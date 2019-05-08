@@ -9,6 +9,7 @@
     ~/.vim: vim
     ~/.vimrc: vimrc
     ~/.gitconfig: gitconfig
+    ~/.bash-it: bash-it
 
 - shell:
   - [git submodule update --init --recursive, Installing submodules]

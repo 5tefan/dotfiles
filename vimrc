@@ -41,3 +41,10 @@ filetype plugin indent on    " required
 "
 " see :h vundle for more details or wiki for FAQ
 " Put your non-Plugin stuff after this line
+
+set nu
+syntax on
+set backspace=indent,eol,start
+set colorcolumn=100
+set laststatus=2
+set tabstop=4 softtabstop=0 expandtab shiftwidth=4 smarttab
