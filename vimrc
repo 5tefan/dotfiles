@@ -18,14 +18,14 @@ Plugin 'tpope/vim-fugitive'
 " Plugin 'L9'
 " Git plugin not hosted on GitHub
 Plugin 'git://git.wincent.com/command-t.git'
-" git repos on your local machine (i.e. when working on your own plugin)
-"Plugin 'file:///home/gmarik/path/to/plugin'
 " The sparkup vim script is in a subdirectory of this repo called vim.
 " Pass the path to set the runtimepath properly.
-"Plugin 'rstacruz/sparkup', {'rtp': 'vim/'}
+Plugin 'rstacruz/sparkup', {'rtp': 'vim/'}
 " Install L9 and avoid a Naming conflict if you've already installed a
 " different version somewhere else.
 " Plugin 'ascenator/L9', {'name': 'newL9'}
+Plugin 'vimwiki/vimwiki'
+Plugin 'scrooloose/nerdtree'
 
 " All of your Plugins must be added before the following line
 call vundle#end()            " required
@@ -42,16 +42,16 @@ filetype plugin indent on    " required
 " see :h vundle for more details or wiki for FAQ
 " Put your non-Plugin stuff after this line
 
-set nu
 syntax on
-
-set colorcolumn=100
+set nu
 set laststatus=2
 set tabstop=4 softtabstop=0 expandtab shiftwidth=4 smarttab
-
 set ruler
 
 let g:vimwiki_list = [{'path': '~/ownCloud/vimwiki', 'path_html': '~/ownCloud/vimwiki_html/'}]
 autocmd FileType * setlocal formatoptions-=c formatoptions-=r formatoptions-=o
 
 set backspace=indent,eol,start  " more powerful backspacing
+
+set tw=100
+set history=10000 " this is the max value
