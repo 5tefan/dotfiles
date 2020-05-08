@@ -44,7 +44,14 @@ filetype plugin indent on    " required
 
 set nu
 syntax on
-set backspace=indent,eol,start
+
 set colorcolumn=100
 set laststatus=2
 set tabstop=4 softtabstop=0 expandtab shiftwidth=4 smarttab
+
+set ruler
+
+let g:vimwiki_list = [{'path': '~/ownCloud/vimwiki', 'path_html': '~/ownCloud/vimwiki_html/'}]
+autocmd FileType * setlocal formatoptions-=c formatoptions-=r formatoptions-=o
+
+set backspace=indent,eol,start  " more powerful backspacing

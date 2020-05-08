@@ -10,6 +10,8 @@
     ~/.vimrc: vimrc
     ~/.gitconfig: gitconfig
     ~/.bash-it: bash-it
+    ~/.lynxrc: lynxrc
+    ~/.git-prompt.sh: git-prompt.sh
 
 - shell:
   - [git submodule update --init --recursive, Installing submodules]
