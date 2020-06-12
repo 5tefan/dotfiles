@@ -3,6 +3,11 @@ filetype off                  " required
 
 " set the runtime path to include Vundle and initialize
 set rtp+=~/.vim/bundle/Vundle.vim
+
+" set runtime path to include fzf
+set rtp+=/usr/local/opt/fzf
+
+
 call vundle#begin()
 " alternatively, pass a path where Vundle should install plugins
 "call vundle#begin('~/some/path/here')
@@ -26,6 +31,9 @@ Plugin 'rstacruz/sparkup', {'rtp': 'vim/'}
 " Plugin 'ascenator/L9', {'name': 'newL9'}
 Plugin 'vimwiki/vimwiki'
 Plugin 'scrooloose/nerdtree'
+
+" fzf.vim needs fzf/ dir on rtp, see above.
+Plugin 'junegunn/fzf.vim'
 
 " All of your Plugins must be added before the following line
 call vundle#end()            " required
@@ -55,3 +63,10 @@ set backspace=indent,eol,start  " more powerful backspacing
 
 set tw=100
 set history=10000 " this is the max value
+
+" If you search for something containing uppercase characters, it will do a case sensitive search; 
+" if you search for something purely lowercase, it will do a case insensitive search. 
+" NOTE: ignorecase affects substitutions as well as searches.
+set ignorecase
+set smartcase
+
