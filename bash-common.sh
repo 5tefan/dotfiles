@@ -20,7 +20,11 @@ PROMPT_COMMAND="history -a; $PROMPT_COMMAND"
 
 # show git branch in prompt
 source ~/.git-prompt.sh
-export PS1='\W $(__git_ps1 " (%s)") \$ '
+if [[ "$HOSTNAME" = atlas* ]]; then
+    export PS1='\W $(__git_ps1 " (%s)") \$ '
+else
+    export PS1='\u@\h \W $(__git_ps1 " (%s)") \$ '
+fi
 
 export TERM="screen"
 export HOST="localhost"
