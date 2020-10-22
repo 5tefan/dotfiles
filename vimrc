@@ -7,7 +7,6 @@ set rtp+=~/.vim/bundle/Vundle.vim
 " set runtime path to include fzf
 set rtp+=/usr/local/opt/fzf
 
-
 call vundle#begin()
 " alternatively, pass a path where Vundle should install plugins
 "call vundle#begin('~/some/path/here')
@@ -35,6 +34,8 @@ Plugin 'scrooloose/nerdtree'
 " fzf.vim needs fzf/ dir on rtp, see above.
 Plugin 'junegunn/fzf.vim'
 
+Plugin 'lervag/vimtex'
+
 " All of your Plugins must be added before the following line
 call vundle#end()            " required
 filetype plugin indent on    " required
@@ -50,14 +51,27 @@ filetype plugin indent on    " required
 " see :h vundle for more details or wiki for FAQ
 " Put your non-Plugin stuff after this line
 
+" Turn filetype plugin back on...
+" See :help ftplugin
+filetype plugin on
+
+
 syntax on
 set nu
 set laststatus=2
 set tabstop=4 softtabstop=0 expandtab shiftwidth=4 smarttab
 set ruler
 
+" Plugin settings.
+
+"" Vimwiki....
 let g:vimwiki_list = [{'path': '~/ownCloud/vimwiki', 'path_html': '~/ownCloud/vimwiki_html/'}]
 autocmd FileType * setlocal formatoptions-=c formatoptions-=r formatoptions-=o
+
+"" CtrlP
+let g:ctrlp_map = '<c-p>'
+let g:ctrlp_cmd = 'CtrlPMixed'
+
 
 set backspace=indent,eol,start  " more powerful backspacing
 
@@ -70,3 +84,9 @@ set history=10000 " this is the max value
 set ignorecase
 set smartcase
 
+" vimtex default flavor, rather than default plain
+let g:tex_flavor = 'latex'
+
+" highlight non-ascii characters: https://stackoverflow.com/a/16988346
+syntax match nonascii "[^\x00-\x7F]"
+highlight nonascii guibg=Red ctermbg=2
