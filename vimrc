@@ -20,8 +20,6 @@ Plugin 'VundleVim/Vundle.vim'
 Plugin 'tpope/vim-fugitive'
 " plugin from http://vim-scripts.org/vim/scripts.html
 " Plugin 'L9'
-" Git plugin not hosted on GitHub
-Plugin 'git://git.wincent.com/command-t.git'
 " The sparkup vim script is in a subdirectory of this repo called vim.
 " Pass the path to set the runtimepath properly.
 Plugin 'rstacruz/sparkup', {'rtp': 'vim/'}
@@ -90,3 +88,8 @@ let g:tex_flavor = 'latex'
 " highlight non-ascii characters: https://stackoverflow.com/a/16988346
 syntax match nonascii "[^\x00-\x7F]"
 highlight nonascii guibg=Red ctermbg=2
+
+" when wrapping lines, move by displayed lines.
+noremap <silent> k gk
+noremap <silent> j gj
+
