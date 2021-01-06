@@ -14,6 +14,7 @@
     ~/.lynxrc: lynxrc
     ~/.git-prompt.sh: git-prompt.sh
     ~/.bash_common.sh: bash-common.sh
+    ~/.p10k.zsh: p10k.zsh
 
 - shell:
   - [git submodule update --init --recursive, Installing submodules]
