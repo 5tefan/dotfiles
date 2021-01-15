@@ -7,3 +7,6 @@
 	smudge = git-lfs smudge -- %f
 	process = git-lfs filter-process
 	required = true
+[core]
+    # Prevent less from paging output if it would fit
+    pager = less -FRX
