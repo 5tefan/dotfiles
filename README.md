@@ -21,3 +21,6 @@ Starting in 2021, I'm starting to migrate from Bash to Zsh as primary interactiv
 
 Before using Powerlevel10k, note that need to install a font. See p10k readme.
 
+
+Using `zsh-common.zsh`: add `[ -f ~/.zsh-common.zsh ] && source ~/.zsh-common.zsh` to `~/.zshrc`.
+
