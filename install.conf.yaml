@@ -12,9 +12,9 @@
     ~/.gitconfig: gitconfig
     ~/.lynxrc: lynxrc
     ~/.git-prompt.sh: git-prompt.sh
-    ~/.bash_common.sh: bash-common.sh
+    ~/.bash-common.sh: bash-common.sh
     ~/.p10k.zsh: p10k.zsh
-    ~/.zsh_common.zsh: zsh-common.zsh
+    ~/.zsh-common.zsh: zsh-common.zsh
 
 - shell:
   - [git submodule update --init --recursive, Installing submodules]
