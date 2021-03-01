@@ -7,7 +7,9 @@ setopt hist_ignore_all_dups
 setopt hist_ignore_space
 
 export WWW_HOME="https://duckduckgo.com/lite"
+export EDITOR="vim"
 
 alias ls='ls --color=auto'
 alias grep='grep --color=auto'
+
 
