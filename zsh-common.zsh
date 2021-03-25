@@ -1,3 +1,7 @@
+alias ..="cd .."
+alias ...="cd ../.."
+alias ....="cd ../../.."
+alias .....="cd ../../../.."
 
 export HISTFILE="$HOME/.zsh_history"
 export HISTSIZE=9999999
