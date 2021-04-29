@@ -34,3 +34,5 @@ export TERM="screen"
 export HOST="localhost"
 export WWW_HOME="https://duckduckgo.com/lite"
 
+source $HOME/.z.sh
+

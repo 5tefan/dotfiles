@@ -15,6 +15,7 @@
     ~/.bash-common.sh: bash-common.sh
     ~/.p10k.zsh: p10k.zsh
     ~/.zsh-common.zsh: zsh-common.zsh
+    ~/.z.sh: z/z.sh
 
 - shell:
   - [git submodule update --init --recursive, Installing submodules]

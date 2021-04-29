@@ -37,3 +37,6 @@
 [submodule "vim/bundle/vimtex"]
 	path = vim/bundle/vimtex
 	url = https://github.com/lervag/vimtex.git
+[submodule "z"]
+	path = z
+	url = https://github.com/rupa/z.git
