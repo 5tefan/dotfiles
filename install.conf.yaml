@@ -4,6 +4,9 @@
 
 - clean: ['~']
 
+- shell:
+  - [git submodule update --init --recursive, Installing submodules]
+
 - link:
     ~/.tmux.conf: tmux.conf
     ~/.tmux: tmux
@@ -16,6 +19,3 @@
     ~/.p10k.zsh: p10k.zsh
     ~/.zsh-common.zsh: zsh-common.zsh
     ~/.z.sh: z/z.sh
-
-- shell:
-  - [git submodule update --init --recursive, Installing submodules]
