@@ -30,6 +30,7 @@ else
     export PS1='\u@\h \W $(__git_ps1 " (%s)") \$ '
 fi
 
+export EDITOR="vim"
 export TERM="screen"
 export HOST="localhost"
 export WWW_HOME="https://duckduckgo.com/lite"
