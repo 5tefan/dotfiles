@@ -13,6 +13,7 @@
     ~/.vim: vim
     ~/.vimrc: vimrc
     ~/.gitconfig: gitconfig
+    ~/.gitignore: gitignore
     ~/.lynxrc: lynxrc
     ~/.git-prompt.sh: git-prompt.sh
     ~/.bash-common.sh: bash-common.sh

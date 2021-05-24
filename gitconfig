@@ -10,3 +10,11 @@
 [core]
     # Prevent less from paging output if it would fit
     pager = less -FRX
+	excludesFile = ~/.gitignore
+[pull]
+    # use `git pull --rebase` or `git pull --no-ff` to override:
+	ff = only
+[alias]
+	co = checkout
+	st = status
+	br = branch
