@@ -6,6 +6,7 @@
 
 - shell:
   - [git submodule update --init --recursive, Installing submodules]
+  - [cd vim/bundle; for d in *; do (cd $d && git checkout master); done, Checkout vim plugin branches]
 
 - link:
     ~/.tmux.conf: tmux.conf
