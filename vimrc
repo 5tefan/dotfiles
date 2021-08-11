@@ -8,32 +8,14 @@ set rtp+=~/.vim/bundle/Vundle.vim
 set rtp+=/usr/local/opt/fzf
 
 call vundle#begin()
-" alternatively, pass a path where Vundle should install plugins
-"call vundle#begin('~/some/path/here')
-
 " let Vundle manage Vundle, required
 Plugin 'VundleVim/Vundle.vim'
-
-" The following are examples of different formats supported.
-" Keep Plugin commands between vundle#begin/end.
-" plugin on GitHub repo
 Plugin 'tpope/vim-fugitive'
-" plugin from http://vim-scripts.org/vim/scripts.html
-" Plugin 'L9'
-" The sparkup vim script is in a subdirectory of this repo called vim.
-" Pass the path to set the runtimepath properly.
-Plugin 'rstacruz/sparkup', {'rtp': 'vim/'}
-" Install L9 and avoid a Naming conflict if you've already installed a
-" different version somewhere else.
-" Plugin 'ascenator/L9', {'name': 'newL9'}
 Plugin 'vimwiki/vimwiki'
 Plugin 'scrooloose/nerdtree'
-
-" fzf.vim needs fzf/ dir on rtp, see above.
+Plugin 'junegunn/fzf', { 'dir': '~/.fzf', 'do': './install --all' }
 Plugin 'junegunn/fzf.vim'
-
 Plugin 'lervag/vimtex'
-
 " All of your Plugins must be added before the following line
 call vundle#end()            " required
 filetype plugin indent on    " required
@@ -63,7 +45,15 @@ set ruler
 " Plugin settings.
 
 "" Vimwiki....
-let g:vimwiki_list = [{'path': '~/ownCloud/vimwiki', 'path_html': '~/ownCloud/vimwiki_html/'}]
+let wiki_1 = {}
+let wiki_1.path = '~/ownCloud/vimwiki'
+let wiki_1.path_html = '~/ownCloud/vimwiki_html/'
+
+let wiki_2 = {}
+let wiki_2.path = '~/ownCloud/vimwiki/work'
+let wiki_2.path_html = '~/ownCloud/vimwiki_html/work/'
+
+let g:vimwiki_list = [wiki_1, wiki_2]
 autocmd FileType * setlocal formatoptions-=c formatoptions-=r formatoptions-=o
 
 "" CtrlP
@@ -93,3 +83,5 @@ highlight nonascii guibg=Red ctermbg=2
 noremap <silent> k gk
 noremap <silent> j gj
 
+" keep 5 lines context on curosr... eg. when searching
+set scrolloff=5
