@@ -1,28 +1,30 @@
 # This is Git's per-user configuration file.
 [user]
-	name = Stefan Codrescu
-	email = ssmmcc1@gmail.com
+    name = Stefan Codrescu
+    email = ssmmcc1@gmail.com
 [filter "lfs"]
-	clean = git-lfs clean -- %f
-	smudge = git-lfs smudge -- %f
-	process = git-lfs filter-process
-	required = true
+    clean = git-lfs clean -- %f
+    smudge = git-lfs smudge -- %f
+    process = git-lfs filter-process
+    required = true
 [core]
     # Prevent less from paging output if it would fit
     pager = less -FRX
-	excludesFile = ~/.gitignore
+    excludesFile = ~/.gitignore
 [pull]
     # use `git pull --rebase` or `git pull --no-ff` to override:
-	ff = only
+    ff = only
 [alias]
-	co = checkout
-	st = status
-	br = branch
+    co = checkout
+    st = status
+    br = branch
 
 [color]
-  diff = auto
-  status = auto
-  branch = auto
-  interactive = auto
-  ui = true
-  pager = true
+    diff = auto
+    status = always
+    branch = auto
+    interactive = auto
+    ui = true
+    pager = true
+[pager]
+    status = true
