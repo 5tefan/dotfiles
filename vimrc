@@ -3,7 +3,6 @@ filetype off                  " required
 
 " set the runtime path to include Vundle and initialize
 set rtp+=~/.vim/bundle/Vundle.vim
-
 call vundle#begin()
 " let Vundle manage Vundle, required
 Plugin 'VundleVim/Vundle.vim'
@@ -38,6 +37,7 @@ set nu
 set laststatus=2
 set tabstop=4 softtabstop=0 expandtab shiftwidth=4 smarttab
 set ruler
+set list
 
 " Plugin settings.
 
@@ -45,6 +45,11 @@ set ruler
 let wiki_1 = {}
 let wiki_1.path = '~/ownCloud/vimwiki'
 let wiki_1.path_html = '~/ownCloud/vimwiki_html/'
+" let wiki_1.css_name = wiki_1.path . '~/ownCloud/vimwiki/custom.css'
+let wiki_1.template_path = '~/ownCloud/vimwiki/templates/'
+let wiki_1.template_default = 'default'
+let wiki_1.template_ext = '.html'
+let wiki_1.css_name = '~/ownCloud/vimwiki/custom.css'
 
 let wiki_2 = {}
 let wiki_2.path = '~/ownCloud/vimwiki/work'
@@ -82,3 +87,16 @@ noremap <silent> j gj
 
 " keep 5 lines context on curosr... eg. when searching
 set scrolloff=5
+
+
+" Vimwiki include pgn files with {{pgn:path/to.pgn}}
+function! VimwikiWikiIncludeHandler(value)
+    let url = matchstr(a:value, g:vimwiki_global_vars['rxWikiInclMatchUrl'])
+    let pgn = matchstr(a:value, '{{pgn:\zs.\{-}\ze}}')
+    if filereadable(pgn)
+        return '<pre class=pgn>'.join(readfile(pgn), "\r").'</pre>'
+    end
+    " Return the empty string when unable to process link
+    return ''
+endfunction
+
