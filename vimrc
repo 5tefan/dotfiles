@@ -35,11 +35,38 @@ filetype plugin on
 
 
 syntax on
+set backspace=indent,eol,start  " more powerful backspacing
 set nu
 set laststatus=2
-set tabstop=4 softtabstop=0 expandtab shiftwidth=4 smarttab
+set tabstop=4
+set softtabstop=0
+set expandtab
+set shiftwidth=4
+set smarttab
 set ruler
 set list
+
+set tw=100
+set history=10000 " this is the max value
+
+" If you search for something containing uppercase characters, it will do a case sensitive search; 
+" if you search for something purely lowercase, it will do a case insensitive search. 
+" NOTE: ignorecase affects substitutions as well as searches.
+set ignorecase
+set smartcase
+
+" keep 5 lines context on curosr... eg. when searching
+set scrolloff=5
+
+" highlight non-ascii characters: https://stackoverflow.com/a/16988346
+syntax match nonascii "[^\x00-\x7F]"
+highlight nonascii guibg=Red ctermbg=2
+
+" when wrapping lines, move by displayed lines.
+noremap <silent> k gk
+noremap <silent> j gj
+
+
 
 " Plugin settings.
 
@@ -47,7 +74,6 @@ set list
 let wiki_1 = {}
 let wiki_1.path = '~/ownCloud/vimwiki'
 let wiki_1.path_html = '~/ownCloud/vimwiki_html/'
-" let wiki_1.css_name = wiki_1.path . '~/ownCloud/vimwiki/custom.css'
 let wiki_1.template_path = '~/ownCloud/vimwiki/templates/'
 let wiki_1.template_default = 'default'
 let wiki_1.template_ext = '.html'
@@ -60,36 +86,8 @@ let wiki_2.path_html = '~/ownCloud/vimwiki_html/work/'
 let g:vimwiki_list = [wiki_1, wiki_2]
 autocmd FileType * setlocal formatoptions-=c formatoptions-=r formatoptions-=o
 
-"" CtrlP
-let g:ctrlp_map = '<c-p>'
-let g:ctrlp_cmd = 'CtrlPMixed'
-
-
-set backspace=indent,eol,start  " more powerful backspacing
-
-set tw=100
-set history=10000 " this is the max value
-
-" If you search for something containing uppercase characters, it will do a case sensitive search; 
-" if you search for something purely lowercase, it will do a case insensitive search. 
-" NOTE: ignorecase affects substitutions as well as searches.
-set ignorecase
-set smartcase
-
 " vimtex default flavor, rather than default plain
 let g:tex_flavor = 'latex'
-
-" highlight non-ascii characters: https://stackoverflow.com/a/16988346
-syntax match nonascii "[^\x00-\x7F]"
-highlight nonascii guibg=Red ctermbg=2
-
-" when wrapping lines, move by displayed lines.
-noremap <silent> k gk
-noremap <silent> j gj
-
-" keep 5 lines context on curosr... eg. when searching
-set scrolloff=5
-
 
 " Vimwiki include pgn files with {{pgn:path/to.pgn}}
 function! VimwikiWikiIncludeHandler(value)
