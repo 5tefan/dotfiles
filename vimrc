@@ -28,7 +28,6 @@ filetype plugin indent on    " required
 "
 " see :h vundle for more details or wiki for FAQ
 " Put your non-Plugin stuff after this line
-
 " Turn filetype plugin back on...
 " See :help ftplugin
 filetype plugin on
@@ -91,12 +90,26 @@ let g:tex_flavor = 'latex'
 
 " Vimwiki include pgn files with {{pgn:path/to.pgn}}
 function! VimwikiWikiIncludeHandler(value)
-    let url = matchstr(a:value, g:vimwiki_global_vars['rxWikiInclMatchUrl'])
     let pgn = matchstr(a:value, '{{pgn:\zs.\{-}\ze}}')
     if filereadable(pgn)
-        return '<pre class=pgn>'.join(readfile(pgn), "\r").'</pre>'
+        return '<pre class="pgn">'.join(readfile(pgn), "\r").'</pre>'
     end
     " Return the empty string when unable to process link
     return ''
 endfunction
 
+" Vimwiki include fen board positions with {{fen:...}}
+" Need to configure chessground assets in (likely) a template.
+" before this will work for you.
+function! VimwikiWikiIncludeHandler(value)
+    let fen = matchstr(a:value, '{{fen:\zs.\{-}\ze}}')
+    if strlen(fen) > 3
+        let out = '<div class="blue merida"><div id="dirty" class="cg-wrap"></div></div>'
+        let out .= '<script>var cg = Chessground(document.getElementById("dirty"), {"fen": "'.fen.'"})</script>'
+        let out .= '<br/><br/>'
+        let out .= '<pre class="fen">'.fen.'</pre>'
+        return out
+    end
+    " Return the empty string when unable to process link
+    return ''
+endfunction
