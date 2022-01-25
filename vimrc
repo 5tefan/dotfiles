@@ -14,6 +14,7 @@ Plugin 'junegunn/fzf.vim'
 Plugin 'lervag/vimtex'
 Plugin 'tpope/vim-surround'
 Plugin 'tpope/vim-repeat'
+Plugin 'Yggdroot/indentLine'
 " All of your Plugins must be added before the following line
 call vundle#end()            " required
 filetype plugin indent on    " required
@@ -66,8 +67,10 @@ noremap <silent> k gk
 noremap <silent> j gj
 
 
+" ...... Plugin settings .......
 
-" Plugin settings.
+" fzf respect .rgignore files
+let $FZF_DEFAULT_COMMAND = 'rg --files'
 
 "" Vimwiki....
 let wiki_1 = {}
