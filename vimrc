@@ -72,6 +72,8 @@ noremap <silent> j gj
 
 " fzf respect .rgignore files
 let $FZF_DEFAULT_COMMAND = 'rg --files'
+" short version :F of normal :Files cmd
+command! -bang -nargs=? -complete=dir F call fzf#vim#files(<q-args>, <bang>0)
 
 "" Vimwiki....
 let wiki_1 = {}
