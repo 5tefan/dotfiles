@@ -52,3 +52,6 @@
 [submodule "vim/bundle/indentLine"]
 	path = vim/bundle/indentLine
 	url = https://github.com/Yggdroot/indentLine
+[submodule "vim/bundle/vim-pythonsense"]
+	path = vim/bundle/vim-pythonsense
+	url = https://github.com/jeetsukumaran/vim-pythonsense.git
