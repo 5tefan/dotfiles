@@ -6,16 +6,28 @@ set rtp+=~/.vim/bundle/Vundle.vim
 call vundle#begin()
 " let Vundle manage Vundle, required
 Plugin 'VundleVim/Vundle.vim'
-Plugin 'tpope/vim-fugitive' " git wrapper
+
+" git wrapper
+Plugin 'tpope/vim-fugitive'
+
 Plugin 'vimwiki/vimwiki'
 Plugin 'scrooloose/nerdtree'
 Plugin 'junegunn/fzf', { 'dir': '~/.fzf', 'do': './install --all' }
 Plugin 'junegunn/fzf.vim'
 Plugin 'lervag/vimtex'
+
+" Surround text objects with quotes, etc.
 Plugin 'tpope/vim-surround'
+
+" Repeat surrounds, etc.
 Plugin 'tpope/vim-repeat'
+
+" Vertical lines on code blocks:
 Plugin 'Yggdroot/indentLine'
+
+" Python aware text objects like [f]unction, [c]lass:
 Plugin 'jeetsukumaran/vim-pythonsense'
+
 " All of your Plugins must be added before the following line
 call vundle#end()            " required
 filetype plugin indent on    " required
@@ -89,6 +101,10 @@ let wiki_2.path = '~/ownCloud/vimwiki/work'
 let wiki_2.path_html = '~/ownCloud/vimwiki_html/work/'
 
 let g:vimwiki_list = [wiki_1, wiki_2]
+" For some reason, this conceal seems to be leaking around and
+" is super annoying. I don't want magically appearing chars!
+let g:vimwiki_conceal_onechar_markers=0
+
 autocmd FileType * setlocal formatoptions-=c formatoptions-=r formatoptions-=o
 
 " vimtex default flavor, rather than default plain
@@ -123,3 +139,4 @@ endfunction
 
 command! -bang -nargs=* Rg call fzf#vim#grep("rg --column --line-number --no-heading --color=always --smart-case "
             \.shellescape(<q-args>), 1, {'options': '--delimiter : --nth 4..'}, <bang>0) 
+
