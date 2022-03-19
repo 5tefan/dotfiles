@@ -55,3 +55,9 @@
 [submodule "vim/bundle/vim-pythonsense"]
 	path = vim/bundle/vim-pythonsense
 	url = https://github.com/jeetsukumaran/vim-pythonsense.git
+[submodule "vim/bundle/nerdcommenter"]
+	path = vim/bundle/nerdcommenter
+	url = https://github.com/preservim/nerdcommenter.git
+[submodule "vim/bundle/vim-easymotion"]
+	path = vim/bundle/vim-easymotion
+	url = https://github.com/easymotion/vim-easymotion.git
