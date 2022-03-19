@@ -25,8 +25,13 @@ Plugin 'tpope/vim-repeat'
 " Vertical lines on code blocks:
 Plugin 'Yggdroot/indentLine'
 
-" Python aware text objects like [f]unction, [c]lass:
-Plugin 'jeetsukumaran/vim-pythonsense'
+" Python aware text objects like [f]unction, [c]lass: Plugin 'jeetsukumaran/vim-pythonsense'
+
+" \ww to jump
+Plugin 'easymotion/vim-easymotion'
+
+" \cc to comment out, \cu to uncomment
+Plugin 'preservim/nerdcommenter'
 
 " All of your Plugins must be added before the following line
 call vundle#end()            " required
@@ -103,7 +108,12 @@ let wiki_2.path_html = '~/ownCloud/vimwiki_html/work/'
 let g:vimwiki_list = [wiki_1, wiki_2]
 " For some reason, this conceal seems to be leaking around and
 " is super annoying. I don't want magically appearing chars!
-let g:vimwiki_conceal_onechar_markers=0
+let g:vimwiki_conceal_onechar_markers = 0
+" disables link conceal.
+let g:vimwiki_conceallevel = 0
+
+" indentLine looks like another culript.
+let g:indentLine_fileTypeExclude = ['json', 'vimwiki']
 
 autocmd FileType * setlocal formatoptions-=c formatoptions-=r formatoptions-=o
 
