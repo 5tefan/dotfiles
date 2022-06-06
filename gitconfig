@@ -43,3 +43,5 @@
 [mergetool "meld"]
     cmd = meld "$LOCAL" "$MERGED" "$REMOTE" --output "$MERGED"
 
+[checkout]
+    defaultRemote = origin

@@ -7,6 +7,7 @@ export HISTFILE="$HOME/.zsh_history"
 export HISTSIZE=9999999
 export SAVEHIST=$HISTSIZE
 
+# manually import history with `fc -RI`
 unsetopt SHARE_HISTORY
 setopt INC_APPEND_HISTORY
 setopt HIST_FIND_NO_DUPS

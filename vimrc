@@ -119,6 +119,8 @@ autocmd FileType * setlocal formatoptions-=c formatoptions-=r formatoptions-=o
 
 " vimtex default flavor, rather than default plain
 let g:tex_flavor = 'latex'
+" please don't conceal things!
+let g:vimtex_syntax_conceal_default = 0
 
 " Vimwiki include pgn files with {{pgn:path/to.pgn}}
 function! VimwikiWikiIncludeHandler(value)
