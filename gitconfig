@@ -21,6 +21,7 @@
     sw = switch
     re = restore
     pom = pull origin main
+    poh = push origin HEAD
 [color]
     diff = auto
     status = always
