@@ -22,6 +22,7 @@
     re = restore
     pom = pull origin main
     poh = push origin HEAD
+    git = !exec git  # https://caiustheory.com/git-git-git-git-git/
 [color]
     diff = auto
     status = always
