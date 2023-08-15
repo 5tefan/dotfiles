@@ -15,6 +15,7 @@ Plugin 'scrooloose/nerdtree'
 Plugin 'junegunn/fzf', { 'dir': '~/.fzf', 'do': './install --all' }
 Plugin 'junegunn/fzf.vim'
 Plugin 'lervag/vimtex'
+Plugin 'leafgarland/typescript-vim'
 
 " Surround text objects with quotes, etc.
 Plugin 'tpope/vim-surround'
@@ -25,13 +26,14 @@ Plugin 'tpope/vim-repeat'
 " Vertical lines on code blocks:
 Plugin 'Yggdroot/indentLine'
 
-" Python aware text objects like [f]unction, [c]lass: Plugin 'jeetsukumaran/vim-pythonsense'
-
 " \ww to jump
 Plugin 'easymotion/vim-easymotion'
 
 " \cc to comment out, \cu to uncomment
 Plugin 'preservim/nerdcommenter'
+
+" Python aware text objects like [f]unction, [c]lass:
+Plugin 'jeetsukumaran/vim-pythonsense'
 
 " All of your Plugins must be added before the following line
 call vundle#end()            " required
@@ -145,10 +147,15 @@ function! VimwikiWikiIncludeHandler(value)
     return ''
 endfunction
 
-
 command! -bang -nargs=* Rg call fzf#vim#grep("rg --column --line-number --no-heading --color=always --smart-case "
             \.shellescape(<q-args>), 1, {'options': '--delimiter : --nth 4..'}, <bang>0) 
 
 " copy previous commit message as a starting point, Git Log Copy
 command Glc .-1read !git log --format=\%s -n1
+
+" quick fix shortcuts, write and next/previous
+command! -nargs=0 Wcn :w <bar> :cn
+command! -nargs=0 Wcp :w <bar> :cp
+cnoreabbrev wcn Wcn
+cnoreabbrev wcp Wcp
 
