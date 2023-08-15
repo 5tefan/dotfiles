@@ -1,12 +1,10 @@
-# This is Git's per-user configuration file.
 [user]
     name = Stefan Codrescu
     email = ssmmcc1@gmail.com
 [filter "lfs"]
     clean = git-lfs clean -- %f
     smudge = git-lfs smudge -- %f
-    process = git-lfs filter-process
-    required = true
+    process = git-lfs filter-process required = true
 [core]
     # Prevent less from paging output if it would fit
     pager = less -FRX
@@ -15,13 +13,14 @@
     # use `git pull --rebase` or `git pull --no-ff` to override:
     ff = only
 [alias]
-    co = checkout
     st = status
     br = branch
     sw = switch
     re = restore
+    co = commit -v
     pom = pull origin main
     poh = push origin HEAD
+    pfoh = push --force origin HEAD
     git = !exec git  # https://caiustheory.com/git-git-git-git-git/
 [color]
     diff = auto
@@ -44,6 +43,5 @@
     tool = meld
 [mergetool "meld"]
     cmd = meld "$LOCAL" "$MERGED" "$REMOTE" --output "$MERGED"
-
 [checkout]
     defaultRemote = origin
