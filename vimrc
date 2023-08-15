@@ -94,18 +94,14 @@ command! -bang -nargs=? -complete=dir F call fzf#vim#files(<q-args>, <bang>0)
 
 "" Vimwiki....
 let wiki_1 = {}
-let wiki_1.path = '~/ownCloud/vimwiki'
-let wiki_1.path_html = '~/ownCloud/vimwiki_html/'
-let wiki_1.template_path = '~/ownCloud/vimwiki/templates/'
+let wiki_1.path = '~/ownCloud2/vimwiki'
+let wiki_1.path_html = '~/ownCloud2/vimwiki_html/'
+let wiki_1.template_path = '~/ownCloud2/vimwiki/templates/'
 let wiki_1.template_default = 'default'
 let wiki_1.template_ext = '.html'
-let wiki_1.css_name = '~/ownCloud/vimwiki/custom.css'
+let wiki_1.css_name = '~/ownCloud2/vimwiki/custom.css'
 
-let wiki_2 = {}
-let wiki_2.path = '~/ownCloud/vimwiki/work'
-let wiki_2.path_html = '~/ownCloud/vimwiki_html/work/'
-
-let g:vimwiki_list = [wiki_1, wiki_2]
+let g:vimwiki_list = [wiki_1]
 " For some reason, this conceal seems to be leaking around and
 " is super annoying. I don't want magically appearing chars!
 let g:vimwiki_conceal_onechar_markers = 0
@@ -114,13 +110,14 @@ let g:vimwiki_conceallevel = 0
 
 " indentLine looks like another culript.
 let g:indentLine_fileTypeExclude = ['json', 'vimwiki']
+let g:indentLine_setConceal = 0
 
 autocmd FileType * setlocal formatoptions-=c formatoptions-=r formatoptions-=o
 
 " vimtex default flavor, rather than default plain
 let g:tex_flavor = 'latex'
 " please don't conceal things!
-let g:vimtex_syntax_conceal_default = 0
+let g:vimtex_syntax_conceal_disable = 1
 
 " Vimwiki include pgn files with {{pgn:path/to.pgn}}
 function! VimwikiWikiIncludeHandler(value)
@@ -151,4 +148,7 @@ endfunction
 
 command! -bang -nargs=* Rg call fzf#vim#grep("rg --column --line-number --no-heading --color=always --smart-case "
             \.shellescape(<q-args>), 1, {'options': '--delimiter : --nth 4..'}, <bang>0) 
+
+" copy previous commit message as a starting point, Git Log Copy
+command Glc .-1read !git log --format=\%s -n1
 
