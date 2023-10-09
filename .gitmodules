@@ -91,3 +91,6 @@
 [submodule "local/share/nvim/plugged/indent-blankline.nvim"]
 	path = local/share/nvim/plugged/indent-blankline.nvim
 	url = https://github.com/lukas-reineke/indent-blankline.nvim.git
+[submodule "local/share/nvim/plugged/tokyonight.nvim"]
+	path = local/share/nvim/plugged/tokyonight.nvim
+	url = https://github.com/folke/tokyonight.nvim.git
