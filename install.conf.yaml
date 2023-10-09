@@ -9,6 +9,8 @@
   - [cd vim/bundle; for d in *; do (cd $d && git checkout master); done, Checkout vim plugin branches]
 
 - link:
+    ~/.config: config
+    ~/.local: local
     ~/.tmux.conf: tmux.conf
     ~/.tmux: tmux
     ~/.vim: vim
