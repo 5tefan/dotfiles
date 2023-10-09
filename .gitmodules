@@ -82,3 +82,12 @@
 [submodule "local/share/nvim/plugged/fzf"]
 	path = local/share/nvim/plugged/fzf
 	url = https://github.com/junegunn/fzf.git
+[submodule "local/share/nvim/plugged/vim-surround"]
+	path = local/share/nvim/plugged/vim-surround
+	url = https://github.com/tpope/vim-surround.git
+[submodule "local/share/nvim/plugged/vim-repeat"]
+	path = local/share/nvim/plugged/vim-repeat
+	url = https://github.com/tpope/vim-repeat.git
+[submodule "local/share/nvim/plugged/indent-blankline.nvim"]
+	path = local/share/nvim/plugged/indent-blankline.nvim
+	url = https://github.com/lukas-reineke/indent-blankline.nvim.git

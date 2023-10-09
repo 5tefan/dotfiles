@@ -14,8 +14,17 @@ Plug 'hrsh7th/vim-vsnip'
 Plug 'nvim-lua/plenary.nvim'
 Plug 'scalameta/nvim-metals'
 
+" Fuzzy finding
 Plug 'junegunn/fzf'
 Plug 'junegunn/fzf.vim'
+
+" Surround text objects with quotes, etc.
+Plug 'tpope/vim-surround'
+
+" Repeat surrounds, etc.
+Plug 'tpope/vim-repeat'
+
+Plug 'lukas-reineke/indent-blankline.nvim'
 
 call plug#end()
 
