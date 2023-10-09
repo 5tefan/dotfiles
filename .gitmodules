@@ -61,3 +61,18 @@
 [submodule "vim/bundle/vim-easymotion"]
 	path = vim/bundle/vim-easymotion
 	url = https://github.com/easymotion/vim-easymotion.git
+[submodule "local/share/nvim/plugged/plenary.nvim"]
+	path = local/share/nvim/plugged/plenary.nvim
+	url = https://github.com/nvim-lua/plenary.nvim.git
+[submodule "local/share/nvim/plugged/nvim-metals"]
+	path = local/share/nvim/plugged/nvim-metals
+	url = https://github.com/scalameta/nvim-metals.git
+[submodule "local/share/nvim/plugged/cmp-nvim-lsp"]
+	path = local/share/nvim/plugged/cmp-nvim-lsp
+	url = https://github.com/hrsh7th/cmp-nvim-lsp.git
+[submodule "local/share/nvim/plugged/nvim-cmp"]
+	path = local/share/nvim/plugged/nvim-cmp
+	url = https://github.com/hrsh7th/nvim-cmp.git
+[submodule "local/share/nvim/plugged/vim-vsnip"]
+	path = local/share/nvim/plugged/vim-vsnip
+	url = https://github.com/hrsh7th/vim-vsnip.git

@@ -1,2 +1,4 @@
 *.sw[op]
 tmux/resurrect/
+local/state
+local/share/nvim/.netrwhist
