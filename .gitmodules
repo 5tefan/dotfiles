@@ -76,3 +76,9 @@
 [submodule "local/share/nvim/plugged/vim-vsnip"]
 	path = local/share/nvim/plugged/vim-vsnip
 	url = https://github.com/hrsh7th/vim-vsnip.git
+[submodule "local/share/nvim/plugged/fzf.vim"]
+	path = local/share/nvim/plugged/fzf.vim
+	url = https://github.com/junegunn/fzf.vim.git
+[submodule "local/share/nvim/plugged/fzf"]
+	path = local/share/nvim/plugged/fzf
+	url = https://github.com/junegunn/fzf.git

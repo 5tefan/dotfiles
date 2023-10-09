@@ -7,11 +7,13 @@ local map = vim.keymap.set
 ----------------------------------
 
 map("n", "gD",  vim.lsp.buf.definition)
+map("n", "K",  vim.lsp.buf.hover)
 map("n", "gi", vim.lsp.buf.implementation)
 map("n", "gr", vim.lsp.buf.references)
 map("n", "<leader>sh", vim.lsp.buf.signature_help)
 map("n", "<leader>rn", vim.lsp.buf.rename)
 map("n", "<leader>f", vim.lsp.buf.format)
+map("n", "<leader>ca", vim.lsp.buf.code_action)
 
 
 ----------------------------------
