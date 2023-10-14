@@ -91,6 +91,9 @@
 [submodule "local/share/nvim/plugged/indent-blankline.nvim"]
 	path = local/share/nvim/plugged/indent-blankline.nvim
 	url = https://github.com/lukas-reineke/indent-blankline.nvim.git
-[submodule "local/share/nvim/plugged/tokyonight.nvim"]
-	path = local/share/nvim/plugged/tokyonight.nvim
-	url = https://github.com/folke/tokyonight.nvim.git
+[submodule "local/share/nvim/plugged/nvim-lspconfig"]
+	path = local/share/nvim/plugged/nvim-lspconfig
+	url = https://github.com/neovim/nvim-lspconfig.git
+[submodule "local/share/nvim/plugged/clangd_extensions.nvim"]
+	path = local/share/nvim/plugged/clangd_extensions.nvim
+	url = https://github.com/p00f/clangd_extensions.nvim.git

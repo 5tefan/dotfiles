@@ -91,6 +91,7 @@ noremap <silent> j gj
 
 " fzf respect .rgignore files
 let $FZF_DEFAULT_COMMAND = 'rg --files'
+
 " short version :F of normal :Files cmd
 command! -bang -nargs=? -complete=dir F call fzf#vim#files(<q-args>, 
             \ {'options': [
@@ -98,6 +99,19 @@ command! -bang -nargs=? -complete=dir F call fzf#vim#files(<q-args>,
                 \ '--preview',
                 \ '~/.vim/bundle/fzf.vim/bin/preview.sh {}'
             \ ]}, <bang>0)
+
+" Rg with preview
+command! -bang -nargs=* Rg call fzf#vim#grep(
+            \ "rg --column --line-number --no-heading --color=always --smart-case "
+            \ .shellescape(<q-args>),
+            \ 1,
+            \ {'options': [
+                \ '--delimiter=:',
+                \ '--nth=4..',
+                \ '--preview',
+                \ '~/.vim/bundle/fzf.vim/bin/preview.sh {}'
+            \ ]}, <bang>0)
+
 
 "" Vimwiki....
 let wiki_1 = {}
@@ -151,9 +165,6 @@ function! VimwikiWikiIncludeHandler(value)
     " Return the empty string when unable to process link
     return ''
 endfunction
-
-command! -bang -nargs=* Rg call fzf#vim#grep("rg --column --line-number --no-heading --color=always --smart-case "
-            \.shellescape(<q-args>), 1, {'options': '--delimiter : --nth 4..'}, <bang>0) 
 
 " copy previous commit message as a starting point, Git Log Copy
 command Glc .-1read !git log --format=\%s -n1
