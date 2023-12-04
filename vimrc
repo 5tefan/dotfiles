@@ -175,3 +175,5 @@ command! -nargs=0 Wcp :w <bar> :cp
 cnoreabbrev wcn Wcn
 cnoreabbrev wcp Wcp
 
+" repeat last macro
+map , @@
