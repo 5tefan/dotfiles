@@ -97,3 +97,6 @@
 [submodule "local/share/nvim/plugged/clangd_extensions.nvim"]
 	path = local/share/nvim/plugged/clangd_extensions.nvim
 	url = https://github.com/p00f/clangd_extensions.nvim.git
+[submodule "local/share/nvim/plugged/rust-tools.nvim"]
+	path = local/share/nvim/plugged/rust-tools.nvim
+	url = https://github.com/simrat39/rust-tools.nvim.git
