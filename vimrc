@@ -55,16 +55,37 @@ filetype plugin on
 
 
 syntax on
-set backspace=indent,eol,start  " more powerful backspacing
+
+" Backspace over everything.
+set backspace=indent,eol,start  
+
 set nu
-set laststatus=2
-set tabstop=4
-set softtabstop=0
-set expandtab
-set shiftwidth=4
-set smarttab
 set ruler
 set list
+
+" Always show status line
+set laststatus=2
+
+" Do not convert spaces into tabs.
+set softtabstop=0 expandtab
+
+" Tab char appears 4 spaces wide
+set tabstop=4
+
+" Pressing tab inserts 4 spaces.
+set shiftwidth=4 smarttab
+
+" Indent by 4 spaces when using >>, <<, == etc.
+set shiftwidth=4
+
+" Indent by 4 spaces when pressing <TAB>
+set softtabstop=4
+
+" Hilight the current line (and the line numbers)
+set cursorline
+
+" Show matching parenthesis
+set showmatch
 
 set tw=100
 set history=10000 " this is the max value
@@ -86,6 +107,18 @@ highlight nonascii guibg=Red ctermbg=2
 noremap <silent> k gk
 noremap <silent> j gj
 
+" When using :edit autocomplete, deprioritize files named with these extensions:
+set suffixes=.aux,.bak,.dvi,.idx,.ps,.swp,.swo,.tar
+
+" Automatically save modifications to files on :next
+set autowrite
+
+" In regular use, keep a per file undo history
+if !isdirectory($HOME."/.vim/undo")
+     call mkdir($HOME."/.vim/undo", "", 0700)
+endif
+set undodir=~/.vim/undo
+set undofile
 
 " ...... Plugin settings .......
 
@@ -168,6 +201,9 @@ endfunction
 
 " copy previous commit message as a starting point, Git Log Copy
 command Glc .-1read !git log --format=\%s -n1
+
+" read date
+command Rd .-1read !date -I
 
 " quick fix shortcuts, write and next/previous
 command! -nargs=0 Wcn :w <bar> :cn
