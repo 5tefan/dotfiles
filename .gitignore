@@ -2,4 +2,7 @@
 tmux/resurrect/
 local/state
 local/share/nvim/.netrwhist
+local/share/lftp/
+local/share/meld/
 config/htop
+vim/undo/
