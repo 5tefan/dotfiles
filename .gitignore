@@ -5,4 +5,8 @@ local/share/nvim/.netrwhist
 local/share/lftp/
 local/share/meld/
 config/htop
+config/zed/conversations
+config/zed/embeddings
+config/zed/themes
+config/zed/.tmp*
 vim/undo/
