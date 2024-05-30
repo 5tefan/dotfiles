@@ -15,6 +15,7 @@
 [alias]
     st = status
     br = branch
+    brs = branch --sort=-committerdate
     sw = switch
     re = restore
     co = commit -v
