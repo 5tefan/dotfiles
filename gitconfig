@@ -13,12 +13,15 @@
     # use `git pull --rebase` or `git pull --no-ff` to override:
     ff = only
 [alias]
+    d = diff
+    dc = diff --cached
     st = status
     br = branch
     brs = branch --sort=-committerdate
     sw = switch
     re = restore
     co = commit -v
+    coa = commit -v --amend
     pom = pull origin main
     poh = push origin HEAD
     pfoh = push --force origin HEAD
