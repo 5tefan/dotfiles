@@ -10,3 +10,4 @@ config/zed/embeddings
 config/zed/themes
 config/zed/.tmp*
 vim/undo/
+vim/plugged/

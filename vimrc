@@ -1,60 +1,36 @@
-set nocompatible              " be iMproved, required
-filetype off                  " required
+call plug#begin()
 
-" set the runtime path to include Vundle and initialize
-set rtp+=~/.vim/bundle/Vundle.vim
-call vundle#begin()
-" let Vundle manage Vundle, required
-Plugin 'VundleVim/Vundle.vim'
+    Plug 'tpope/vim-sensible'
 
-" git wrapper
-Plugin 'tpope/vim-fugitive'
+    " git wrapper
+    Plug 'tpope/vim-fugitive'
 
-Plugin 'vimwiki/vimwiki'
-Plugin 'scrooloose/nerdtree'
-Plugin 'junegunn/fzf', { 'dir': '~/.fzf', 'do': './install --all' }
-Plugin 'junegunn/fzf.vim'
-Plugin 'lervag/vimtex'
-Plugin 'leafgarland/typescript-vim'
+    Plug 'vimwiki/vimwiki', { 'branch': 'dev' }
+    Plug 'scrooloose/nerdtree'
+    Plug 'junegunn/fzf', { 'dir': '~/.fzf', 'do': './install --all' }
+    Plug 'junegunn/fzf.vim'
+    Plug 'lervag/vimtex'
+    Plug 'leafgarland/typescript-vim'
 
-" Surround text objects with quotes, etc.
-Plugin 'tpope/vim-surround'
+    " Surround text objects with quotes, etc.
+    Plug 'tpope/vim-surround'
 
-" Repeat surrounds, etc.
-Plugin 'tpope/vim-repeat'
+    " Repeat surrounds, etc.
+    Plug 'tpope/vim-repeat'
 
-" Vertical lines on code blocks:
-Plugin 'Yggdroot/indentLine'
+    " Vertical lines on code blocks:
+    Plug 'Yggdroot/indentLine'
 
-" \ww to jump
-Plugin 'easymotion/vim-easymotion'
+    " \ww to jump
+    Plug 'easymotion/vim-easymotion'
 
-" \cc to comment out, \cu to uncomment
-Plugin 'preservim/nerdcommenter'
+    " \cc to comment out, \cu to uncomment
+    Plug 'preservim/nerdcommenter'
 
-" Python aware text objects like [f]unction, [c]lass:
-Plugin 'jeetsukumaran/vim-pythonsense'
+    " Python aware text objects like [f]unction, [c]lass:
+    Plug 'jeetsukumaran/vim-pythonsense'
 
-" All of your Plugins must be added before the following line
-call vundle#end()            " required
-filetype plugin indent on    " required
-" To ignore plugin indent changes, instead use:
-"filetype plugin on
-"
-" Brief help
-" :PluginList       - lists configured plugins
-" :PluginInstall    - installs plugins; append `!` to update or just :PluginUpdate
-" :PluginSearch foo - searches for foo; append `!` to refresh local cache
-" :PluginClean      - confirms removal of unused plugins; append `!` to auto-approve removal
-"
-" see :h vundle for more details or wiki for FAQ
-" Put your non-Plugin stuff after this line
-" Turn filetype plugin back on...
-" See :help ftplugin
-filetype plugin on
-
-
-syntax on
+call plug#end()
 
 " Backspace over everything.
 set backspace=indent,eol,start  
@@ -96,7 +72,7 @@ set history=10000 " this is the max value
 set ignorecase
 set smartcase
 
-" keep 5 lines context on curosr... eg. when searching
+" keep 5 lines context on cursor... eg. on search / scroll
 set scrolloff=5
 
 " highlight non-ascii characters: https://stackoverflow.com/a/16988346

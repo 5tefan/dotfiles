@@ -1,24 +1,6 @@
 [submodule "dotbot"]
 	path = dotbot
 	url = https://github.com/anishathalye/dotbot
-[submodule "vim/bundle/Vundle.vim"]
-	path = vim/bundle/Vundle.vim
-	url = https://github.com/VundleVim/Vundle.vim.git
-[submodule "vim/bundle/nerdtree"]
-	path = vim/bundle/nerdtree
-	url = https://github.com/scrooloose/nerdtree.git
-[submodule "vim/bundle/sparkup"]
-	path = vim/bundle/sparkup
-	url = https://github.com/rstacruz/sparkup.git
-[submodule "vim/bundle/vim-fugitive"]
-	path = vim/bundle/vim-fugitive
-	url = https://github.com/tpope/vim-fugitive.git
-[submodule "vim/bundle/vimwiki"]
-	path = vim/bundle/vimwiki
-	url = https://github.com/vimwiki/vimwiki.git
-[submodule "vim/bundle/fzf.vim"]
-	path = vim/bundle/fzf.vim
-	url = https://github.com/junegunn/fzf.vim.git
 [submodule "tmux/plugins/tpm"]
 	path = tmux/plugins/tpm
 	url = https://github.com/tmux-plugins/tpm
@@ -34,33 +16,9 @@
 [submodule "tmux/plugins/tmux-prefix-highlight"]
 	path = tmux/plugins/tmux-prefix-highlight
 	url = https://github.com/tmux-plugins/tmux-prefix-highlight.git
-[submodule "vim/bundle/vimtex"]
-	path = vim/bundle/vimtex
-	url = https://github.com/lervag/vimtex.git
 [submodule "z"]
 	path = z
 	url = https://github.com/rupa/z.git
-[submodule "vim/bundle/fzf"]
-	path = vim/bundle/fzf
-	url = https://github.com/junegunn/fzf.git
-[submodule "vim/bundle/vim-surround"]
-	path = vim/bundle/vim-surround
-	url = https://github.com/tpope/vim-surround.git
-[submodule "vim/bundle/vim-repeat"]
-	path = vim/bundle/vim-repeat
-	url = https://github.com/tpope/vim-repeat.git
-[submodule "vim/bundle/indentLine"]
-	path = vim/bundle/indentLine
-	url = https://github.com/Yggdroot/indentLine
-[submodule "vim/bundle/vim-pythonsense"]
-	path = vim/bundle/vim-pythonsense
-	url = https://github.com/jeetsukumaran/vim-pythonsense.git
-[submodule "vim/bundle/nerdcommenter"]
-	path = vim/bundle/nerdcommenter
-	url = https://github.com/preservim/nerdcommenter.git
-[submodule "vim/bundle/vim-easymotion"]
-	path = vim/bundle/vim-easymotion
-	url = https://github.com/easymotion/vim-easymotion.git
 [submodule "local/share/nvim/plugged/plenary.nvim"]
 	path = local/share/nvim/plugged/plenary.nvim
 	url = https://github.com/nvim-lua/plenary.nvim.git
