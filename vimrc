@@ -1,7 +1,6 @@
 call plug#begin()
 
     Plug 'tpope/vim-sensible'
-
     " git wrapper
     Plug 'tpope/vim-fugitive'
 
@@ -35,6 +34,7 @@ call plug#end()
 " Backspace over everything.
 set backspace=indent,eol,start  
 
+set noincsearch
 set nu
 set ruler
 set list
