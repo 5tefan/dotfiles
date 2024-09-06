@@ -106,7 +106,7 @@ command! -bang -nargs=? -complete=dir F call fzf#vim#files(<q-args>,
             \ {'options': [
                 \ '--info=inline', 
                 \ '--preview',
-                \ '~/.vim/bundle/fzf.vim/bin/preview.sh {}'
+                \ '~/.vim/plugged/fzf.vim/bin/preview.sh {}'
             \ ]}, <bang>0)
 
 " Rg with preview
@@ -118,7 +118,7 @@ command! -bang -nargs=* Rg call fzf#vim#grep(
                 \ '--delimiter=:',
                 \ '--nth=4..',
                 \ '--preview',
-                \ '~/.vim/bundle/fzf.vim/bin/preview.sh {}'
+                \ '~/.vim/plugged/fzf.vim/bin/preview.sh {}'
             \ ]}, <bang>0)
 
 
