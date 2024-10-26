@@ -7,13 +7,41 @@
 // custom settings, run the `open default settings` command
 // from the command palette or from `Zed` application menu.
 {
+  "autosave": "on_focus_change",
+  "base_keymap": "JetBrains",
+  "buffer_font_size": 12,
   "features": {
     "copilot": false
   },
-  "format_on_save": "off",
-  "base_keymap": "JetBrains",
-  "theme": "Andromeda",
-  "vim_mode": true,
-  "ui_font_size": 16,
-  "buffer_font_size": 16
+  "git_status": true,
+  "git_diff": true,
+  "git": {
+    "git_gutter": "tracked_files",
+    "inline_blame": {
+      "enabled": true
+    }
+  },
+  "indent_guides": {
+    "enabled": true,
+    "coloring": "indent_aware"
+  },
+  "inline_completions": {
+    "disabled_globs": [".env"]
+  },
+  "inlay_hints": {
+    "enabled": true
+  },
+  "languages": {
+    "Python": {
+      "show_inline_completions": true
+    }
+  },
+  "show_inline_completions": false,
+  "show_copilot_suggestions": false,
+  "theme": "One Dark",
+  "ui_font_size": 14,
+  "vim": {
+    "use_system_clipboard": "never"
+  },
+  "vim_mode": true
 }
