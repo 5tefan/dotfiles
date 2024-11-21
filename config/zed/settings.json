@@ -36,6 +36,8 @@
       "show_inline_completions": true
     }
   },
+  "pane_split_direction_horizontal": "down",
+  "pane_split_direction_vertical": "right",
   "show_inline_completions": false,
   "show_copilot_suggestions": false,
   "theme": "One Dark",
