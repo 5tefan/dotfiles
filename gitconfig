@@ -20,6 +20,9 @@
     brs = branch --sort=-committerdate
     sw = switch
     re = restore
+    res = restore --staged
+    rew = rewstore --worktree
+    resw = restore --staged --worktree
     co = commit -v
     coa = commit -v --amend
     pom = pull origin main
