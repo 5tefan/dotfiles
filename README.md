@@ -11,6 +11,7 @@ into a "common" dotfile that I can then source from the machine specific rc file
 
 ### Bash
 
+1. Add `[ -f ~/.bash-common.sh ] && source ~/.bash-common.sh` to `~/.bashrc`
 
 ### Zsh
 
