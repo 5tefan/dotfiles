@@ -7,14 +7,27 @@
 // custom settings, run the `open default settings` command
 // from the command palette or from `Zed` application menu.
 {
+  "agent": {
+    "default_model": {
+      "provider": "ollama",
+      "model": "qwen3:32b-q8_0"
+    }
+  },
   "autosave": "on_focus_change",
   "base_keymap": "JetBrains",
   "buffer_font_size": 12,
-  "features": {
-    "copilot": false
+  "close_on_file_delete": true,
+  "edit_predictions": {
+    "copilot": {
+      "proxy": "http://localhost:11435",
+      "proxy_no_verify": true
+    },
+    "disabled_globs": [".env"]
   },
-  "git_status": true,
-  "git_diff": true,
+  "expand_excerpt_lines": 15,
+  "features": {
+    "edit_prediction_provider": "copilot"
+  },
   "git": {
     "git_gutter": "tracked_files",
     "inline_blame": {
@@ -25,21 +38,38 @@
     "enabled": true,
     "coloring": "indent_aware"
   },
-  "inline_completions": {
-    "disabled_globs": [".env"]
-  },
   "inlay_hints": {
     "enabled": true
   },
   "languages": {
     "Python": {
-      "show_inline_completions": true
+      "show_edit_predictions": true,
+      "language_servers": ["!pylsp", "pyright"],
+      "formatter": [
+        {
+          "external": {
+            "command": "black",
+            "arguments": ["-"]
+          }
+        },
+        {
+          "external": {
+            "command": "isort",
+            "arguments": ["-d", "-"]
+          }
+        }
+      ]
     }
+  },
+  "minimap": {
+    "show": "always",
+    "display_in": "all_editors",
+    "current_line_highlight": "all"
   },
   "pane_split_direction_horizontal": "down",
   "pane_split_direction_vertical": "right",
-  "show_inline_completions": false,
-  "show_copilot_suggestions": false,
+  "show_edit_predictions": true,
+  "show_completions_on_input": true,
   "theme": "One Dark",
   "ui_font_size": 14,
   "vim": {

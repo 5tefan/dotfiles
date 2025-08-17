@@ -61,3 +61,6 @@
     deltaCacheSize = 2047m 
     packSizeLimit = 2047m 
     windowMemory = 2047m
+    window = 1
+[http]
+    postBuffer = 157286400

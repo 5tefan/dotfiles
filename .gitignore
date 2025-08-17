@@ -4,10 +4,16 @@ local/state
 local/share/nvim/.netrwhist
 local/share/lftp/
 local/share/meld/
+local/share/cartopy/
+local/share/containers/
+local/share/nsnake/
+local/share/recently-used.xbel
 config/htop
 config/zed/conversations
 config/zed/embeddings
 config/zed/themes
 config/zed/.tmp*
+config/containers/
+
 vim/undo/
 vim/plugged/
