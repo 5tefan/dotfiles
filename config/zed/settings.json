@@ -10,7 +10,7 @@
   "agent": {
     "default_model": {
       "provider": "ollama",
-      "model": "qwen3:32b-q8_0"
+      "model": "gpt-oss:120b"
     }
   },
   "autosave": "on_focus_change",
