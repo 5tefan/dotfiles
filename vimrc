@@ -124,12 +124,12 @@ command! -bang -nargs=* Rg call fzf#vim#grep(
 
 "" Vimwiki....
 let wiki_1 = {}
-let wiki_1.path = '~/ownCloud2/vimwiki'
-let wiki_1.path_html = '~/ownCloud2/vimwiki_html/'
-let wiki_1.template_path = '~/ownCloud2/vimwiki/templates/'
+let wiki_1.path = '~/ownCloud/vimwiki'
+let wiki_1.path_html = '~/ownCloud/vimwiki_html/'
+let wiki_1.template_path = '~/ownCloud/vimwiki/templates/'
 let wiki_1.template_default = 'default'
 let wiki_1.template_ext = '.html'
-let wiki_1.css_name = '~/ownCloud2/vimwiki/custom.css'
+let wiki_1.css_name = '~/ownCloud/vimwiki/custom.css'
 
 let g:vimwiki_list = [wiki_1]
 " For some reason, this conceal seems to be leaking around and
@@ -180,6 +180,7 @@ command Glc .-1read !git log --format=\%s -n1
 
 " read date
 command Rd .-1read !date -I
+command Rdt .-1read !date
 
 " quick fix shortcuts, write and next/previous
 command! -nargs=0 Wcn :w <bar> :cn
