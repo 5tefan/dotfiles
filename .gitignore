@@ -17,3 +17,5 @@ config/containers/
 
 vim/undo/
 vim/plugged/
+
+config/zed/prompts/
