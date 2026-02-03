@@ -124,14 +124,13 @@ command! -bang -nargs=* Rg call fzf#vim#grep(
 
 "" Vimwiki....
 let wiki_1 = {}
-let wiki_1.path = '~/ownCloud/vimwiki'
-let wiki_1.path_html = '~/ownCloud/vimwiki_html/'
-let wiki_1.template_path = '~/ownCloud/vimwiki/templates/'
+let wiki_1.path = '~/vimwiki'
+let wiki_1.path_html = '~/vimwiki_html/'
+let wiki_1.template_path = '~/vimwiki/templates/'
 let wiki_1.template_default = 'default'
 let wiki_1.template_ext = '.html'
-let wiki_1.css_name = '~/ownCloud/vimwiki/custom.css'
+let wiki_1.css_name = '~/vimwiki/custom.css'
 
-let g:vimwiki_list = [wiki_1]
 " For some reason, this conceal seems to be leaking around and
 " is super annoying. I don't want magically appearing chars!
 let g:vimwiki_conceal_onechar_markers = 0
@@ -141,6 +140,9 @@ let g:vimwiki_conceallevel = 0
 " indentLine looks like another culript.
 let g:indentLine_fileTypeExclude = ['json', 'vimwiki']
 let g:indentLine_setConceal = 0
+
+let g:vimwiki_conceal_onechar_markers=0
+let g:vimwiki_list = [wiki_1]
 
 autocmd FileType * setlocal formatoptions-=c formatoptions-=r formatoptions-=o
 

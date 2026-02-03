@@ -29,6 +29,7 @@
     poh = push origin HEAD
     pfoh = push --force origin HEAD
     git = !exec git  # https://caiustheory.com/git-git-git-git-git/
+    sreb = !git stash push -u && git rebase - && git stash pop
 [color]
     diff = auto
     status = always
@@ -64,3 +65,5 @@
     window = 1
 [http]
     postBuffer = 157286400
+[rerere]
+    enabled = 1
