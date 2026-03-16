@@ -3,3 +3,22 @@
 [user]
 name = "Stefan Codrescu"
 email = "ssmmcc1@gmail.com"
+
+[aliases]
+co = ["commit"]
+poh = ["git", "push"]
+pom = ["git", "fetch"]
+l = ["log", "-r", "main | immutable_heads()-..@ | (immutable_heads()-..@):: | @::"]
+
+[remotes.origin]
+auto-track-bookmarks = "*"
+
+[revset-aliases]
+"immutable_bookmarks()" = "main@upstream"
+"closest_pushable(to)" = "heads(::to & mutable() & ~description(exact:'') & (~empty() | merges()))"
+
+[revsets]
+# https://github.com/jj-vcs/jj/issues/9079#issuecomment-4042768244
+bookmark-advance-from = "closest_bookmarks(to) ~ immutable_bookmarks()"
+# https://github.com/jj-vcs/jj/pull/8830#issuecomment-3952394421
+bookmark-advance-to = "closest_pushable(@)"
