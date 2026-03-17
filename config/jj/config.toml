@@ -9,13 +9,17 @@ co = ["commit"]
 poh = ["git", "push"]
 pom = ["git", "fetch"]
 l = ["log", "-r", "main | immutable_heads()-..@ | (immutable_heads()-..@):: | @::"]
+d = ["diff"]
 
 [remotes.origin]
 auto-track-bookmarks = "*"
 
 [revset-aliases]
-"immutable_bookmarks()" = "main@upstream"
+"immutable_bookmarks()" = "main"
 "closest_pushable(to)" = "heads(::to & mutable() & ~description(exact:'') & (~empty() | merges()))"
+# Based on https://github.com/jj-vcs/jj/discussions/5568#discussioncomment-12674748
+"closest_bookmarks()" = "closest_bookmarks(@-)"
+"closest_bookmarks(to)" = "heads(::to & bookmarks())"
 
 [revsets]
 # https://github.com/jj-vcs/jj/issues/9079#issuecomment-4042768244

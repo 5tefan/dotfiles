@@ -1,0 +1,14 @@
+[
+  {
+    "context": "",
+    "bindings": {
+      "ctrl-w e": "terminal_panel::ToggleFocus",
+    },
+  },
+  {
+    "context": "",
+    "bindings": {
+      "ctrl-w": null,
+    },
+  },
+]
