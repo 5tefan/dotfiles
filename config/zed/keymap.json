@@ -2,13 +2,11 @@
   {
     "context": "",
     "bindings": {
-      "ctrl-w e": "terminal_panel::ToggleFocus",
-    },
-  },
-  {
-    "context": "",
-    "bindings": {
       "ctrl-w": null,
+      "\\ w t": "terminal_panel::ToggleFocus",
+      "\\ w f": "project_panel::ToggleFocus",
+      "\\ w a": "agent::ToggleFocus",
+      "\\ w s": "outline_panel::ToggleFocus",
     },
   },
 ]
