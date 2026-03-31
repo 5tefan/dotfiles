@@ -23,3 +23,5 @@ alias rg='rg --color=always'
 
 source $HOME/.z.sh
 
+[ -d ~/.cargo/bin ] && export PATH=$PATH:~/.cargo/bin
+
