@@ -8,38 +8,78 @@
 // from the command palette or from `Zed` application menu.
 {
   "agent": {
+    "tool_permissions": {
+      "tools": {
+        "terminal": {
+          "always_allow": [
+            {
+              "pattern": "^cargo\\s"
+            },
+            {
+              "pattern": "^tree-sitter\\s"
+            },
+            {
+              "pattern": "^head\\s"
+            },
+            {
+              "pattern": "^tail\\s"
+            },
+            {
+              "pattern": "^cat\\s"
+            },
+            {
+              "pattern": "^echo\\s"
+            },
+            {
+              "pattern": "^grep\\s"
+            },
+          ],
+        },
+      },
+    },
+    "favorite_models": [
+      {
+        "provider": "ollama",
+        "model": "qwen3.5:122b-a10b",
+        "enable_thinking": false,
+      },
+    ],
+    "default_profile": "write",
+    "enable_feedback": false,
     "default_model": {
+      "enable_thinking": false,
       "provider": "ollama",
-      "model": "gpt-oss:120b"
-    }
+      "model": "qwen3.5:122b-a10b",
+    },
+    "notify_when_agent_waiting": "primary_screen",
+    "play_sound_when_agent_done": true,
   },
   "autosave": "on_focus_change",
   "base_keymap": "JetBrains",
   "buffer_font_size": 12,
   "close_on_file_delete": true,
   "edit_predictions": {
-    "copilot": {
-      "proxy": "http://localhost:11435",
-      "proxy_no_verify": true
+    "provider": "ollama",
+    "ollama": {
+      "model": "qwen2.5-coder:32b-instruct-q8_0",
+      "max_output_tokens": 64,
+      "api_url": "http://localhost:11434",
     },
-    "disabled_globs": [".env"]
+    "disabled_globs": [".env"],
   },
   "expand_excerpt_lines": 15,
-  "features": {
-    "edit_prediction_provider": "copilot"
-  },
   "git": {
     "git_gutter": "tracked_files",
     "inline_blame": {
-      "enabled": true
-    }
+      "enabled": true,
+    },
   },
   "indent_guides": {
     "enabled": true,
-    "coloring": "indent_aware"
+    "coloring": "indent_aware",
   },
   "inlay_hints": {
-    "enabled": true
+    "enabled": true,
   },
   "languages": {
     "Python": {
@@ -49,22 +89,56 @@
         {
           "external": {
             "command": "black",
-            "arguments": ["-"]
-          }
+            "arguments": ["-"],
+          },
         },
         {
           "external": {
             "command": "isort",
-            "arguments": ["-d", "-"]
-          }
-        }
-      ]
-    }
+            "arguments": ["-d", "-"],
+          },
+        },
+      ],
+    },
+  },
+  "language_models": {
+    "ollama": {
+      "api_url": "http://localhost:11434",
+      "available_models": [
+        {
+          "name": "gpt-oss:120b",
+          "max_tokens": 131072,
+          "supports_tools": true,
+          "supports_thinking": true,
+          "supports_images": false,
+          "keep_alive": null,
+        },
+        {
+          "name": "qwen3.5:122b-a10b",
+          "max_tokens": 262144,
+          "supports_tools": true,
+          "supports_thinking": true,
+          "supports_images": true,
+          "keep_alive": null,
+        },
+      ],
+    },
+  },
+  "lsp": {
+    "texlab": {
+      "settings": {
+        "texlab": {
+          "build": {
+            "onSave": false,
+          },
+        },
+      },
+    },
   },
   "minimap": {
     "show": "always",
     "display_in": "all_editors",
-    "current_line_highlight": "all"
+    "current_line_highlight": "all",
   },
   "pane_split_direction_horizontal": "down",
   "pane_split_direction_vertical": "right",
@@ -73,7 +147,7 @@
   "theme": "One Dark",
   "ui_font_size": 14,
   "vim": {
-    "use_system_clipboard": "never"
+    "use_system_clipboard": "never",
   },
-  "vim_mode": true
+  "vim_mode": true,
 }
