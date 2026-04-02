@@ -10,6 +10,7 @@ poh = ["git", "push"]
 pom = ["git", "fetch"]
 l = ["log", "-r", "main | immutable_heads()-..@ | (immutable_heads()-..@):: | @::"]
 d = ["diff"]
+e = ["edit"]
 
 [remotes.origin]
 auto-track-bookmarks = "*"
