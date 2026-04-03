@@ -11,6 +11,8 @@ pom = ["git", "fetch"]
 l = ["log", "-r", "main | immutable_heads()-..@ | (immutable_heads()-..@):: | @::"]
 d = ["diff"]
 e = ["edit"]
+bclean = ["util", "exec", "--", "sh", "-c", "jj b l -r '(bookmarks() & mutable() & committer_date(before:\"2 weeks ago\")) | (bookmarks() & immutable() ~ immutable_bookmarks())' -T 'name ++ \"\\n\"' | grep -v '^$' | xargs -r jj b f"]
+
 
 [remotes.origin]
 auto-track-bookmarks = "*"
