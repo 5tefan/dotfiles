@@ -5,13 +5,15 @@ name = "Stefan Codrescu"
 email = "ssmmcc1@gmail.com"
 
 [aliases]
-co = ["commit"]
+co = ["util", "exec", "--", "sh", "-c", "PARENT=$(jj log -r @ --no-graph -T 'change_id.shortest()') && jj commit && jj rebase -s \"children($PARENT) ~ @\" -d @"]
 poh = ["git", "push"]
 pom = ["git", "fetch"]
 l = ["log", "-r", "main | immutable_heads()-..@ | (immutable_heads()-..@):: | @::"]
 d = ["diff", "--git"]
 e = ["edit"]
 bclean = ["util", "exec", "--", "sh", "-c", "jj b l -r '(bookmarks() & mutable() & committer_date(before:\"2 weeks ago\")) | (bookmarks() & immutable() ~ immutable_bookmarks())' -T 'name ++ \"\\n\"' | grep -v '^$' | xargs -r jj b f"]
+bforget = ["util", "exec", "--", "sh", "-c", "jj b l -r 'bookmarks() & ~mine() & ~main' -T 'name ++ \"\\n\"' | grep -v '^$' | xargs -r jj b f"]
+rev = ["new", "--insert-after"]
 
 
 [remotes.origin]

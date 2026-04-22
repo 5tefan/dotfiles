@@ -8,6 +8,7 @@
       "\\ w a": "agent::ToggleFocus",
       "\\ w s": "outline_panel::ToggleFocus",
       "\\ w e": "editor::ToggleFocus",
+      "\\ w z": "workspace::ToggleZoom",
     },
   },
 ]

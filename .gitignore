@@ -14,6 +14,8 @@ config/zed/embeddings
 config/zed/themes
 config/zed/.tmp*
 config/containers/
+config/gh/
+config/gh-copilot/
 
 vim/undo/
 vim/plugged/
