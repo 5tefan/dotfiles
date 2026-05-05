@@ -31,3 +31,12 @@ auto-track-bookmarks = "*"
 bookmark-advance-from = "closest_bookmarks(to) ~ immutable_bookmarks()"
 # https://github.com/jj-vcs/jj/pull/8830#issuecomment-3952394421
 bookmark-advance-to = "closest_pushable(@)"
+
+[templates]
+draft_commit_description = '''
+concat(
+  builtin_draft_commit_description,
+  "\nJJ: ignore-rest\n",
+  diff.git(),
+)
+'''
