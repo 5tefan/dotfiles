@@ -32,7 +32,7 @@ call plug#begin()
 call plug#end()
 
 " Backspace over everything.
-set backspace=indent,eol,start  
+set backspace=indent,eol,start
 
 set noincsearch
 set nu
@@ -66,8 +66,8 @@ set showmatch
 set tw=100
 set history=10000 " this is the max value
 
-" If you search for something containing uppercase characters, it will do a case sensitive search; 
-" if you search for something purely lowercase, it will do a case insensitive search. 
+" If you search for something containing uppercase characters, it will do a case sensitive search;
+" if you search for something purely lowercase, it will do a case insensitive search.
 " NOTE: ignorecase affects substitutions as well as searches.
 set ignorecase
 set smartcase
@@ -102,9 +102,9 @@ set undofile
 let $FZF_DEFAULT_COMMAND = 'rg --files'
 
 " short version :F of normal :Files cmd
-command! -bang -nargs=? -complete=dir F call fzf#vim#files(<q-args>, 
+command! -bang -nargs=? -complete=dir F call fzf#vim#files(<q-args>,
             \ {'options': [
-                \ '--info=inline', 
+                \ '--info=inline',
                 \ '--preview',
                 \ '~/.vim/plugged/fzf.vim/bin/preview.sh {}'
             \ ]}, <bang>0)
@@ -124,12 +124,12 @@ command! -bang -nargs=* Rg call fzf#vim#grep(
 
 "" Vimwiki....
 let wiki_1 = {}
-let wiki_1.path = '~/vimwiki'
-let wiki_1.path_html = '~/vimwiki_html/'
-let wiki_1.template_path = '~/vimwiki/templates/'
+let wiki_1.path = '~/owncloud/vimwiki'
+let wiki_1.path_html = '~/owncloud/vimwiki_html/'
+let wiki_1.template_path = '~/owncloud/vimwiki/templates/'
 let wiki_1.template_default = 'default'
 let wiki_1.template_ext = '.html'
-let wiki_1.css_name = '~/vimwiki/custom.css'
+let wiki_1.css_name = '~/owncloud/vimwiki/custom.css'
 
 " For some reason, this conceal seems to be leaking around and
 " is super annoying. I don't want magically appearing chars!
@@ -144,36 +144,81 @@ let g:indentLine_setConceal = 0
 let g:vimwiki_conceal_onechar_markers=0
 let g:vimwiki_list = [wiki_1]
 
-autocmd FileType * setlocal formatoptions-=c formatoptions-=r formatoptions-=o
+autocmd FileType * setlocal fo-=c fo-=r fo-=o
+
+" wrap on lines longer than tw
+set fo+=t
 
 " vimtex default flavor, rather than default plain
 let g:tex_flavor = 'latex'
 " please don't conceal things!
 let g:vimtex_syntax_conceal_disable = 1
 
-" Vimwiki include pgn files with {{pgn:path/to.pgn}}
-function! VimwikiWikiIncludeHandler(value)
+" Helper function to handle PGN includes with unique IDs
+function! VimwikiHandlePgnInclude(value)
+    " Matches content between {{pgn: and }}
     let pgn = matchstr(a:value, '{{pgn:\zs.\{-}\ze}}')
     if filereadable(pgn)
-        return '<pre class="pgn">'.join(readfile(pgn), "\r").'</pre>'
+        let lines = readfile(pgn)
+        " Filter out lines starting with [Site "
+        let pattern = '^[Site "'
+        let filtered_lines = filter(lines, 'v:val !~# pattern')
+        let pgn_raw = join(filtered_lines, "\r")
+    else
+        return ''
+    endif
+
+    if !exists('g:vimwiki_pgn_counter')
+        let g:vimwiki_pgn_counter = 0
+    endif
+    let g:vimwiki_pgn_counter += 1
+    let unique_id = 'chess_board_pgn_' . g:vimwiki_pgn_counter
+
+    " Store escaped PGN in hidden div, script reads and uses it
+    let out = '<div id="' . unique_id . '" class="cg-wrap"></div>'
+    let out .= '<div id="' . unique_id . '_pgn" style="display:none">' . pgn_raw . '</div>'
+    let out .= '<script type="module">import V from "/js/lichess-pgn-viewer.min.js"; var el = document.getElementById("' . unique_id . '"); var pgnEl = document.getElementById("' . unique_id . '_pgn"); var pgn = pgnEl.textContent.replace(/<br>/g, "\r"); var v = V(el, {pgn: pgn});</script>'
+    return out
+endfunction
+
+" Helper function to handle FEN includes
+function! VimwikiHandleFenInclude(value)
+    let fen = matchstr(a:value, '{{fen:\zs.\{-}\ze}}')
+    let wfen = matchstr(a:value, '{{wfen:\zs.\{-}\ze}}')
+    let bfen = matchstr(a:value, '{{bfen:\zs.\{-}\ze}}')
+
+    let orientation = "white"
+    if strlen(wfen) > 3
+        let fen = wfen
+    elseif strlen(bfen) > 3
+        let fen = bfen
+        let orientation = "black"
+    endif
+
+    if strlen(fen) > 3
+        if !exists('g:vimwiki_fen_counter')
+            let g:vimwiki_fen_counter = 0
+        endif
+        let g:vimwiki_fen_counter += 1
+        let unique_id = 'chess_board_fen_' . g:vimwiki_fen_counter
+
+        let out = '<div class="fen"><div id="' . unique_id . '" class="cg-wrap"></div></div>'
+        let out .= '<script>var cg = Chessground(document.getElementById("' . unique_id . '"), {"fen": "' . fen . '", "orientation": "' . orientation . '"})</script>'
+        let out .= '<br/><br/>'
+        let out .= '<pre>'.fen.'</pre>'
+        return out
     end
     " Return the empty string when unable to process link
     return ''
 endfunction
 
-" Vimwiki include fen board positions with {{fen:...}}
-" Need to configure chessground assets in (likely) a template.
-" before this will work for you.
 function! VimwikiWikiIncludeHandler(value)
-    let fen = matchstr(a:value, '{{fen:\zs.\{-}\ze}}')
-    if strlen(fen) > 3
-        let out = '<div class="blue merida"><div id="dirty" class="cg-wrap"></div></div>'
-        let out .= '<script>var cg = Chessground(document.getElementById("dirty"), {"fen": "'.fen.'"})</script>'
-        let out .= '<br/><br/>'
-        let out .= '<pre class="fen">'.fen.'</pre>'
-        return out
-    end
-    " Return the empty string when unable to process link
+    call writefile(['VimwikiWikiIncludeHandler called with: ' . string(a:value)], expand('~') . '/tmp/vimwiki_debug.log', 'a')
+    if a:value =~ '{{pgn:'
+        return VimwikiHandlePgnInclude(a:value)
+    elseif a:value =~ '{{fen:' || a:value =~ '{{wfen:' || a:value =~ '{{bfen:'
+        return VimwikiHandleFenInclude(a:value)
+    endif
     return ''
 endfunction
 
