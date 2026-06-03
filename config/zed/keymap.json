@@ -1,6 +1,5 @@
 [
   {
-    "context": "",
     "bindings": {
       "ctrl-w": null,
       "\\ w t": "terminal_panel::ToggleFocus",
@@ -9,6 +8,8 @@
       "\\ w s": "outline_panel::ToggleFocus",
       "\\ w e": "editor::ToggleFocus",
       "\\ w z": "workspace::ToggleZoom",
+      "\\ l f": ["task::Spawn", { "task_name": "forward_search" }],
+      "\\ l v": ["task::Spawn", { "task_name": "latexmk (watch)" }],
     },
   },
 ]
