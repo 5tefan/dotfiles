@@ -15,11 +15,13 @@ e = ["edit"]
 bclean = ["util", "exec", "--", "sh", "-c", "jj b l -r '(bookmarks() & mutable() & committer_date(before:\"2 weeks ago\")) | (bookmarks() & immutable() ~ immutable_bookmarks())' -T 'name ++ \"\\n\"' | grep -v '^$' | xargs -r jj b f"]
 bforget = ["util", "exec", "--", "sh", "-c", "jj b l -r 'bookmarks() & ~mine() & ~main' -T 'name ++ \"\\n\"' | grep -v '^$' | xargs -r jj b f"]
 rev = ["new", "--insert-after"]
-rr = ["rebase", "-s", "roots(mutable())", "-d", "main"]
+rr = ["rebase", "-s", "roots(mutable() & mine())", "-d", "main"]
+collapse = ["squash", "--from", "main..@", "--into", "@", "--ignore-immutable"]
+
 
 
 [remotes.origin]
-auto-track-bookmarks = "*"
+auto-track-bookmarks = "glob:stefan/*"
 
 [revset-aliases]
 "immutable_bookmarks()" = "main"
@@ -42,3 +44,6 @@ concat(
   diff.git(),
 )
 '''
+
+[ui]
+default-command = "log"
