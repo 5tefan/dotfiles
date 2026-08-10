@@ -8,9 +8,10 @@ email = "ssmmcc1@gmail.com"
 co = ["util", "exec", "--", "sh", "-c", "PARENT=$(jj log -r @ --no-graph -T 'change_id.shortest()') && jj commit && jj rebase -s \"children($PARENT) ~ @\" -d @"]
 poh = ["git", "push"]
 pom = ["git", "fetch"]
-l = ["log", "-r", "main | immutable_heads()-..@ | (immutable_heads()-..@):: | @::"]
+l  = ["log", "-r", "main | immutable_heads()-..@ | @::"]
+la = ["log", "-r", "main | immutable_heads()-..@ | (immutable_heads()-..@):: | @::"]
 lm = ["log", "-r", "mine()"]
-d = ["diff", "--git"]
+d = ["diff"]
 e = ["edit"]
 bclean = ["util", "exec", "--", "sh", "-c", "jj b l -r '(bookmarks() & mutable() & committer_date(before:\"2 weeks ago\")) | (bookmarks() & immutable() ~ immutable_bookmarks())' -T 'name ++ \"\\n\"' | grep -v '^$' | xargs -r jj b f"]
 bforget = ["util", "exec", "--", "sh", "-c", "jj b l -r 'bookmarks() & ~mine() & ~main' -T 'name ++ \"\\n\"' | grep -v '^$' | xargs -r jj b f"]
@@ -47,3 +48,4 @@ concat(
 
 [ui]
 default-command = "log"
+diff-formatter = ["difft", "--color=always", "$left", "$right"]
