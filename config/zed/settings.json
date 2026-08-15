@@ -7,7 +7,6 @@
 // custom settings, run the `open default settings` command
 // from the command palette or from `Zed` application menu.
 {
-  "cli_default_open_behavior": "new_window",
   "terminal": {
     "dock": "bottom",
   },
@@ -28,25 +27,6 @@
       "type": "registry",
     },
   },
-  "lsp": {
-    "vtsls": {
-      "settings": {
-        "typescript": {
-          "updateImportsOnFileMove": {
-            "enabled": "always",
-          },
-        },
-        "javascript": {
-          "updateImportsOnFileMove": {
-            "enabled": "always",
-          },
-        },
-      },
-      "enable_lsp_tasks": true,
-    },
-  },
-  "excerpt_context_lines": 10,
-  "close_on_file_delete": true,
   "agent": {
     "sandbox_permissions": {
       "allow_unsandboxed": true,
@@ -70,6 +50,9 @@
             { "pattern": "^doppler run -- bunx langfuse-cli\\b" },
             { "pattern": "^jj new\\b" },
             { "pattern": "^shamecube\\b" },
+            // more projects
+            { "pattern": "^cargo\\s" },
+            { "pattern": "^tree\\-sitter\\b.*(\\s|$)" },
 
             // Frontend
             { "pattern": "cd (intern|tiger_lily)/frontend\\b" },
@@ -130,20 +113,28 @@
         "enable_thinking": true,
         "effort": "medium",
       },
+      {
+        "provider": "ollama",
+        "model": "qwen3.6:27b-mtp-bf16",
+        "enable_thinking": true,
+      },
     ],
     "enable_feedback": false,
     "default_profile": "write",
-    "default_model": {
-      "effort": "high",
-      "enable_thinking": true,
-      "provider": "copilot_chat",
-      "model": "claude-opus-4.8",
-    },
+    "notify_when_agent_waiting": "primary_screen",
+    "play_sound_when_agent_done": "always",
   },
   "autosave": "on_focus_change",
   "base_keymap": "JetBrains",
   "buffer_font_size": 12,
   "colorize_brackets": true,
+  "cli_default_open_behavior": "new_window",
+  "close_on_file_delete": true,
+  "edit_predictions": {
+    "provider": "copilot",
+    "disabled_globs": [".env"],
+  },
+  "excerpt_context_lines": 10,
   "expand_excerpt_lines": 15,
   "format_on_save": "on",
   "git": {
@@ -155,10 +146,6 @@
   "indent_guides": {
     "enabled": true,
     "coloring": "indent_aware",
-  },
-  "edit_predictions": {
-    "provider": "copilot",
-    "disabled_globs": [".env"],
   },
   "inlay_hints": {
     "enabled": true,
@@ -173,6 +160,52 @@
     "Python": {
       "show_edit_predictions": true,
       "language_servers": ["!pylsp", "pyright"],
+      "formatter": [
+        {
+          "external": {
+            "command": "black",
+            "arguments": ["-"],
+          },
+        },
+        {
+          "external": {
+            "command": "isort",
+            "arguments": ["-d", "-"],
+          },
+        },
+      ],
+    },
+  },
+  "language_models": {
+    "llama.cpp": {
+      "api_url": "http://localhost:10800",
+      "auto_discover": true,
+    },
+  },
+  "lsp": {
+    "texlab": {
+      "settings": {
+        "texlab": {
+          "build": {
+            "onSave": false,
+          },
+        },
+      },
+    },
+    "vtsls": {
+      "settings": {
+        "typescript": {
+          "updateImportsOnFileMove": {
+            "enabled": "always",
+          },
+        },
+        "javascript": {
+          "updateImportsOnFileMove": {
+            "enabled": "always",
+          },
+        },
+      },
+      "enable_lsp_tasks": true,
     },
   },
   "minimap": {
