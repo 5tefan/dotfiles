@@ -7,6 +7,19 @@
 // custom settings, run the `open default settings` command
 // from the command palette or from `Zed` application menu.
 {
+  "context_servers": {
+    "agent-browser": {
+      "env": {
+        "AGENT_BROWSER_EXECUTABLE_PATH": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      },
+      "enabled": true,
+      "remote": false,
+      "command": "agent-browser",
+      "args": ["mcp"],
+      "timeout": 300,
+    },
+  },
+  "context_server_timeout": 300,
   "terminal": {
     "dock": "bottom",
   },
