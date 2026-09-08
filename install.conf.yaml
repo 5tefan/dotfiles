@@ -1,12 +1,21 @@
 - defaults:
     link:
       relink: true
+    shell:
+      stdout: true
+      stderr: true
 
-- clean: ['~']
+- clean: ["~"]
 
 - shell:
-  - [git submodule update --init --recursive, Installing submodules]
-  - [cd vim/bundle; for d in *; do (cd $d && git checkout master); done, Checkout vim plugin branches]
+    - description: Installing submodules
+      command: git submodule update --init --recursive
+    - description: Configure bash to source ~/.bash-common.sh
+      command: |
+        grep -qxsF '[ -f ~/.bash-common.sh ] && source ~/.bash-common.sh' ~/.bashrc || echo '[ -f ~/.bash-common.sh ] && source ~/.bash-common.sh' >> ~/.bashrc
+    - description: Configure zsh to source ~/.zsh-common.zsh
+      command: |
+        grep -qxsF '[ -f ~/.zsh-common.zsh ] && source ~/.zsh-common.zsh' ~/.zshrc || echo '[ -f ~/.zsh-common.zsh ] && source ~/.zsh-common.zsh' >> ~/.zshrc
 
 - link:
     ~/.config: config
