@@ -13,4 +13,10 @@
       "\\ l v": ["task::Spawn", { "task_name": "latexmk (watch)" }],
     },
   },
+  {
+    "context": "AgentPanel",
+    "bindings": {
+      "cmd-w": "workspace::CloseActiveDock",
+    },
+  },
 ]
