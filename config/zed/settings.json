@@ -47,7 +47,46 @@
     "dock": "left",
     "tool_permissions": {
       "tools": {
+        "mcp:agent-browser:agent_browser_click": {
+          "default": "allow",
+        },
+        "mcp:agent-browser:agent_browser_snapshot": {
+          "default": "allow",
+        },
+        "mcp:agent-browser:agent_browser_get_title": {
+          "default": "allow",
+        },
+        "mcp:agent-browser:agent_browser_tab_switch": {
+          "default": "allow",
+        },
+        "mcp:agent-browser:agent_browser_close": {
+          "default": "allow",
+        },
+        "mcp:agent-browser:agent_browser_tab_new": {
+          "default": "allow",
+        },
+        "mcp:agent-browser:agent_browser_tab_list": {
+          "default": "allow",
+        },
+        "mcp:agent-browser:agent_browser_get_url": {
+          "default": "allow",
+        },
+        "mcp:agent-browser:agent_browser_read": {
+          "default": "allow",
+        },
+        "mcp:agent-browser:agent_browser_open": {
+          "default": "allow",
+        },
+        "mcp:agent-browser:agent_browser_eval": {
+          "default": "allow",
+        },
+        "mcp:agent-browser:agent_browser_wait_ms": {
+          "default": "allow",
+        },
         "write_file": {
+          "default": "allow",
+        },
+        "move_path": {
           "default": "allow",
         },
         "terminal": {
@@ -56,27 +95,66 @@
             { "pattern": "/tmp" },
           ],
           "always_allow": [
-            // Project commands
-            { "pattern": "^source\\s+\\.venv/bin/activate\\b" },
-            { "pattern": "^\\./manage\\.py (test|graphql)\\b" },
-            { "pattern": "^bin/(format|ci)\\b" },
-            { "pattern": "^doppler run -- bunx langfuse-cli\\b" },
-            { "pattern": "^jj new\\b" },
-            { "pattern": "^shamecube\\b" },
-            // more projects
-            { "pattern": "^cargo\\s" },
-            { "pattern": "^tree\\-sitter\\b.*(\\s|$)" },
-
-            // Frontend
-            { "pattern": "cd (intern|tiger_lily)/frontend\\b" },
-            { "pattern": "(yarn|npx) (tsc|lint)\\b" },
-            { "pattern": "ls intern/frontend/src/__generated__" },
-
-            // Linters / type checkers
-            { "pattern": "^(ruff|mypy)\\b" },
-
-            // Read-only shell utilities
-            { "pattern": "^(rg|grep|head|tail|sort|uniq|wc|jq|echo|tr)\\b" },
+            {
+              "pattern": "^source\\s+\\.venv/bin/activate\\b",
+            },
+            {
+              "pattern": "^source\\s+\\.venv/bin/activate\\s*&&\\s*\\./manage\\.py\\b",
+            },
+            {
+              "pattern": "^\\./manage\\.py\\b",
+            },
+            {
+              "pattern": "^bin/(format|ci)\\b",
+            },
+            {
+              "pattern": "^doppler run -- bunx langfuse-cli\\b",
+            },
+            {
+              "pattern": "^jj\\s+(?:new|status|log|desc|diff|edit|squash|resolve|file)\\b",
+            },
+            {
+              "pattern": "^shamecube\\b",
+            },
+            {
+              "pattern": "^cargo\\s",
+            },
+            {
+              "pattern": "^tree\\-sitter\\b.*(\\s|$)",
+            },
+            {
+              "pattern": "cd (intern|tiger_lily)/frontend\\b",
+            },
+            {
+              "pattern": "^\\./manage\\.py\\b",
+            },
+            {
+              "pattern": "(yarn|npx) (tsc|lint)\\b",
+            },
+            {
+              "pattern": "ls intern/frontend/src/__generated__",
+            },
+            {
+              "pattern": "^(ruff|mypy)\\b",
+            },
+            {
+              "pattern": "^(rg|grep|head|tail|sort|uniq|wc|jq|echo|tr)\\b",
+            },
+            {
+              "pattern": "^yarn\\s+test(\\s|$)",
+            },
+            {
+              "pattern": "^source\\s+\\.venv/bin/activate(\\s|$)",
+            },
+            {
+              "pattern": "^tail\\b",
+            },
+            {
+              "pattern": "^printf\\s+(\\s|$)",
+            },
+            {
+              "pattern": "^python3\\b",
+            },
           ],
         },
       },
