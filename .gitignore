@@ -16,6 +16,7 @@ config/zed/.tmp*
 config/containers/
 config/gh/
 config/gh-copilot/
+config/github-copilot/
 
 vim/undo/
 vim/plugged/
