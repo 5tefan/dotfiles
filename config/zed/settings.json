@@ -111,7 +111,7 @@
               "pattern": "^doppler run -- bunx langfuse-cli\\b",
             },
             {
-              "pattern": "^jj\\s+(?:new|status|log|desc|diff|edit|squash|resolve|file)\\b",
+              "pattern": "^jj\\s+(?:--no-pager\\s+)?(?:new|status|log|desc|diff|edit|squash|resolve|file|op log)\\b",
             },
             {
               "pattern": "^shamecube\\b",
