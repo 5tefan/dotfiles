@@ -138,22 +138,13 @@
               "pattern": "^(ruff|mypy)\\b",
             },
             {
-              "pattern": "^(rg|grep|head|tail|sort|uniq|wc|jq|echo|tr)\\b",
+              "pattern": "^(rg|grep|head|tail|sort|uniq|wc|jq|echo|tr|printf)\\b",
             },
             {
               "pattern": "^yarn\\s+test(\\s|$)",
             },
             {
               "pattern": "^source\\s+\\.venv/bin/activate(\\s|$)",
-            },
-            {
-              "pattern": "^tail\\b",
-            },
-            {
-              "pattern": "^printf\\s+(\\s|$)",
-            },
-            {
-              "pattern": "^python3\\b",
             },
           ],
         },
