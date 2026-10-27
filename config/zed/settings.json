@@ -114,7 +114,7 @@
               "pattern": "^jj\\s+(?:--no-pager\\s+)?(?:new|status|log|desc|diff|edit|squash|resolve|file|op log)\\b",
             },
             {
-              "pattern": "^shamecube\\b",
+              "pattern": "^(bin/)?shamecube\\b",
             },
             {
               "pattern": "^cargo\\s",
