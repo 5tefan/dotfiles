@@ -19,6 +19,8 @@ rev = ["new", "--insert-after"]
 rr = ["rebase", "-s", "roots(mutable() & mine())", "-d", "main"]
 collapse = ["squash", "--from", "main..@", "--into", "@", "--ignore-immutable"]
 
+[snapshot]
+max-new-file-size = 41943040
 
 
 [remotes.origin]
