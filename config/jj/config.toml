@@ -5,19 +5,52 @@ name = "Stefan Codrescu"
 email = "ssmmcc1@gmail.com"
 
 [aliases]
-co = ["util", "exec", "--", "sh", "-c", "PARENT=$(jj log -r @ --no-graph -T 'change_id.shortest()') && jj commit && jj rebase -s \"children($PARENT) ~ @\" -d @"]
+co = [
+    "util",
+    "exec",
+    "--",
+    "sh",
+    "-c",
+    "PARENT=$(jj log -r @ --no-graph -T 'change_id.shortest()') && jj commit && jj rebase -s \"children($PARENT) ~ @\" -d @",
+]
 poh = ["git", "push"]
 pom = ["git", "fetch"]
-l  = ["log", "-r", "main | immutable_heads()-..@ | @::"]
-la = ["log", "-r", "main | immutable_heads()-..@ | (immutable_heads()-..@):: | @::"]
+l = ["log", "-r", "main | immutable_heads()-..@ | @::"]
+la = [
+    "log",
+    "-r",
+    "main | immutable_heads()-..@ | (immutable_heads()-..@):: | @::",
+]
 lm = ["log", "-r", "mine()"]
 d = ["diff"]
 e = ["edit"]
-bclean = ["util", "exec", "--", "sh", "-c", "jj b l -r '(bookmarks() & mutable() & committer_date(before:\"2 weeks ago\")) | (bookmarks() & immutable() ~ immutable_bookmarks())' -T 'name ++ \"\\n\"' | grep -v '^$' | xargs -r jj b f"]
-bforget = ["util", "exec", "--", "sh", "-c", "jj b l -r 'bookmarks() & ~mine() & ~main' -T 'name ++ \"\\n\"' | grep -v '^$' | xargs -r jj b f"]
+bclean = [
+    "util",
+    "exec",
+    "--",
+    "sh",
+    "-c",
+    "jj b l -r '(bookmarks() & mutable() & committer_date(before:\"2 weeks ago\")) | (bookmarks() & immutable() ~ immutable_bookmarks())' -T 'name ++ \"\\n\"' | grep -v '^$' | xargs -r jj b f",
+]
+bforget = [
+    "util",
+    "exec",
+    "--",
+    "sh",
+    "-c",
+    "jj b l -r 'bookmarks() & ~mine() & ~main' -T 'name ++ \"\\n\"' | grep -v '^$' | xargs -r jj b f",
+]
 rev = ["new", "--insert-after"]
 rr = ["rebase", "-s", "roots(mutable() & mine())", "-d", "main"]
 collapse = ["squash", "--from", "main..@", "--into", "@", "--ignore-immutable"]
+
+# Stack nav: stack forward (sf) and stack backward (sb).
+sf = ["edit", "@+"]
+sff = ["edit", "@++"]
+sfff = ["edit", "@+++"]
+sb = ["edit", "@-"]
+sbb = ["edit", "@--"]
+sbbb = ["edit", "@---"]
 
 [snapshot]
 max-new-file-size = 41943040
@@ -50,4 +83,10 @@ concat(
 
 [ui]
 default-command = "log"
-diff-formatter = ["difft", "--width=$width", "--color=always", "$left", "$right"]
+diff-formatter = [
+    "difft",
+    "--width=$width",
+    "--color=always",
+    "$left",
+    "$right",
+]
