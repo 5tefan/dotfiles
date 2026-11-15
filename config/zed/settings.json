@@ -41,6 +41,11 @@
     },
   },
   "agent": {
+    "default_model": {
+      "provider": "llama.cpp",
+      "model": "unsloth/Qwen3.8-27B-GGUF:BF16",
+      "enable_thinking": true,
+    },
     "sandbox_permissions": {
       "allow_unsandboxed": true,
     },
@@ -261,7 +266,16 @@
   "language_models": {
     "llama.cpp": {
       "api_url": "http://localhost:10800",
-      "auto_discover": true,
+      "auto_discover": false,
+      "available_models": [
+        {
+          "name": "unsloth/Qwen3.8-27B-GGUF:BF16",
+          "display_name": "Qwen3.8-27B",
+          "max_tokens": 150016,
+          "supports_tools": true,
+          "supports_images": true,
+        },
+      ],
     },
   },
   "lsp": {
