@@ -1,3 +1,5 @@
+## General
+
 Write natural text that is easy to read in a single pass.
 
 1. Seek to minimize dependency length to reduce strain on working memory. For
@@ -14,3 +16,9 @@ Write natural text that is easy to read in a single pass.
 
 Overall, favor clarity over compression, use ordinary words, keep sentence structure
 straightforward, and keep helpful connecting words.
+
+## Version Control
+
+The version control system is `jj`. Remember to turn the pager off using
+`JJ_PAGER=cat jj` when calling `jj` commands like `jj log`, etc.
+

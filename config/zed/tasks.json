@@ -1,0 +1,48 @@
+[
+  {
+    "label": "jj l",
+    "command": "viddy --unfold jj l --color always",
+    "hide": "always",
+    "env": {
+      "JJ_PAGER": "cat",
+    },
+    "allow_concurrent_runs": true,
+    "use_new_terminal": false,
+  },
+  {
+    "label": "jj sf",
+    "command": "jj edit @+",
+    "hide": "always",
+    "allow_concurrent_runs": false,
+    "use_new_terminal": false,
+    "show_command": false,
+    "save": "all",
+  },
+  {
+    "label": "jj sb",
+    "command": "jj edit @-",
+    "hide": "always",
+    "allow_concurrent_runs": false,
+    "use_new_terminal": false,
+    "show_command": false,
+    "save": "all",
+  },
+  {
+    "label": "jj new",
+    "command": "jj new",
+    "hide": "always",
+    "allow_concurrent_runs": false,
+    "use_new_terminal": false,
+    "show_command": false,
+    "save": "all",
+  },
+  {
+    "label": "jj squash",
+    "command": "jj squash && jj edit @-",
+    "hide": "always",
+    "allow_concurrent_runs": false,
+    "use_new_terminal": false,
+    "show_command": false,
+    "save": "all",
+  },
+]

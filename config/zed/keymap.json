@@ -18,6 +18,8 @@
       ],
       "ctrl-shift-j": ["task::Spawn", { "task_name": "jj sb" }],
       "ctrl-shift-k": ["task::Spawn", { "task_name": "jj sf" }],
+      "ctrl-shift-n": ["task::Spawn", { "task_name": "jj new" }],
+      "ctrl-shift-m": ["task::Spawn", { "task_name": "jj squash" }],
 
       "\\ l f": ["task::Spawn", { "task_name": "forward_search" }],
       "\\ l v": ["task::Spawn", { "task_name": "latexmk (watch)" }],
