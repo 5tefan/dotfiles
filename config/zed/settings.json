@@ -52,6 +52,28 @@
     "dock": "left",
     "tool_permissions": {
       "tools": {
+        "copy_path": {
+          "default": "allow",
+        },
+        "fetch": {
+          "always_allow": [
+            {
+              "pattern": "^https?://github\\.com",
+            },
+            {
+              "pattern": "^https?://docs\\.github\\.com",
+            },
+            {
+              "pattern": "^https?://raw\\.githubusercontent\\.com",
+            },
+            {
+              "pattern": "^https?://lima-vm\\.io",
+            },
+            {
+              "pattern": "^https?://packages\\.ubuntu\\.com",
+            },
+          ],
+        },
         "mcp:agent-browser:agent_browser_click": {
           "default": "allow",
         },
@@ -116,10 +138,13 @@
               "pattern": "^doppler run -- bunx langfuse-cli\\b",
             },
             {
-              "pattern": "^jj\\s+(?:--no-pager\\s+)?(?:new|status|log|desc|diff|edit|squash|resolve|file|op log)\\b",
+              "pattern": "^(JJ_PAGER=cat\\s+)?jj\\s+(?:(?:--no-pager|--ignore-working-copy)\\s+)*(?:new|status|log|desc|describe|diff|edit|squash|split|resolve|file|op log|bookmark|absorb)\\b",
             },
             {
               "pattern": "^(bin/)?shamecube\\b",
+            },
+            {
+              "pattern": "^(?:/Users/stefan/\\.cargo/bin/)?jj-pr-status\\b",
             },
             {
               "pattern": "^cargo\\s",
@@ -143,13 +168,31 @@
               "pattern": "^(ruff|mypy)\\b",
             },
             {
-              "pattern": "^(rg|grep|head|tail|sort|uniq|wc|jq|echo|tr|printf)\\b",
+              "pattern": "^(ls|rg|grep|head|tail|sort|uniq|wc|jq|echo|tr|printf|base64|diff|cmp)\\b",
+            },
+            {
+              "pattern": "^(sleep|command)\\b",
             },
             {
               "pattern": "^yarn\\s+test(\\s|$)",
             },
             {
               "pattern": "^source\\s+\\.venv/bin/activate(\\s|$)",
+            },
+            {
+              "pattern": "^set\\b",
+            },
+            {
+              "pattern": "^gh\\s+(pr|repo|run|api)(\\s|$)",
+            },
+            {
+              "pattern": "^swift\\b",
+            },
+            {
+              "pattern": "^xcode-select\\b",
+            },
+            {
+              "pattern": "^copilot\\b",
             },
           ],
         },
