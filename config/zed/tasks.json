@@ -45,4 +45,14 @@
     "show_command": false,
     "save": "all",
   },
+  {
+    "label": "jj revision ready",
+    "command": "sh ~/.config/zed/jj-revision-ready.sh",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "hide": "on_success",
+    "allow_concurrent_runs": false,
+    "use_new_terminal": false,
+    "show_command": false,
+    "save": "none",
+  },
 ]

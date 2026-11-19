@@ -20,6 +20,7 @@
       "ctrl-shift-k": ["task::Spawn", { "task_name": "jj sf" }],
       "ctrl-shift-n": ["task::Spawn", { "task_name": "jj new" }],
       "ctrl-shift-m": ["task::Spawn", { "task_name": "jj squash" }],
+      "ctrl-shift-r": ["task::Spawn", { "task_name": "jj revision ready" }],
 
       "\\ l f": ["task::Spawn", { "task_name": "forward_search" }],
       "\\ l v": ["task::Spawn", { "task_name": "latexmk (watch)" }],
