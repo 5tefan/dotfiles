@@ -32,3 +32,15 @@
     ~/.p10k.zsh: p10k.zsh
     ~/.zsh-common.zsh: zsh-common.zsh
     ~/.z.sh: z/z.sh
+
+- link:
+    ~/.agents/skills/:
+      path: agents/skills/*
+      glob: true
+      create: true
+      force: false
+    ~/.claude/skills/:
+      path: agents/skills/*
+      glob: true
+      create: true
+      force: false

@@ -23,3 +23,5 @@ vim/undo/
 vim/plugged/
 
 config/zed/prompts/
+
+agents/.backups/
