@@ -1,0 +1,572 @@
+# zed-pr-review
+
+A Rust CLI for reviewing GitHub pull requests from Zed and a jj workspace.
+Press **Ctrl-Shift-G** to open a PR: the CLI fetches it, preserves your local work,
+edits the exact PR head, and opens the full comparison. Select right-side text
+and press **Ctrl-Shift-C** to save an inline comment in a private local draft.
+Approve or request changes to send the summary and all saved comments in one
+GitHub review. The `ready` command also marks the checked-out PR ready for review
+and can request a reviewer. This uses Zed tasks, not a GUI extension.
+
+## Setup
+
+Install Rust **1.89 or newer** with Cargo, `jj`, `git`, `gh`, and the `zed` CLI.
+These commands must be on the PATH available to Zed tasks. Authenticate `gh` as
+the reviewer, using the appropriate `--hostname` for GitHub Enterprise:
+
+```sh
+gh auth login
+gh auth status
+```
+
+Install this dotfiles configuration at `~/.config/zed`, then build the local
+binary:
+
+```sh
+cargo build --locked --release --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml
+```
+
+The tasks in `../tasks.json` run
+`~/.config/zed/zed-pr-review/target/release/zed-pr-review`. Rebuild after changing
+the Rust source; the tasks do not build automatically.
+
+Open the jj workspace in Zed, press **Ctrl-Shift-G**, and enter a PR number or
+URL. You do not need to fetch or track its original branch first. `open` fetches
+the PR and base history, preserves your work, switches jj `@` to the exact PR
+head, and starts a review session. See the checkout safeguards below.
+
+You can still prepare the checkout yourself with `jj git fetch` and `jj edit`,
+then run `PR: full diff` to start a review session before commenting or submitting.
+`open` and review navigation (`sb`/`sf`) fetch and switch revisions; the other
+review commands do not. The recorded jj `@` must be the **exact PR head**, not
+its parent, an earlier PR commit, or a new
+child revision. Comments need local head blobs; `diff` also needs the pinned
+base and head commits and enough history to find one merge base.
+
+An existing review session supplies the PR for commands without `--pr`, so its
+original branch bookmark is not required. Without a session or explicit `--pr`,
+automatic discovery requires one unconflicted local bookmark at `@` and one
+matching open PR. Tool bookmarks under `zed-pr-review/` are excluded. Use `--pr`
+and, when needed, `--repo` if discovery is ambiguous; these flags do not relax
+the exact-head check. **Comment, approve, and request-changes always require
+context from a live full-PR diff**, even with an explicit `--pr`. They do not
+fall back to bookmark discovery or the last active session.
+
+## Zed tasks and shortcuts
+
+| Task                  | Shortcut     | Purpose                                                           |
+| --------------------- | ------------ | ----------------------------------------------------------------- |
+| `PR: open for review` | Ctrl-Shift-G | Fetch and check out a PR, then open its full comparison.          |
+| `PR: add comment`     | Ctrl-Shift-C | Read a multiline comment in a terminal and save it locally.       |
+| `PR: approve`         | Ctrl-Shift-A | Write a summary, then submit an approval with all saved comments. |
+| `PR: request changes` | Ctrl-Shift-Q | Write a summary, then request changes with all saved comments.    |
+| `PR: list comments`   | None         | Show the draft, its comments, and recovery status.                |
+| `PR: full diff`       | None         | Rebuild the full comparison at the current exact PR head.         |
+| `jj l`                | Ctrl-Shift-L | Show the PR stack in review mode; otherwise show the live jj log. |
+| `jj sb`               | Ctrl-Shift-J | Open the parent PR in review mode; otherwise run `jj sb`.         |
+| `jj sf`               | Ctrl-Shift-K | Open a child PR in review mode; otherwise run `jj sf`.            |
+
+Ctrl-Shift-G is global. The comment and decision shortcuts have `Editor`
+context, not terminal context. Use Zed's `task: spawn` picker for any named task.
+Every `PR:` task runs with `cwd: $ZED_WORKTREE_ROOT`, `reveal: always`,
+`hide: never`, `allow_concurrent_runs: false`, and `use_new_terminal: true`.
+A new terminal avoids reusing a terminal that is waiting for comment input.
+
+**`PR: open for review` uses `save: all`** before changing the checkout and runs
+with `/bin/zsh -f`. The other `PR:` tasks use `save: none`. The CLI also holds a
+workspace lock for review operations and a separate lock for each draft,
+including while waiting for input or an editor. These locks do not prevent
+unrelated jj commands or file edits; do not change the workspace concurrently.
+
+### Open a PR for review
+
+`PR: open for review` runs the binary's `open` command. Without the global `--pr`
+flag, it prompts for a PR number or URL and reads **one stdin line**. Press Enter
+to continue; a blank line cancels without repository changes. Unlike comment
+input, this does not require Ctrl-D. For example:
+
+```sh
+~/.config/zed/zed-pr-review/target/release/zed-pr-review open
+~/.config/zed/zed-pr-review/target/release/zed-pr-review --pr 123 --repo owner/repo open
+~/.config/zed/zed-pr-review/target/release/zed-pr-review --pr https://github.com/owner/repo/pull/123 open
+```
+
+`open` performs these steps:
+
+1. Resolve the PR and authenticated reviewer. Fetch `refs/pull/N/head` and the
+   base branch's history from the **base repository**, including for fork PRs.
+   The fetch uses HTTPS and `gh` credentials, rejects URL rewrites and redirects,
+   and obtains full history when the repository is shallow. Verify the fetched
+   head and base against the PR and recheck its identity. If exactly one configured
+   remote matches the PR's **source host and repository**, also fetch its source
+   branch, verify its head, and run `jj bookmark track` as needed.
+2. Prepare frozen snapshots for `merge-base(base, head) → head` in the default
+   repository-local state directory.
+3. Snapshot the current jj working copy and preserve it with a unique
+   `zed-pr-review/previous-*` bookmark. Then run `jj edit` on the **exact head
+   SHA**, without `--ignore-immutable`, and verify the resulting checkout.
+4. Save `last-checkout.json` in the per-PR draft directory, activate the session,
+   print the previous SHA in a `jj edit <previous-SHA>` return command, and open
+   the comparison in Zed. If checkout succeeds but Zed cannot open the view, run
+   `PR: full diff` rather than repeating checkout just to reopen it.
+
+Save buffers yourself before using `open` directly; only the Zed task saves them
+for you. The preserved commit contains the work recorded by jj, not unsaved
+editor buffers or ignored files.
+
+The `zed-pr-review/` namespace is reserved for tool refs and bookmarks. Fetches
+use unique refs under `refs/heads/zed-pr-review/`; both these refs and the
+`previous-*` bookmarks are **kept intentionally**. They are excluded from
+automatic PR discovery and are not removed when another session opens.
+
+`open` refuses sparse or stale workspaces, conflicted current or target
+revisions, immutable PR heads, submodule checkouts, unsafe paths, and untracked
+or ignored files that obstruct checkout. Before switching, it also checks whether
+the target's ignore rules would expose existing ignored files, such as `.env`,
+and refuses that checkout without recording those files. Directories that remain
+ignored, such as `node_modules`, are left alone. Final verification disables
+automatic tracking of new files. It also refuses reserved state paths in the
+current revision, Git index, or incoming head. It never pushes, resets,
+rebases, or automatically rolls back. A failure may leave fetched refs,
+snapshots, or a preserved bookmark; after checkout, it may leave `@` at the PR
+head. Inspect the reported state and use the preserved bookmark or printed
+return command rather than assuming that failure restored the old checkout.
+
+### Fetching and tracking branches
+
+There is no need to run `jj git fetch` or `jj b t` before **Ctrl-Shift-G** or a
+move through the PR stack. The CLI uses a scoped, hardened HTTPS Git fetch plus
+`jj git import`, rather than a broad `jj git fetch`. This avoids unrelated
+refspecs, configured transport helpers, and automatic bookmark tracking. It
+still uses `gh` credentials, including when the matching remote has an SSH URL.
+
+When one configured remote matches the source repository, the CLI fetches only
+the PR's branch, verifies it against the PR head, and tracks that remote
+bookmark. It refuses conflicting local bookmarks, non-fast-forward updates,
+locally deleted bookmarks, mismatched branch heads, or ambiguous matching
+remotes. It never creates a remote or overwrites conflicting work. Fork PRs
+without a matching source remote still work through the base repository's
+`refs/pull/N/head`; they do not need a source bookmark.
+
+Because jj imports Git refs globally, the CLI also refuses unrelated pending
+Git branch or tag changes before importing. Otherwise, an already-tracked
+bookmark could move or disappear during review setup. Resolve those changes
+manually and retry. A late refusal can leave verified fetched refs in Git; it
+does not import the unrelated changes or roll them back. Do not run other
+repository operations concurrently.
+
+### Show and navigate the PR stack
+
+**Ctrl-Shift-L** shows the open PR stack in a terminal in the center pane. The
+current PR has a `*` marker; each entry includes its title, branches, draft
+status, and URL. The key now spawns the task directly instead of splitting the
+pane first, so the task receives context from the diff. This is a one-time
+GitHub read, not a polling loop. Press L again to refresh.
+
+**Ctrl-Shift-J** opens the parent PR; **Ctrl-Shift-K** opens a child PR. Each move
+uses the same fetch, tracking, preservation, exact-head checks, and full diff
+as **Ctrl-Shift-G**. With several children, enter one of the offered **PR
+numbers**, then press Enter. A blank line cancels. At either end of the stack,
+there is no checkout. Saved comments remain in their separate per-PR drafts;
+returning to an unchanged PR does not discard them.
+
+Stack links come from GitHub's exact repository and branch relationships:
+`parent.head repository/ref == child.base repository/ref`. The parent's head
+must also match the child's base SHA. Neither PR numbering, branch-name
+prefixes, PR descriptions, nor commit ancestry defines a stack. Unrelated PRs
+that all target `main` are not grouped together. Closed or merged PRs are not
+included. Cycles, ambiguous parents, and observed changes to the stack cause a
+refusal rather than a guessed checkout. If the offered children change during
+navigation, retry to see the new choices.
+
+The three shortcuts decide their mode from Zed's task context:
+
+- **Registered diff snapshot, either side:** review mode. The snapshot and the
+  exact PR head at `@` must still be valid. An old or altered tab fails closed;
+  it never falls back to jj navigation or binds itself to a newer session.
+- **Ordinary source file:** normal jj mode, even if a review session exists.
+  J and K run the configured `jj sb` and `jj sf` aliases. L retains
+  `viddy --unfold -n 1 jj l --color always`.
+- **No file, such as a terminal:** use the active review only while `@` equals
+  its pinned head. Otherwise, use normal jj mode. A corrupt active pointer is
+  an error, not permission to change revisions.
+
+Navigation from either diff side does not enable deleted-side comments:
+**Ctrl-Shift-C still requires a right-side selection**. J and K save buffers
+before running, as the previous jj tasks did. They share the workspace lock
+with comment input and review submission. For direct CLI use, save buffers
+first. Run `stack` for a one-time local jj log; `stack --watch` enables the
+normal live log. `--pr` cannot force a source buffer into review mode; use
+`open` first.
+
+### Mark a PR ready
+
+The existing **Ctrl-Shift-R** shortcut and `jj revision ready` task now run the
+Rust `ready` command. Their other task settings are unchanged.
+
+```sh
+~/.config/zed/zed-pr-review/target/release/zed-pr-review ready
+~/.config/zed/zed-pr-review/target/release/zed-pr-review ready --reviewer alice
+~/.config/zed/zed-pr-review/target/release/zed-pr-review --pr 123 --repo owner/repo ready
+```
+
+The recorded **jj `@` must equal the current PR head**, including when `--pr` is
+explicit. Unlike the former script, this never searches ancestors for a bookmark.
+If you have moved to a new child revision, open the PR again or `jj edit` its
+head before running it. An existing session can supply the PR without its
+original bookmark. Otherwise, automatic discovery requires one unambiguous
+non-tool bookmark at `@`; explicit `--pr` can select the PR without a bookmark
+but cannot bypass the head check.
+
+`ready` marks a draft PR ready; an already-ready PR does not need that mutation.
+An optional `--reviewer LOGIN` requests one user. Use `--reviewer org/team-slug`
+for a team in the base repository's organization. Without the flag,
+`ZED_REVISION_READY_REVIEWER` supplies the reviewer; an unset or whitespace-only
+value means no request. The flag takes precedence, and an explicitly blank flag
+is an error. Reviewer requests add to existing requests rather than replacing
+the reviewer list. Repeating `ready --reviewer ...` may notify the reviewer again.
+
+The command rechecks the PR head, base commit and branch, identity, authenticated
+account, and recorded jj `@` before and after each mutation. A change detected
+after marking ready stops the command before it requests a reviewer. A failed
+request reports that the PR was already ready and that the request may have
+succeeded despite the error. No mutation is automatically retried or rolled back;
+check GitHub before trying again.
+
+GitHub's mark-ready API has no atomic expected-head condition. Another push can
+race with the final check; post-action checks report a detected change but cannot
+undo a notification. These checks compare the recorded revision, not unsaved Zed
+buffers or file edits that jj has not recorded. Keep the viewed files unchanged
+when using this shortcut.
+
+`ready` never pushes, fetches, or snapshots the working copy. It does not open an
+editor or read, lock, create, or alter a private review draft, so an existing
+review or uncertain submission does not block it. Normally it creates no private
+state. It can read an existing local session association and validate that state;
+`--state-dir` or `ZED_PR_REVIEW_STATE_DIR` affects whether that association is
+used. The exact-head and before/after mutation checks still apply. `--editor`
+has no effect; `--draft-dir` is rejected.
+
+### Add a comment
+
+1. Use a registered **head snapshot** from `open` or `diff`. Ordinary source
+   files are not review context, even when a saved session matches `@`. Keep the
+   snapshot unchanged on disk and in the editor; the comment task does not save
+   buffers. The CLI checks the whole file against the head blob and its exact
+   recorded digest. Bare-CR files are rejected because their editor rows can
+   differ from GitHub's line numbers.
+2. Select one continuous, nonblank range on the **RIGHT (head) side**, within one
+   excerpt and one GitHub diff hunk. Added lines and right-side context are
+   supported; deleted-side comments are not.
+3. Press Ctrl-Shift-C. Check the PR, path, and line range shown in the terminal.
+4. Type a multiline comment. Press Enter, then **Ctrl-D on an empty line** to
+   finish stdin. A nonblank body is saved locally; nothing is published. A blank
+   body cancels. Ctrl-C cancels the current input and keeps earlier comments.
+
+The selection behavior was verified in the **Zed 1.29.3 source**, whose relevant
+code is unchanged from 1.29.2; the actual GUI workflow has **not** been tested.
+Zed supplies `ZED_FILE`, `ZED_ROW`, `ZED_COLUMN`, and `ZED_SELECTED_TEXT` through
+the task environment. Rows and UTF-8 byte columns are one-based and refer to the
+selection start, even for a reverse selection. Zed exports only the newest
+selection, with no reliable diff-side metadata. The CLI cannot reliably detect
+multiple selections or determine which side you selected. **A reported RHS path
+does not prove that the selection came from the RHS.** Use exactly one nonblank,
+continuous right-side selection within one excerpt and one hunk.
+
+For snapshots, the CLI maps only the exact registered `head/` path in that
+session's manifest to its repository filename. It validates the manifest and
+snapshot digests, the whole file against the pinned head blob, the selected text
+at the supplied coordinates, and the range against the GitHub patch. It never
+finds a file or line by searching for matching text. Base snapshots, unknown
+paths, modified snapshots, cleaned sessions, and stale sessions are rejected.
+
+The CLI reads these environment variables directly. **Never interpolate selected
+text into a task command, shell argument, or shell script**, even inside quotes.
+Do not add an `echo` or other shell wrapper to pass it to the CLI. The terminal's
+stdin is for the comment body, not the selected source text.
+
+### Review the full PR
+
+Zed's project diff compares jj `@` with its parent and may omit earlier commits
+in a multi-commit PR. Both `open` and `PR: full diff` (CLI `diff`) compare
+**`merge-base(base, head) → head`** with `zed --existing --diff`.
+
+`open` fetches and switches the checkout. `diff` instead reads existing local
+Git objects and builds a new session at the current **exact PR head**; it does
+not fetch, switch revisions, or snapshot the working copy. It still contacts
+GitHub to check the PR and obtain its changed-file metadata.
+
+Each comparison has a unique directory:
+
+```text
+REPO_ROOT/scratch/zed-pr-review/<draft-key>/diff-<unique>/
+  base/
+  head/
+  manifest.json
+  cleanup.json  # added after a confirmed review, before removing base/ and head/
+```
+
+The snapshots are frozen copies of the changed files, not live workspace files.
+The manifest records the pinned PR, merge base, repository paths, sides, and
+content digests. `active.json` at the state root identifies the active session.
+Reopening creates a new directory rather than replacing the old snapshots.
+**Old tabs stay bound to their original session**, even after another PR opens.
+You can comment from registered head snapshots with Ctrl-Shift-C; do not edit
+the snapshots.
+
+**Comment, approve, and request-changes require an exact registered snapshot
+from a live session.** The CLI refuses ordinary source files, missing file
+context, prompt/metadata files, and cleaned sessions before creating state,
+contacting GitHub, reading comment input, or opening the summary editor. A
+saved active session, matching bookmark, or explicit `--pr` cannot bypass this.
+Comments require the right side; either side can provide context for a decision.
+
+Other commands, such as listing and recovery, can still use the active session
+from ordinary files. No session-based command needs the original PR branch.
+An explicit `--pr` must agree with the session; it cannot rebind an existing view
+or active review.
+If `@` moves or the PR head, base, or identity changes, the command fails rather
+than silently choosing a different PR. Run `open` again to switch or refresh the
+active review. Reopening does not reassign old comments to a new revision; see
+the draft guidance below.
+
+Renames may appear as removal/addition pairs. Pure renames, mode-only changes,
+binary files, and files without a GitHub patch may have no useful text diff.
+The CLI prints file status and rename information, plus binary/no-patch caveats.
+Binary and no-patch files are view-only; deleted files have no RHS for comments.
+
+### Approve or request changes
+
+Use `PR: list comments` to check the draft, then press Ctrl-Shift-A or Ctrl-Shift-Q
+from a file in the live full-PR diff. Both decision tasks explicitly pass
+`--editor 'zed --existing --wait'`, so the shell's `EDITOR=vim` does not take over.
+The CLI opens a Markdown message file with room for your summary at the top.
+Below it, each saved comment includes its file and line range, the commented
+lines with up to **five lines before and after**, and your comment underneath.
+The source comes from the pinned PR head, not the working copy. A `>` marks each
+commented line; the other numbered lines provide context.
+
+Every reference line starts with `#|`. These lines are removed from the summary
+before submission, even if indented. Ordinary Markdown headings such as
+`# Summary` are preserved. The reference section is only for viewing: editing
+its copy of a comment does not change the saved comment. Use `edit INDEX` for
+that. With no saved comments, the message file is empty.
+
+**`zed --wait` waits until the message tab closes, not until it is saved.** Save a
+nonblank summary and close that tab to submit. Closing a tab with a saved
+nonblank summary **will submit** after the safety checks pass; closing is not a
+cancel action, and there is no extra confirmation prompt.
+
+To cancel, **clear the summary, save, then close the tab**. You can leave the
+`#|` reference lines in place. An empty or whitespace-only summary after removing
+those lines aborts either decision and preserves all saved inline comments.
+Alternatively, Ctrl-C in the task terminal cancels the editor process;
+the local draft persists. If submission may already have started, follow recovery
+below instead of assuming cancellation prevented the POST.
+
+After GitHub confirms an approval or request-changes review and the CLI saves
+its receipt, it **removes the `head/` and `base/` snapshots** from every saved
+session for that PR and reviewer, including earlier opens and revisions. Other
+PRs and reviewers are untouched. The CLI keeps `draft.json` with your comments
+and receipt, message files, archives, and the small session manifests.
+
+Each cleaned session also keeps a `cleanup.json` marker. Together with
+`active.json`, this preserves the PR identity so **Ctrl-Shift-L/J/K still work
+from the reviewed tab or task terminal**. The old tab may remain open in Zed,
+but its source files are gone and cannot accept new comments. Use `PR: full diff`
+or reopen the PR to create fresh snapshots. Starting another review still
+requires explicitly discarding the submitted draft.
+
+Blank or canceled reviews, failed submissions, uncertain responses, and failures
+to save a receipt **do not remove snapshots**. A successful `recover` cleans them
+once it confirms the submission and saves the receipt, including when you use
+`--draft-dir` from another directory. Cleanup needs access to the original jj
+workspace; old external state directories are not modified.
+
+If cleanup fails, the CLI prints a warning without turning a successful review
+into a failed submission. Comments and the saved receipt remain intact. Fix the
+reported filesystem or workspace problem, then run `recover` with `--draft-dir`
+pointing to the saved draft directory to retry cleanup only. **Do not submit the
+review again.** Interrupted cleanup can resume; altered or unregistered files
+are refused rather than deleted.
+
+## CLI reference
+
+Run the binary directly for actions without tasks or for explicit PR selection:
+
+```sh
+~/.config/zed/zed-pr-review/target/release/zed-pr-review --help
+~/.config/zed/zed-pr-review/target/release/zed-pr-review --pr 123 --repo owner/repo open
+~/.config/zed/zed-pr-review/target/release/zed-pr-review --pr 123 --repo owner/repo list
+~/.config/zed/zed-pr-review/target/release/zed-pr-review edit 1 --editor 'zed --existing --wait'
+```
+
+The PR number and repository above are examples. `comment` normally runs through
+Zed because it requires the selection variables from the task environment.
+
+| Subcommand        | Behavior                                                                                 |
+| ----------------- | ---------------------------------------------------------------------------------------- |
+| `open`            | Fetch, track when safe, preserve local work, edit the exact PR head, and open a session. |
+| `stack`           | Show the GitHub stack in review context; otherwise run `jj l` once.                      |
+| `stack --watch`   | Same as `stack`, but use viddy for the normal jj log, never for GitHub polling.          |
+| `sb` / `sf`       | Open the parent/child PR in review context; otherwise run the corresponding jj alias.    |
+| `ready`           | Mark the exact PR head at jj `@` ready; optionally request a reviewer with `--reviewer`. |
+| `comment`         | Read a multiline body from stdin until EOF; save a local inline comment.                 |
+| `approve`         | Edit a nonblank summary; send one approval with all saved comments.                      |
+| `request-changes` | Edit a nonblank summary; send one request for changes with all saved comments.           |
+| `list`            | Print one-based comment indices, pinned revision, status, and draft directory.           |
+| `edit INDEX`      | Edit a saved comment body; a blank edit preserves the original.                          |
+| `remove INDEX`    | Remove a saved comment locally.                                                          |
+| `discard`         | Ask for `yes`, archive the draft, and clear it locally.                                  |
+| `discard --yes`   | Archive and clear without prompting; never delete a GitHub review.                       |
+| `recover`         | Reconcile an uncertain submission or retry snapshot cleanup; never send another review.  |
+| `recover --retry` | If safe to proceed, ask for `yes` to permit a later attempt; do not post.                |
+| `diff`            | Build a frozen full-PR session at the current exact head, without fetching or switching. |
+
+Indices are one-based and refer to the current `list` output. All of these flags
+are global:
+
+| Flag                       | Meaning                                                                                                                                                                                         |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--directory PATH`         | Workspace directory; otherwise prefer the selected `ZED_FILE`'s jj workspace, then `ZED_WORKTREE_ROOT`, then the current directory. `--draft-dir` skips the selected-file hint.                 |
+| `--pr NUMBER_OR_URL`       | Explicit PR number or `https://HOST/owner/repo/pull/NUMBER`.                                                                                                                                    |
+| `--repo [HOST/]owner/repo` | Base repository, including an optional GitHub Enterprise host. Without a host, uses `github.com` unless a PR URL supplies one.                                                                  |
+| `--state-dir PATH`         | State root; overrides `ZED_PR_REVIEW_STATE_DIR`. Defaults to `REPO_ROOT/scratch/zed-pr-review`. External paths remain supported for draft commands, not review sessions or PR stack navigation. |
+| `--draft-dir PATH`         | Open a specific draft directory without PR discovery; only for `list`, `edit`, `remove`, `discard`, and `recover`. Cannot be combined with `--pr` or `--repo`.                                  |
+| `--editor COMMAND`         | Editor command and arguments, parsed without shell evaluation.                                                                                                                                  |
+
+Editor precedence is `--editor`, `ZED_PR_REVIEW_EDITOR`, `EDITOR`, then `vim`.
+When using Zed, include `--wait`; `zed --existing --wait` is recommended.
+
+## Private drafts and changed checkouts
+
+The default state root is now **`REPO_ROOT/scratch/zed-pr-review`**, where
+`REPO_ROOT` is the jj workspace root. Each draft has a separate `<draft-key>`
+directory based on host, repository, PR number, and reviewer. Alongside the
+drafts and sessions, the state root contains `active.json` and the `workspace/`
+lock directory. `last-checkout.json` lives in the per-PR draft directory.
+
+Before writing private state, the CLI checks for reserved paths in jj `@`, the
+Git index, and the incoming head when available. It creates an untracked
+`scratch/zed-pr-review/.gitignore` containing `*`, which ignores itself and all
+state contents in Git and jj, then verifies the ignore protection. It never
+edits a tracked `.gitignore` or untracks files. Conflicting ignore contents,
+tracked reserved paths, symlinks, hard-linked state files, and other unsafe
+filesystem entries cause an error rather than being replaced.
+
+Draft directories have private Unix permissions. Drafts are local, not pending
+GitHub reviews. Messages, archives, and snapshots may contain private source or
+review text; keep the state out of source control and shared storage. **This is
+not a disposable cache: deleting the state loses saved comments and submission
+recovery records**, not just snapshots. Successful reviews remove their source
+snapshots automatically, not the saved comments or receipts.
+
+`ZED_PR_REVIEW_STATE_DIR` or `--state-dir` can still select an external state root
+for draft commands. The default path is the only allowed location inside the
+reviewed repository. Full sessions (`open`, `diff`, and comments from snapshots)
+require that default repository-local state; an external override produces a
+clear error. Omit `--state-dir` and unset `ZED_PR_REVIEW_STATE_DIR` for that
+workflow, after checking whether you have an older draft to preserve.
+
+The CLI prints the exact per-PR draft directory. Pass that path to `--draft-dir`,
+not the parent state directory. With this flag, `list`, `edit`, `remove`, and
+`discard` work offline, independently of jj, local Git objects, and the current
+checkout. `recover` also works independently of the checkout, but **requires
+GitHub access** and the original authenticated reviewer. Use an existing
+`--directory` if `ZED_WORKTREE_ROOT` points to a directory that no longer exists.
+Commenting and submission require both a live review snapshot and the exact PR
+head at `@`. Marking ready also requires the exact PR head, but it can use a
+session, explicit flags, or bookmark discovery; it does not use the local draft.
+
+If the PR head, base, or identity changes, the CLI keeps existing comments and
+refuses to reuse them for a new revision. Inspect the old draft, explicitly
+`discard` it when appropriate, and review the new revision. A submitted draft
+also stays blocked until an explicit `discard` starts a new review. Discard keeps
+an archive and never changes GitHub; it is refused while submission is uncertain.
+
+### Older global drafts
+
+Earlier versions defaulted to `~/Library/Application Support/zed-pr-review` on
+macOS, or `$XDG_STATE_HOME/zed-pr-review` / `~/.local/state/zed-pr-review` elsewhere.
+**Those drafts are not automatically migrated or deleted.**
+
+Use `--draft-dir` with the **exact old per-PR directory** to `list`, `edit`, or
+`recover` an old draft; the offline behavior above is unchanged. You can no
+longer add comments or submit directly from external state: those actions now
+require a live repository-local review session. Old drafts remain untouched;
+there is no automatic migration.
+
+Check the old draft before starting a new local one. In particular, recover an
+uncertain submission in its original directory; do not copy its comments into
+a fresh draft or send another review merely because the new default appears
+empty. Separate state directories cannot prevent duplicate submissions across
+them.
+
+## Submission safety and recovery
+
+A decision sends **one POST** containing the summary, all saved comments, and the
+pinned head as `commit_id`. The CLI rechecks the checkout, PR identity, head/base,
+and comment coordinates before sending. It refuses to approve or request changes
+on your own PR, or while you already have a pending GitHub review. Resolve that
+pending review on GitHub first; this tool will not modify it.
+
+GitHub has no atomic expected-head condition for this operation. A PR can change
+between the final check and the POST. The review still targets the pinned head;
+check GitHub if the CLI warns that the PR changed during submission.
+
+Before the POST, the CLI saves the exact attempt and the IDs of existing reviews.
+An error, interrupted process, or missing receipt may mean GitHub accepted the
+review even though `gh` failed. The saved attempt blocks edits, discard, and
+another submission. **Do not retry just because `gh` failed.**
+
+1. Run `recover`, using `--draft-dir` if the checkout or PR revision changed.
+2. Recovery checks new reviews by the same reviewer for the decision, exact
+   summary body, pinned head, and full set of comment bodies and original
+   coordinates. It can recover after comments move, after the PR closes, or
+   after a review is dismissed. A dismissed review is recorded as `DISMISSED`,
+   not as an active approval. One match records the receipt and marks the draft
+   as submitted.
+3. Multiple matches, or new reviews with no matching attempt, keep recovery
+   blocked. Inspect GitHub rather than forcing another POST. Recovery also
+   refuses to proceed if the authenticated account changed. Edited review
+   summaries or comment bodies can prevent an exact match.
+4. No match is not proof of failure: a delayed server write is possible. Check
+   GitHub yourself. Only then use `recover --retry` and type the literal `yes`
+   when prompted. With no new review, this archives the old attempt and enables
+   a later retry. It **does not post a review**. Run `approve` or
+   `request-changes` separately if another attempt is actually needed. Previous
+   attempts remain in the draft and are checked both before opening the editor
+   and before another POST. If an earlier submission becomes visible, the CLI
+   records its receipt instead. No client can eliminate a delayed-write race
+   when the server provides no idempotency key.
+
+## Tests and validation limits
+
+The Rust tests run offline. Integration tests use real local jj/Git objects, a
+fake `gh`, and a non-GUI editor. Stack tests cover pagination, exact branch
+relationships, ambiguity, and changes during navigation. Local transport tests
+cover fetching, tracking, pending-ref refusals, complete parent/child navigation,
+and preserved drafts. Cleanup tests cover both review decisions, recovery,
+interrupted deletion, retained comments, and navigation after snapshots are
+removed. Guard tests verify that review actions outside a live diff do not read
+stdin, open an editor, contact GitHub, or create state. They do not exercise the
+Zed GUI or mutate live GitHub reviews. Run them with:
+
+```sh
+cargo test --locked --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml -- --test-threads=4
+cargo clippy --locked --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml --all-targets -- -D warnings
+```
+
+The selection contract was checked against the Zed 1.29.3 source, with the same
+relevant code in 1.29.2. This is a version-specific constraint, not a guarantee
+for other versions or a successful GUI test. The actual GUI workflow has not
+been tested. These tests do not verify live shortcut handling, message-tab
+behavior, or GitHub submission end to end.
+
+Sources for the Zed integration:
+
+- [Selection context](https://github.com/zed-industries/zed/blob/v1.29.3/crates/editor/src/runnables.rs#L482-L551)
+- [Selected text availability](https://github.com/zed-industries/zed/blob/v1.29.3/crates/project/src/task_inventory.rs#L1000-L1031)
+- [Task variables exported as environment variables](https://github.com/zed-industries/zed/blob/v1.29.3/crates/task/src/task_template.rs#L251-L291)
+- [Project Diff uses the right-side editor](https://github.com/zed-industries/zed/blob/v1.29.3/crates/git_ui/src/project_diff.rs#L547-L566)
+- [Directory diff support](https://github.com/zed-industries/zed/blob/v1.29.3/crates/cli/src/main.rs#L165-L251)

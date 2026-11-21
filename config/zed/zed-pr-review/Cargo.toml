@@ -1,0 +1,16 @@
+[package]
+name = "zed-pr-review"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+description = "Review GitHub pull requests from Zed and jj"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+shell-words = "1"
+tempfile = "3"

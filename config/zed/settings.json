@@ -42,9 +42,10 @@
   },
   "agent": {
     "default_model": {
-      "provider": "llama.cpp",
-      "model": "unsloth/Qwen3.8-27B-GGUF:BF16",
+      "provider": "copilot_chat",
+      "model": "gpt-6-astra",
       "enable_thinking": true,
+      "effort": "high",
     },
     "sandbox_permissions": {
       "allow_unsandboxed": true,
@@ -71,6 +72,9 @@
             },
             {
               "pattern": "^https?://packages\\.ubuntu\\.com",
+            },
+            {
+              "pattern": "^https?://zed\\.dev",
             },
           ],
         },
@@ -138,6 +142,9 @@
               "pattern": "^doppler run -- bunx langfuse-cli\\b",
             },
             {
+              "pattern": "^(/usr/bin/)?python3\\b",
+            },
+            {
               "pattern": "^(JJ_PAGER=cat\\s+)?jj\\s+(?:(?:--no-pager|--ignore-working-copy)\\s+)*(?:new|status|log|desc|describe|diff|edit|squash|split|resolve|file|op log|bookmark|absorb)\\b",
             },
             {
@@ -147,7 +154,7 @@
               "pattern": "^(?:/Users/stefan/\\.cargo/bin/)?jj-pr-status\\b",
             },
             {
-              "pattern": "^cargo\\s",
+              "pattern": "^(cargo|rustfmt)\\s",
             },
             {
               "pattern": "^tree\\-sitter\\b.*(\\s|$)",

@@ -10,20 +10,26 @@
       "\\ w d": "git::Diff",
       "\\ w z": "workspace::ToggleZoom",
       "ctrl-shift-l": [
-        "action::Sequence",
-        [
-          ["pane::SplitRight", {}],
-          ["task::Spawn", { "task_name": "jj l", "reveal_target": "center" }],
-        ],
+        "task::Spawn",
+        { "task_name": "jj l", "reveal_target": "center" },
       ],
       "ctrl-shift-j": ["task::Spawn", { "task_name": "jj sb" }],
       "ctrl-shift-k": ["task::Spawn", { "task_name": "jj sf" }],
       "ctrl-shift-n": ["task::Spawn", { "task_name": "jj new" }],
       "ctrl-shift-m": ["task::Spawn", { "task_name": "jj squash" }],
       "ctrl-shift-r": ["task::Spawn", { "task_name": "jj revision ready" }],
+      "ctrl-shift-g": ["task::Spawn", { "task_name": "PR: open for review" }],
 
       "\\ l f": ["task::Spawn", { "task_name": "forward_search" }],
       "\\ l v": ["task::Spawn", { "task_name": "latexmk (watch)" }],
+    },
+  },
+  {
+    "context": "Editor",
+    "bindings": {
+      "ctrl-shift-c": ["task::Spawn", { "task_name": "PR: add comment" }],
+      "ctrl-shift-a": ["task::Spawn", { "task_name": "PR: approve" }],
+      "ctrl-shift-q": ["task::Spawn", { "task_name": "PR: request changes" }],
     },
   },
   {
