@@ -61,6 +61,7 @@ auto-track-bookmarks = "glob:stefan/*"
 
 [revset-aliases]
 "immutable_bookmarks()" = "main"
+"trunk()" = "main@origin"
 "closest_pushable(to)" = "heads(::to & mutable() & ~description(exact:'') & (~empty() | merges()))"
 # Based on https://github.com/jj-vcs/jj/discussions/5568#discussioncomment-12674748
 "closest_bookmarks()" = "closest_bookmarks(@-)"
