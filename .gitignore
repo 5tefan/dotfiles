@@ -8,6 +8,7 @@ local/share/cartopy/
 local/share/containers/
 local/share/nsnake/
 local/share/recently-used.xbel
+local/share/doppler/
 config/htop
 config/zed/conversations
 config/zed/embeddings
