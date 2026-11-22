@@ -1,3 +1,5 @@
+command -v starship >/dev/null && eval "$(starship init zsh)"
+
 alias ..="cd .."
 alias ...="cd ../.."
 alias ....="cd ../../.."
@@ -24,4 +26,3 @@ alias rg='rg --color=always'
 source $HOME/.z.sh
 
 [ -d ~/.cargo/bin ] && export PATH=$PATH:~/.cargo/bin
-
