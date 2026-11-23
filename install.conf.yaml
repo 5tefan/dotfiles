@@ -10,13 +10,26 @@
 - shell:
     - description: Installing submodules
       command: git submodule update --init --recursive
-    - description: Configure bash to source ~/.bash-common.sh
+    - description: Configure .*-common.sh
       command: |
-        grep -qxsF '[ -f ~/.bash-common.sh ] && source ~/.bash-common.sh' ~/.bashrc || echo '[ -f ~/.bash-common.sh ] && source ~/.bash-common.sh' >> ~/.bashrc
-    - description: Configure zsh to source ~/.zsh-common.zsh
+        grep -qxsF '[ -f ~/.bash-common.sh ] && source ~/.bash-common.sh' ~/.bashrc || echo '[ -f ~/.bash-common.sh ] && source ~/.bash-common.sh' >> ~/.bashrc;
+        grep -qxsF '[ -f ~/.zsh-common.zsh ] && source ~/.zsh-common.zsh' ~/.zshrc || echo '[ -f ~/.zsh-common.zsh ] && source ~/.zsh-common.zsh' >> ~/.zshrc;
+    - description: Install Homebrew if missing (macOS only)
       command: |
-        grep -qxsF '[ -f ~/.zsh-common.zsh ] && source ~/.zsh-common.zsh' ~/.zshrc || echo '[ -f ~/.zsh-common.zsh ] && source ~/.zsh-common.zsh' >> ~/.zshrc
-
+        if [ "$(uname)" = Darwin ] && [ ! -x /opt/homebrew/bin/brew ]; then
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)";
+        fi
+    - description: Set up Homebrew if missing (macOS only)
+      command: |
+        if [ "$(uname)" = Darwin ]; then
+          grep -qxsF 'eval "$(/opt/homebrew/bin/brew shellenv)"' ~/.bash_profile || echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.bash_profile;
+          grep -qxsF 'eval "$(/opt/homebrew/bin/brew shellenv)"' ~/.zprofile || echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile;
+        fi
+    - description: Install Homebrew packages (macOS only)
+      command: |
+        if [ "$(uname)" = Darwin ] && [ -x /opt/homebrew/bin/brew ]; then
+          /opt/homebrew/bin/brew bundle --file Brewfile;
+        fi
 - link:
     ~/.config: config
     ~/.local: local
@@ -44,3 +57,7 @@
       glob: true
       create: true
       force: false
+
+- shell:
+    - description: Build zed-pr-review
+      command: cargo build --locked --release --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml
