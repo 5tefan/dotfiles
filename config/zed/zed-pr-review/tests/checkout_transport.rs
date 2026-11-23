@@ -285,7 +285,6 @@ fn local_transport_colocated_and_noncolocated() -> Result<()> {
             "target-conflicts",
             "sparse",
             "shallow",
-            "immutable",
             "conflicts",
             "stale",
             "api-race",
@@ -298,6 +297,17 @@ fn local_transport_colocated_and_noncolocated() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[test]
+fn immutable_heads_colocated_and_noncolocated() -> Result<()> {
+    tracking_scenarios(&[
+        "immutable",
+        "immutable-late-edit",
+        "ignore-removed-immutable",
+        "ignore-kept-immutable",
+        "ignore-late-file-immutable",
+    ])
 }
 
 #[test]
@@ -474,12 +484,55 @@ fn git(client: &Client, args: &[&str]) -> Result<String> {
     )
 }
 
+fn assert_review_checkout(client: &Client, head: &str, immutable: bool) -> Result<()> {
+    let actual = client.checkout_commit()?;
+    if immutable {
+        assert_ne!(actual, head);
+        assert_eq!(
+            jj(
+                &client.root,
+                &[
+                    "--ignore-working-copy",
+                    "log",
+                    "-r",
+                    &actual,
+                    "--no-graph",
+                    "-T",
+                    "parents.map(|p| p.commit_id()).join(\" \") ++ \"\\t\" ++ empty ++ \"\\t\" ++ conflict",
+                ],
+            )?,
+            format!("{head}\ttrue\tfalse")
+        );
+        assert_eq!(
+            jj(
+                &client.root,
+                &[
+                    "--ignore-working-copy",
+                    "log",
+                    "-r",
+                    head,
+                    "--no-graph",
+                    "-T",
+                    "immutable"
+                ]
+            )?,
+            "true",
+            "review checkout must not override immutability"
+        );
+    } else {
+        assert_eq!(actual, head);
+    }
+    Ok(())
+}
+
 fn ignored_checkout(
     client: &Client,
     mut pr: zed_pr_review::model::PullRequest,
     fixture: &Path,
     scenario: &str,
 ) -> Result<()> {
+    let immutable = scenario.ends_with("-immutable");
+    let scenario = scenario.strip_suffix("-immutable").unwrap_or(scenario);
     let root = &client.root;
     client.fetch_pr(&pr)?;
     let initial = client.checkout_commit()?;
@@ -505,6 +558,16 @@ fn ignored_checkout(
     jj(root, &["bookmark", "create", "review-target"])?;
     let target_commit = git(client, &["cat-file", "commit", &pr.head_sha])?;
     jj(root, &["edit", &initial])?;
+    if immutable {
+        let mut config = fs::OpenOptions::new()
+            .append(true)
+            .open(fixture.join("jj.toml"))?;
+        writeln!(
+            config,
+            "[revset-aliases]\n'immutable_heads()' = '{}'",
+            pr.head_sha
+        )?;
+    }
     fs::write(
         root.join(".gitignore"),
         if nested || scenario.ends_with("excludes") || scenario == "ignore-core-changed" {
@@ -588,14 +651,14 @@ fn ignored_checkout(
         "private review state\n".into(),
     ));
     if scenario == "ignore-late-file" {
-        // Simulate a file arriving after the guard, just after jj edit finishes. Final
+        // Simulate a file arriving after the guard, just after jj edit/new finishes. Final
         // verification must not snapshot it, even with the default auto-track=all().
         let real_jj = PathBuf::from(std::env::var_os("ZPR_REAL_JJ").unwrap());
         let wrapper = fixture.join("bin/jj");
         fs::write(
             &wrapper,
             format!(
-                "#!/usr/bin/env python3\nimport subprocess, sys\nr = subprocess.run([{}] + sys.argv[1:])\nif r.returncode == 0 and 'edit' in sys.argv[1:]:\n    open('.late-private', 'w').write('late private data\\n')\nsys.exit(r.returncode)\n",
+                "#!/usr/bin/env python3\nimport subprocess, sys\nr = subprocess.run([{}] + sys.argv[1:])\nif r.returncode == 0 and any(a in sys.argv[1:] for a in ['edit', 'new']):\n    open('.late-private', 'w').write('late private data\\n')\nsys.exit(r.returncode)\n",
                 serde_json::to_string(&real_jj)?
             ),
         )?;
@@ -629,7 +692,8 @@ fn ignored_checkout(
         );
     } else {
         assert_eq!(result?, previous);
-        assert_eq!(client.checkout_commit()?, pr.head_sha);
+        assert_review_checkout(client, &pr.head_sha, immutable)?;
+        client.ensure_checkout(&pr)?;
     }
     assert_eq!(
         git(client, &["cat-file", "commit", &previous])?,
@@ -1301,26 +1365,18 @@ fn tracking_checkout(client: &Client, fixture: &Path, scenario: &str) -> Result<
     }
     assert!(!client.git_dir.join("FETCH_HEAD").exists());
     let checkout = client.checkout_pr(&pr);
-    if matches!(scenario, "track-immutable" | "track-ignored") {
+    if scenario == "track-ignored" {
         let error = format!("{:#}", checkout.unwrap_err());
-        assert!(
-            error.contains(if scenario == "track-immutable" {
-                "immutable"
-            } else {
-                "ignored"
-            }),
-            "{error}"
-        );
+        assert!(error.contains("ignored"), "{error}");
         assert_ne!(client.checkout_commit()?, pr.head_sha);
-        if scenario == "track-ignored" {
-            assert_eq!(
-                fs::read_to_string(directory.join("private-key"))?,
-                "do not snapshot this\n"
-            );
-        }
+        assert_eq!(
+            fs::read_to_string(directory.join("private-key"))?,
+            "do not snapshot this\n"
+        );
     } else {
         let previous = checkout?;
-        assert_eq!(client.checkout_commit()?, pr.head_sha);
+        assert_review_checkout(client, &pr.head_sha, scenario == "track-immutable")?;
+        client.ensure_checkout(&pr)?;
         assert_eq!(
             client.blob(&previous, "keep.txt")?,
             b"unsnapshotted local changes\n"
@@ -1651,7 +1707,7 @@ fn checkout_child() -> Result<()> {
         &client,
         &["config", "core.hooksPath", hooks.to_str().unwrap()],
     )?;
-    // The old PR path must still require an exact @ match.
+    // An unrelated checkout must not qualify for review discovery.
     assert!(Client::discover(&directory, Some("42"), Some("upstream/project")).is_err());
     fs::write(directory.join("keep.txt"), "unsnapshotted local changes\n")?;
     if scenario == "url-rewrite" {
@@ -1801,7 +1857,7 @@ fn checkout_child() -> Result<()> {
         fs::create_dir(directory.join("file.txt"))?;
         fs::write(directory.join("file.txt/private"), "keep this\n")?;
     }
-    if scenario == "immutable" {
+    if scenario.starts_with("immutable") {
         fs::write(
             fixture.join("jj.toml"),
             format!(
@@ -1826,13 +1882,38 @@ fn checkout_child() -> Result<()> {
         jj(&directory, &["sparse", "set", "--clear"])?;
     }
     let before = client.checkout_commit()?;
+    let target_before = git(&client, &["cat-file", "commit", &pr.head_sha])?;
+    if scenario == "immutable-late-edit" {
+        let real_jj = PathBuf::from(std::env::var_os("ZPR_REAL_JJ").unwrap());
+        fs::write(
+            fixture.join("bin/jj"),
+            format!(
+                "#!/usr/bin/env python3\nimport subprocess, sys\nr = subprocess.run([{}] + sys.argv[1:])\nif r.returncode == 0 and 'new' in sys.argv[1:]:\n    open('file.txt', 'w').write('late tracked edit\\n')\nsys.exit(r.returncode)\n",
+                serde_json::to_string(&real_jj)?
+            ),
+        )?;
+    }
     let result = client.checkout_pr(&checkout_pr);
+    assert_eq!(
+        git(&client, &["cat-file", "commit", &pr.head_sha])?,
+        target_before
+    );
+    if scenario == "immutable-late-edit" {
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("Previous work is preserved"), "{error}");
+        assert!(!client.checkout_matches(&pr)?);
+        assert!(client.ensure_checkout(&pr).is_err());
+        assert_eq!(
+            fs::read_to_string(directory.join("file.txt"))?,
+            "late tracked edit\n"
+        );
+        return Ok(());
+    }
     if [
         "obstruction",
         "directory-obstruction",
         "target-conflicts",
         "sparse",
-        "immutable",
         "conflicts",
         "stale",
     ]
@@ -1852,7 +1933,8 @@ fn checkout_child() -> Result<()> {
         return Ok(());
     }
     let previous = result?;
-    assert_eq!(client.checkout_commit()?, pr.head_sha);
+    assert_review_checkout(&client, &pr.head_sha, scenario == "immutable")?;
+    client.ensure_checkout(&pr)?;
     assert_eq!(
         fs::read_to_string(directory.join("file.txt"))?,
         "fork head\n"
@@ -1893,6 +1975,11 @@ fn checkout_child() -> Result<()> {
                 .iter()
                 .any(|a| ["checkout", "reset", "rebase", "pull"].contains(&a.as_str()))
         );
+    }
+    let jj_calls = fs::read_to_string(fixture.join("jj-calls.jsonl"))?;
+    for call in jj_calls.lines() {
+        let args: Vec<String> = serde_json::from_str(call)?;
+        assert!(!args.iter().any(|a| a == "--ignore-immutable"), "{args:?}");
     }
     let gh_calls = fs::read_to_string(fixture.join("gh-calls.jsonl"))?;
     for call in gh_calls.lines() {

@@ -2,7 +2,7 @@
 
 A Rust CLI for reviewing GitHub pull requests from Zed and a jj workspace.
 Press **Ctrl-Shift-G** to open a PR: the CLI fetches it, preserves your local work,
-edits the exact PR head, and opens the full comparison. Select right-side text
+checks out the PR's files, and opens the full comparison. Select right-side text
 and press **Ctrl-Shift-C** to save an inline comment in a private local draft.
 Approve or request changes to send the summary and all saved comments in one
 GitHub review. The `ready` command also marks the checked-out PR ready for review
@@ -32,23 +32,30 @@ the Rust source; the tasks do not build automatically.
 
 Open the jj workspace in Zed, press **Ctrl-Shift-G**, and enter a PR number or
 URL. You do not need to fetch or track its original branch first. `open` fetches
-the PR and base history, preserves your work, switches jj `@` to the exact PR
-head, and starts a review session. See the checkout safeguards below.
+the PR and base history, preserves your work, and starts a review session.
+For mutable heads it runs `jj edit <head>`; for immutable heads it runs
+`jj new <head>`, leaving the PR commit unchanged. See the safeguards below.
 
-You can still prepare the checkout yourself with `jj git fetch` and `jj edit`,
-then run `PR: full diff` to start a review session before commenting or submitting.
-`open` and review navigation (`sb`/`sf`) fetch and switch revisions; the other
-review commands do not. The recorded jj `@` must be the **exact PR head**, not
-its parent, an earlier PR commit, or a new
-child revision. Comments need local head blobs; `diff` also needs the pinned
-base and head commits and enough history to find one merge base.
+You can also prepare the checkout yourself with `jj git fetch` and `jj edit`
+(or `jj new` for an immutable head), then run `PR: full diff` before commenting
+or submitting. `open` and review navigation (`sb`/`sf`) fetch and switch revisions;
+the other review commands do not. The recorded jj `@` must be either the **exact
+PR head** or a **conflict-free, empty child with that head as its only parent**.
+The child's complete tree must match the head; merges, grandchildren, and children
+with recorded file changes are rejected. Manually created empty children also
+qualify. These checks use recorded jj state, not unsaved or unsnapshotted edits.
+Comments and comparisons remain pinned to the PR head, never the child. Comments
+need local head blobs; `diff` also needs the pinned base and head commits and
+enough history to find one merge base.
 
 An existing review session supplies the PR for commands without `--pr`, so its
 original branch bookmark is not required. Without a session or explicit `--pr`,
-automatic discovery requires one unconflicted local bookmark at `@` and one
-matching open PR. Tool bookmarks under `zed-pr-review/` are excluded. Use `--pr`
-and, when needed, `--repo` if discovery is ambiguous; these flags do not relax
-the exact-head check. **Comment, approve, and request-changes always require
+automatic discovery requires one unconflicted local bookmark and one matching
+open PR. It checks `@` first. Only if there are no non-tool bookmarks there may it
+check the sole parent of an empty, conflict-free `@`. It never falls back after
+ambiguous or failed discovery, or searches further ancestors. Tool bookmarks under
+`zed-pr-review/` are excluded. Use `--pr` and, when needed, `--repo` if discovery
+is ambiguous; these flags do not relax the checkout check. **Comment, approve, and request-changes always require
 context from a live full-PR diff**, even with an explicit `--pr`. They do not
 fall back to bookmark discovery or the last active session.
 
@@ -61,7 +68,7 @@ fall back to bookmark discovery or the last active session.
 | `PR: approve`         | Ctrl-Shift-A | Write a summary, then submit an approval with all saved comments. |
 | `PR: request changes` | Ctrl-Shift-Q | Write a summary, then request changes with all saved comments.    |
 | `PR: list comments`   | None         | Show the draft, its comments, and recovery status.                |
-| `PR: full diff`       | None         | Rebuild the full comparison at the current exact PR head.         |
+| `PR: full diff`       | None         | Rebuild the full comparison for the checked-out PR.               |
 | `jj l`                | Ctrl-Shift-L | Show the PR stack in review mode; otherwise show the live jj log. |
 | `jj sb`               | Ctrl-Shift-J | Open the parent PR in review mode; otherwise run `jj sb`.         |
 | `jj sf`               | Ctrl-Shift-K | Open a child PR in review mode; otherwise run `jj sf`.            |
@@ -103,11 +110,13 @@ input, this does not require Ctrl-D. For example:
 2. Prepare frozen snapshots for `merge-base(base, head) → head` in the default
    repository-local state directory.
 3. Snapshot the current jj working copy and preserve it with a unique
-   `zed-pr-review/previous-*` bookmark. Then run `jj edit` on the **exact head
-   SHA**, without `--ignore-immutable`, and verify the resulting checkout.
+   `zed-pr-review/previous-*` bookmark. Then run `jj edit <head-SHA>` for a mutable
+   head or `jj new <head-SHA>` for an immutable head, and verify the resulting
+   checkout. Neither command overrides immutability or changes jj configuration.
 4. Save `last-checkout.json` in the per-PR draft directory, activate the session,
-   print the previous SHA in a `jj edit <previous-SHA>` return command, and open
-   the comparison in Zed. If checkout succeeds but Zed cannot open the view, run
+   print the previous SHA in a `jj edit <previous-SHA>` return command (use
+   `jj new <previous-SHA>` if it is immutable), and open the comparison in Zed.
+   If checkout succeeds but Zed cannot open the view, run
    `PR: full diff` rather than repeating checkout just to reopen it.
 
 Save buffers yourself before using `open` directly; only the Zed task saves them
@@ -120,7 +129,7 @@ use unique refs under `refs/heads/zed-pr-review/`; both these refs and the
 automatic PR discovery and are not removed when another session opens.
 
 `open` refuses sparse or stale workspaces, conflicted current or target
-revisions, immutable PR heads, submodule checkouts, unsafe paths, and untracked
+revisions, submodule checkouts, unsafe paths, and untracked
 or ignored files that obstruct checkout. Before switching, it also checks whether
 the target's ignore rules would expose existing ignored files, such as `.env`,
 and refuses that checkout without recording those files. Directories that remain
@@ -129,7 +138,7 @@ automatic tracking of new files. It also refuses reserved state paths in the
 current revision, Git index, or incoming head. It never pushes, resets,
 rebases, or automatically rolls back. A failure may leave fetched refs,
 snapshots, or a preserved bookmark; after checkout, it may leave `@` at the PR
-head. Inspect the reported state and use the preserved bookmark or printed
+head or its new child. Inspect the reported state and use the preserved bookmark or printed
 return command rather than assuming that failure restored the old checkout.
 
 ### Fetching and tracking branches
@@ -164,7 +173,7 @@ pane first, so the task receives context from the diff. This is a one-time
 GitHub read, not a polling loop. Press L again to refresh.
 
 **Ctrl-Shift-J** opens the parent PR; **Ctrl-Shift-K** opens a child PR. Each move
-uses the same fetch, tracking, preservation, exact-head checks, and full diff
+uses the same fetch, tracking, preservation, checkout checks, and full diff
 as **Ctrl-Shift-G**. With several children, enter one of the offered **PR
 numbers**, then press Enter. A blank line cancels. At either end of the stack,
 there is no checkout. Saved comments remain in their separate per-PR drafts;
@@ -182,13 +191,13 @@ navigation, retry to see the new choices.
 The three shortcuts decide their mode from Zed's task context:
 
 - **Registered diff snapshot, either side:** review mode. The snapshot and the
-  exact PR head at `@` must still be valid. An old or altered tab fails closed;
+  checkout must still match the pinned PR revision. An old or altered tab fails closed;
   it never falls back to jj navigation or binds itself to a newer session.
 - **Ordinary source file:** normal jj mode, even if a review session exists.
   J and K run the configured `jj sb` and `jj sf` aliases. L retains
   `viddy --unfold -n 1 jj l --color always`.
 - **No file, such as a terminal:** use the active review only while `@` equals
-  its pinned head. Otherwise, use normal jj mode. A corrupt active pointer is
+  its pinned head or qualifies as its empty child. Otherwise, use normal jj mode. A corrupt active pointer is
   an error, not permission to change revisions.
 
 Navigation from either diff side does not enable deleted-side comments:
@@ -211,17 +220,17 @@ Rust `ready` command. Their other task settings are unchanged.
 ```
 
 The command first captures the recorded **jj `@`**, before contacting GitHub.
-That commit must equal the current PR head, including when `--pr` is explicit.
+That commit must equal the current PR head or qualify as its empty child,
+including when `--pr` is explicit.
 Discovery uses the captured commit, and all later checks and writes use the same
 PR. You can move to another revision while `ready` runs; it will finish on the
 original PR without changing your new checkout.
 
-Unlike the former script, this never searches ancestors for a bookmark. If you
-have already moved to a new child revision before starting `ready`, open the PR
-again or `jj edit` its head first. An existing session can supply the PR without
-its original bookmark. Otherwise, automatic discovery requires one unambiguous
-non-tool bookmark at the captured commit; explicit `--pr` can select the PR
-without a bookmark but cannot bypass the initial head check.
+An existing session can supply the PR without its original bookmark. Otherwise,
+automatic discovery checks bookmarks at the captured commit, then at its sole
+parent only if the captured commit is empty, conflict-free, and has no non-tool
+bookmarks. It never searches further ancestors. Explicit `--pr` can select the PR
+without a bookmark but cannot bypass the initial checkout check.
 
 `ready` marks a draft PR ready; an already-ready PR does not need that mutation.
 An optional `--reviewer LOGIN` requests one user. Use `--reviewer org/team-slug`
@@ -250,7 +259,7 @@ editor or read, lock, create, or alter a private review draft, so an existing
 review or uncertain submission does not block it. Normally it creates no private
 state. It can read an existing local session association and validate that state;
 `--state-dir` or `ZED_PR_REVIEW_STATE_DIR` affects whether that association is
-used. The initial exact-head and remote before/after mutation checks still apply. `--editor`
+used. The initial checkout and remote before/after mutation checks still apply. `--editor`
 has no effect; `--draft-dir` is rejected.
 
 ### Add a comment
@@ -298,8 +307,9 @@ in a multi-commit PR. Both `open` and `PR: full diff` (CLI `diff`) compare
 **`merge-base(base, head) → head`** with `zed --existing --diff`.
 
 `open` fetches and switches the checkout. `diff` instead reads existing local
-Git objects and builds a new session at the current **exact PR head**; it does
-not fetch, switch revisions, or snapshot the working copy. It still contacts
+Git objects and builds a new session for the pinned PR head, with `@` at that
+head or its empty child. It does not fetch, switch revisions, or snapshot the
+working copy. It still contacts
 GitHub to check the PR and obtain its changed-file metadata.
 
 Each comparison has a unique directory:
@@ -331,7 +341,8 @@ Other commands, such as listing and recovery, can still use the active session
 from ordinary files. No session-based command needs the original PR branch.
 An explicit `--pr` must agree with the session; it cannot rebind an existing view
 or active review.
-If `@` moves or the PR head, base, or identity changes, the command fails rather
+If `@` no longer matches the pinned head or its empty child, or the PR head,
+base, or identity changes, the command fails rather
 than silently choosing a different PR. Run `open` again to switch or refresh the
 active review. Reopening does not reassign old comments to a new revision; see
 the draft guidance below.
@@ -410,24 +421,24 @@ Run the binary directly for actions without tasks or for explicit PR selection:
 The PR number and repository above are examples. `comment` normally runs through
 Zed because it requires the selection variables from the task environment.
 
-| Subcommand        | Behavior                                                                                 |
-| ----------------- | ---------------------------------------------------------------------------------------- |
-| `open`            | Fetch, track when safe, preserve local work, edit the exact PR head, and open a session. |
-| `stack`           | Show the GitHub stack in review context; otherwise run `jj l` once.                      |
-| `stack --watch`   | Same as `stack`, but use viddy for the normal jj log, never for GitHub polling.          |
-| `sb` / `sf`       | Open the parent/child PR in review context; otherwise run the corresponding jj alias.    |
-| `ready`           | Mark the exact PR head at jj `@` ready; optionally request a reviewer with `--reviewer`. |
-| `comment`         | Read a multiline body from stdin until EOF; save a local inline comment.                 |
-| `approve`         | Edit a nonblank summary; send one approval with all saved comments.                      |
-| `request-changes` | Edit a nonblank summary; send one request for changes with all saved comments.           |
-| `list`            | Print one-based comment indices, pinned revision, status, and draft directory.           |
-| `edit INDEX`      | Edit a saved comment body; a blank edit preserves the original.                          |
-| `remove INDEX`    | Remove a saved comment locally.                                                          |
-| `discard`         | Ask for `yes`, archive the draft, and clear it locally.                                  |
-| `discard --yes`   | Archive and clear without prompting; never delete a GitHub review.                       |
-| `recover`         | Reconcile an uncertain submission or retry snapshot cleanup; never send another review.  |
-| `recover --retry` | If safe to proceed, ask for `yes` to permit a later attempt; do not post.                |
-| `diff`            | Build a frozen full-PR session at the current exact head, without fetching or switching. |
+| Subcommand        | Behavior                                                                                |
+| ----------------- | --------------------------------------------------------------------------------------- |
+| `open`            | Fetch, track when safe, preserve local work, check out the PR, and open a session.      |
+| `stack`           | Show the GitHub stack in review context; otherwise run `jj l` once.                     |
+| `stack --watch`   | Same as `stack`, but use viddy for the normal jj log, never for GitHub polling.         |
+| `sb` / `sf`       | Open the parent/child PR in review context; otherwise run the corresponding jj alias.   |
+| `ready`           | Mark the selected PR ready from its head or empty child; optionally use `--reviewer`.   |
+| `comment`         | Read a multiline body from stdin until EOF; save a local inline comment.                |
+| `approve`         | Edit a nonblank summary; send one approval with all saved comments.                     |
+| `request-changes` | Edit a nonblank summary; send one request for changes with all saved comments.          |
+| `list`            | Print one-based comment indices, pinned revision, status, and draft directory.          |
+| `edit INDEX`      | Edit a saved comment body; a blank edit preserves the original.                         |
+| `remove INDEX`    | Remove a saved comment locally.                                                         |
+| `discard`         | Ask for `yes`, archive the draft, and clear it locally.                                 |
+| `discard --yes`   | Archive and clear without prompting; never delete a GitHub review.                      |
+| `recover`         | Reconcile an uncertain submission or retry snapshot cleanup; never send another review. |
+| `recover --retry` | If safe to proceed, ask for `yes` to permit a later attempt; do not post.               |
+| `diff`            | Build a frozen full-PR session for the checked-out PR, without fetching or switching.   |
 
 Indices are one-based and refer to the current `list` output. All of these flags
 are global:
@@ -480,9 +491,10 @@ not the parent state directory. With this flag, `list`, `edit`, `remove`, and
 checkout. `recover` also works independently of the checkout, but **requires
 GitHub access** and the original authenticated reviewer. Use an existing
 `--directory` if `ZED_WORKTREE_ROOT` points to a directory that no longer exists.
-Commenting and submission require both a live review snapshot and the exact PR
-head at `@`. Marking ready also requires the exact PR head, but it can use a
-session, explicit flags, or bookmark discovery; it does not use the local draft.
+Commenting and submission require both a live review snapshot and a recorded
+`@` that matches the pinned head or its empty child. Marking ready uses the same
+checkout rule, but it can use a session, explicit flags, or bookmark discovery;
+it does not use the local draft.
 
 If the PR head, base, or identity changes, the CLI keeps existing comments and
 refuses to reuse them for a new revision. Inspect the old draft, explicitly
@@ -552,7 +564,8 @@ The Rust tests run offline. Integration tests use real local jj/Git objects, a
 fake `gh`, and a non-GUI editor. Stack tests cover pagination, exact branch
 relationships, ambiguity, and changes during navigation. Local transport tests
 cover fetching, tracking, pending-ref refusals, complete parent/child navigation,
-and preserved drafts. Cleanup tests cover both review decisions, recovery,
+and preserved drafts. Immutable-head tests cover empty-child checkouts, review
+commands, navigation, and protection of ignored files. Cleanup tests cover both review decisions, recovery,
 interrupted deletion, retained comments, and navigation after snapshots are
 removed. Guard tests verify that review actions outside a live diff do not read
 stdin, open an editor, contact GitHub, or create state. They do not exercise the

@@ -30,7 +30,7 @@ pub fn run(client: &Client, pr: &PullRequest, reviewer: Option<&str>) -> Result<
         "The PR head, base, or identity changed since discovery"
     );
     client.check_identity(pr)?;
-    println!("PR head at captured jj @: {}", pr.head_sha);
+    println!("Pinned PR head: {}", pr.head_sha);
     if checked_state(client, &pinned)? {
         let outcome = client.mark_ready(&pinned);
         // Recheck even after a failed command: the server may have accepted it.
@@ -70,7 +70,7 @@ fn checked_state(client: &Client, pinned: &ReadyState) -> Result<bool> {
         pinned.pr.same_revision(&current.pr)
             && pinned.base_ref == current.base_ref
             && pinned.node_id == current.node_id,
-        "The PR head, base branch, or identity changed. Check out the exact PR head and retry"
+        "The PR head, base branch, or identity changed. Open the PR again and retry"
     );
     client.check_identity(&pinned.pr)?;
     Ok(current.draft)

@@ -17,7 +17,7 @@ use zed_pr_review::store::{Attempt, Draft, Receipt, Store, default_directory, pr
 #[derive(Parser)]
 #[command(
     version,
-    about = "Review GitHub PRs from Zed, or mark the exact jj revision ready for review"
+    about = "Review GitHub PRs from Zed, or mark the checked-out PR ready for review"
 )]
 struct Cli {
     /// jj workspace; defaults to ZED_WORKTREE_ROOT, then the current directory.
@@ -56,7 +56,7 @@ enum Action {
     Sb,
     /// Open a child PR in review mode; otherwise run jj sf.
     Sf,
-    /// Capture jj @, mark its exact PR head ready, and optionally request a reviewer.
+    /// Mark the PR ready from its head or empty child; optionally request a reviewer.
     Ready {
         /// GitHub login or organization/team-slug; defaults to ZED_REVISION_READY_REVIEWER.
         #[arg(long)]
@@ -116,7 +116,7 @@ fn run(cli: Cli) -> Result<()> {
     if let Action::Ready { reviewer } = &cli.command {
         ensure!(
             cli.draft_dir.is_none(),
-            "--draft-dir cannot be used with ready; the exact PR head must be checked out"
+            "--draft-dir cannot be used with ready; check out the PR head or an empty child"
         );
         let reviewer = ready::requested_reviewer(reviewer.as_deref())?;
         let root = workspace_root(&directory)?;
@@ -902,9 +902,9 @@ fn navigation_session(root: &Path) -> Result<Option<Session>> {
         repo: active.pr.repo.clone(),
         reviewer: active.pr.reviewer.clone(),
     };
-    // Terminal/task context has no snapshot path. Only keep review mode while
-    // the active session still describes the exact recorded working revision.
-    Ok((client.checkout_commit()? == active.pr.head_sha).then_some(active))
+    // Terminal/task context has no snapshot path. Keep review mode for the pinned
+    // head or its unchanged child, but propagate inspection failures rather than navigate locally.
+    Ok(client.checkout_matches(&active.pr)?.then_some(active))
 }
 
 fn navigate(cli: &Cli, directory: &Path) -> Result<()> {
@@ -1084,6 +1084,7 @@ fn checkout_review(
     );
     session.activate(state)?;
     println!("Previous work is preserved. Return with: jj edit {previous_commit}");
+    println!("If that revision is immutable, use: jj new {previous_commit}");
     session.open().context("Checkout succeeded, but the diff could not be opened. Run the PR: full diff task; do not repeat checkout just to reopen the view")
 }
 

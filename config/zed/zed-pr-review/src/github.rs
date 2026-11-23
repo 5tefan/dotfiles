@@ -51,8 +51,71 @@ pub(crate) struct ReadyState {
     pub base_ref: String,
 }
 
+struct RecordedRevision {
+    commit_id: String,
+    empty_parent: Option<String>,
+}
+
+impl RecordedRevision {
+    fn read(root: &Path, sha: &str) -> Result<Self> {
+        validate_sha(sha)?;
+        let output = text(run(
+            jj_command(root).args([
+                "log",
+                "-r",
+                sha,
+                "--no-graph",
+                "-T",
+                r#"commit_id ++ "\t" ++ conflict ++ "\t" ++ empty ++ "\t" ++ parents.map(|parent| parent.commit_id()).join(" ")"#,
+            ]),
+            "inspect the recorded jj commit and its parents without snapshotting",
+        )?)?;
+        let revision = Self::parse(&output)?;
+        ensure!(
+            revision.commit_id.eq_ignore_ascii_case(sha),
+            "jj returned a different commit from the captured revision"
+        );
+        Ok(revision)
+    }
+
+    fn parse(output: &str) -> Result<Self> {
+        let fields: Vec<_> = output.trim_end_matches(['\r', '\n']).split('\t').collect();
+        ensure!(fields.len() == 4, "Invalid recorded jj revision output");
+        validate_sha(fields[0])?;
+        let conflict: bool = fields[1].parse().context("Invalid jj conflict flag")?;
+        let empty: bool = fields[2].parse().context("Invalid jj empty flag")?;
+        let parents: Vec<_> = if fields[3].is_empty() {
+            Vec::new()
+        } else {
+            fields[3].split(' ').collect()
+        };
+        for parent in &parents {
+            validate_sha(parent)?;
+        }
+        // jj's empty flag compares against the merged parent tree. A merge is
+        // never an acceptable wrapper, even when that comparison is empty.
+        let empty_parent = match parents.as_slice() {
+            [parent] if empty && !conflict => Some(parent.to_ascii_lowercase()),
+            _ => None,
+        };
+        Ok(Self {
+            commit_id: fields[0].to_ascii_lowercase(),
+            empty_parent,
+        })
+    }
+
+    fn matches(&self, head: &str) -> bool {
+        self.commit_id.eq_ignore_ascii_case(head)
+            || self
+                .empty_parent
+                .as_ref()
+                .is_some_and(|parent| parent.eq_ignore_ascii_case(head))
+    }
+}
+
 impl Client {
-    /// Discover a PR at the exact recorded jj `@`; never snapshot, fetch, or check out.
+    /// Discover a PR at recorded jj `@` or its sole parent when `@` is empty and
+    /// conflict-free. Never snapshot, fetch, or check out.
     /// An unqualified `--repo owner/repo` uses github.com unless a PR URL supplies a host.
     pub fn discover(
         directory: &Path,
@@ -65,7 +128,9 @@ impl Client {
     }
 
     /// Discover a PR for a previously captured jj `@`, even if the checkout moves.
-    /// The caller must capture `head_sha` before discovery; no live `@` check follows.
+    /// The caller must capture the actual `head_sha` before discovery. It must
+    /// equal the PR head or be its empty, conflict-free single-parent child;
+    /// no live `@` check follows.
     pub fn discover_at(
         directory: &Path,
         pr: Option<&str>,
@@ -93,23 +158,28 @@ impl Client {
             }
             None => checkout_sha(&root)?,
         };
-        let bookmark = if explicit_pr.is_none() {
-            Some(select_bookmark(&text(run(
-                jj_command(&root).args([
-                    "bookmark",
-                    "list",
-                    "-r",
-                    &head_sha,
-                    "--template",
-                    BOOKMARK_TEMPLATE,
-                ]),
-                "list local bookmarks at the captured jj @",
-            )?)?)?)
+        // Capture the relationship before any GitHub call. Later checkout moves
+        // must not change discover_at's interpretation of the initial revision.
+        let revision = RecordedRevision::read(&root, &head_sha)?;
+        let lookup = if explicit_pr.is_none() {
+            Some(select_discovery_bookmark(&revision, |sha| {
+                text(run(
+                    jj_command(&root).args([
+                        "bookmark",
+                        "list",
+                        "-r",
+                        sha,
+                        "--template",
+                        BOOKMARK_TEMPLATE,
+                    ]),
+                    "list local bookmarks at the captured jj revision",
+                )?)
+            })?)
         } else {
             None
         };
         let mut client = Self::in_workspace(&root, explicit_target)?;
-        let listed = if let Some(bookmark) = &bookmark {
+        let listed = if let Some((lookup_sha, bookmark)) = &lookup {
             let response = run(
                 gh_command(&client.root, Some(&client.host)).args([
                     "pr",
@@ -129,7 +199,7 @@ impl Client {
             )?;
             let candidates: Vec<ListedPr> =
                 serde_json::from_slice(&response).context("Invalid gh pr list JSON")?;
-            Some(select_pr(candidates, &head_sha, &client.target())?)
+            Some(select_pr(candidates, lookup_sha, &client.target())?)
         } else {
             None
         };
@@ -140,12 +210,16 @@ impl Client {
         };
         let pull = client.read_pr(number)?;
         ensure!(
-            pull.head_sha == head_sha,
-            "PR head {} does not equal captured jj @ {}; check out the exact PR head and retry (ancestors are not considered)",
-            pull.head_sha,
-            head_sha
+            revision.matches(&pull.head_sha),
+            "Captured jj @ {} is neither PR head {} nor its empty, conflict-free single-parent child; open the PR again",
+            head_sha,
+            pull.head_sha
         );
-        if let (Some(bookmark), Some(listed)) = (&bookmark, &listed) {
+        if let (Some((lookup_sha, bookmark)), Some(listed)) = (&lookup, &listed) {
+            ensure!(
+                pull.head_sha == *lookup_sha,
+                "PR head changed during discovery; retry with an explicit --pr"
+            );
             ensure!(
                 pull.head_ref == *bookmark
                     && pull.head_repo.eq_ignore_ascii_case(&listed.head_repo),
@@ -271,13 +345,20 @@ impl Client {
         Ok(reviewer.to_owned())
     }
 
-    /// Check identity and the recorded working-copy commit, without mutating the workspace.
-    pub fn ensure_checkout(&self, pr: &PullRequest) -> Result<()> {
+    /// Check identity and whether recorded jj `@` is the pinned PR head or its
+    /// empty, conflict-free single-parent child, without snapshotting or importing
+    /// refs. Inspection failures are errors, not checkout mismatches.
+    pub fn checkout_matches(&self, pr: &PullRequest) -> Result<bool> {
         self.check_identity(pr)?;
         let actual = checkout_sha(&self.root)?;
+        Ok(RecordedRevision::read(&self.root, &actual)?.matches(&pr.head_sha))
+    }
+
+    /// Require a matching recorded checkout without mutating the workspace.
+    pub fn ensure_checkout(&self, pr: &PullRequest) -> Result<()> {
         ensure!(
-            actual.eq_ignore_ascii_case(&pr.head_sha),
-            "jj @ is {actual}, but the pinned PR head is {}; check out the exact PR head and retry",
+            self.checkout_matches(pr)?,
+            "Recorded jj @ is neither the pinned PR head {} nor its empty, conflict-free single-parent child; open the PR again",
             pr.head_sha
         );
         Ok(())
@@ -810,8 +891,9 @@ impl Client {
         Ok(())
     }
 
-    /// Snapshot current work, pin it with a unique bookmark, then edit the exact head.
-    /// Returns the preserved commit ID. Never forces an immutable/conflicted checkout.
+    /// Snapshot current work and pin it with a unique bookmark. Edit a mutable PR
+    /// head, or create an empty child of an immutable head without overriding it.
+    /// Returns the preserved commit ID. Never forces a conflicted checkout.
     /// A failure after preservation leaves the bookmark available for manual recovery.
     /// Sparse workspaces, submodules, and non-UTF-8 paths are conservatively refused.
     /// The caller must serialize review operations; do not run other jj commands while switching.
@@ -852,14 +934,25 @@ impl Client {
             "preserve current jj work with a unique bookmark",
         )?;
         let result = (|| {
-            self.check_checkout_target(pr)?;
             ensure!(!self.commit_state("@")?.0, "Current jj @ has conflicts");
             let previous = self.checkout_commit()?;
             self.check_obstructions(&previous, &pr.head_sha)?;
             self.check_ignore_changes(&previous, &pr.head_sha)?;
+            let immutable = self.check_checkout_target(pr)?;
+            let (action, operation) = if immutable {
+                (
+                    "new",
+                    "create an empty child of the immutable PR head (stale workspaces are not overridden)",
+                )
+            } else {
+                (
+                    "edit",
+                    "edit the exact PR head (immutable revisions and stale workspaces are not overridden)",
+                )
+            };
             run(
-                jj_workspace_command(&self.root).args(["edit", &pr.head_sha]),
-                "edit the exact PR head (immutable revisions and stale workspaces are not overridden)",
+                jj_workspace_command(&self.root).args([action, &pr.head_sha]),
+                operation,
             )?;
             self.ensure_checkout(pr)?;
             // Verify tracked files, but never put newly unignored local files into Git
@@ -927,14 +1020,10 @@ impl Client {
         }
     }
 
-    fn check_checkout_target(&self, pr: &PullRequest) -> Result<()> {
+    fn check_checkout_target(&self, pr: &PullRequest) -> Result<bool> {
         let (conflict, immutable) = self.commit_state(&pr.head_sha)?;
         ensure!(!conflict, "The PR head has jj conflicts; refusing checkout");
-        ensure!(
-            !immutable,
-            "The PR head is immutable in jj; refusing checkout without overriding immutability"
-        );
-        Ok(())
+        Ok(immutable)
     }
 
     fn tree_paths(&self, sha: &str) -> Result<HashSet<PathBuf>> {
@@ -1750,7 +1839,22 @@ fn map_repo_view(value: &Value) -> Result<Target> {
     })
 }
 
-fn select_bookmark(output: &str) -> Result<String> {
+fn select_discovery_bookmark(
+    revision: &RecordedRevision,
+    mut list: impl FnMut(&str) -> Result<String>,
+) -> Result<(String, String)> {
+    for sha in std::iter::once(revision.commit_id.as_str()).chain(revision.empty_parent.as_deref())
+    {
+        if let Some(bookmark) = select_bookmark(&list(sha)?)? {
+            return Ok((sha.to_owned(), bookmark));
+        }
+    }
+    bail!(
+        "No local bookmark points at captured jj @ or its eligible empty-child parent; supply --pr explicitly (no other ancestors are considered)"
+    )
+}
+
+fn select_bookmark(output: &str) -> Result<Option<String>> {
     let mut names = Vec::new();
     for line in output.lines() {
         let (name, conflict) = line
@@ -1760,20 +1864,16 @@ fn select_bookmark(output: &str) -> Result<String> {
         match conflict {
             "false" => names.push(name),
             "true" => bail!(
-                "A local bookmark at jj @ is conflicted; resolve it or supply --pr explicitly"
+                "A local bookmark at the lookup revision is conflicted; resolve it or supply --pr explicitly"
             ),
             _ => bail!("Invalid jj bookmark conflict flag"),
         }
     }
     ensure!(
-        !names.is_empty(),
-        "No local bookmark points exactly at jj @; supply --pr explicitly (ancestors are not considered)"
+        names.len() <= 1,
+        "Multiple local bookmarks point at the lookup revision; supply --pr explicitly"
     );
-    ensure!(
-        names.len() == 1,
-        "Multiple local bookmarks point at jj @; supply --pr explicitly"
-    );
-    Ok(names[0].to_owned())
+    Ok(names.first().map(|name| (*name).to_owned()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1817,11 +1917,11 @@ fn select_pr(candidates: Vec<ListedPr>, sha: &str, target: &Target) -> Result<Se
     }
     ensure!(
         !matching.is_empty(),
-        "No open PR for the local bookmark has exactly the jj @ commit; check the checkout or supply --pr/--repo explicitly"
+        "No open PR for the local bookmark has exactly the lookup commit; check the checkout or supply --pr/--repo explicitly"
     );
     ensure!(
         matching.len() == 1,
-        "Multiple open PRs match the local bookmark and jj @ commit; supply --pr explicitly"
+        "Multiple open PRs match the local bookmark and lookup commit; supply --pr explicitly"
     );
     let candidate = matching.pop().context("Missing selected PR")?;
     check_pr_url(&candidate.url, target, candidate.number)?;
@@ -2304,13 +2404,144 @@ mod tests {
     }
 
     #[test]
+    fn recorded_revision_accepts_only_the_exact_head_or_an_empty_direct_child() {
+        let revision = RecordedRevision::parse(&format!("{HEAD}\tfalse\ttrue\t{BASE}")).unwrap();
+        assert!(revision.matches(HEAD));
+        assert!(revision.matches(&HEAD.to_ascii_uppercase()));
+        assert!(revision.matches(BASE));
+        assert!(revision.matches(&BASE.to_ascii_uppercase()));
+        assert!(!revision.matches(&"f".repeat(40)));
+
+        for (conflict, empty, parents) in [
+            (false, false, BASE.to_owned()),
+            (true, true, BASE.to_owned()),
+            (true, false, BASE.to_owned()),
+            (false, true, String::new()),
+            (false, true, format!("{BASE} {}", "f".repeat(40))),
+            (false, true, "f".repeat(40)),
+        ] {
+            let output = format!("{HEAD}\t{conflict}\t{empty}\t{parents}");
+            let revision = RecordedRevision::parse(&output).unwrap();
+            assert!(
+                revision.matches(HEAD),
+                "Exact matches remain valid: {output}"
+            );
+            assert!(!revision.matches(BASE), "{output}");
+        }
+    }
+
+    #[test]
+    fn recorded_revision_output_is_strict_and_normalizes_full_ids() {
+        let revision = RecordedRevision::parse(&format!(
+            "{}\tfalse\ttrue\t{}\n",
+            HEAD.to_ascii_uppercase(),
+            BASE.to_ascii_uppercase()
+        ))
+        .unwrap();
+        assert_eq!(revision.commit_id, HEAD);
+        assert_eq!(revision.empty_parent.as_deref(), Some(BASE));
+        let sha256 = "a".repeat(64);
+        let revision = RecordedRevision::parse(&format!("{sha256}\tfalse\ttrue\t")).unwrap();
+        assert!(revision.matches(&sha256));
+        assert!(revision.empty_parent.is_none());
+
+        for output in [
+            String::new(),
+            format!("{HEAD}\tfalse\ttrue"),
+            format!("{HEAD}\tfalse\ttrue\t{BASE}\textra"),
+            format!("{HEAD}\tunknown\ttrue\t{BASE}"),
+            format!("{HEAD}\tfalse\tunknown\t{BASE}"),
+            format!("short\tfalse\ttrue\t{BASE}"),
+            format!("{HEAD}\tfalse\ttrue\tshort"),
+            format!("{HEAD}\tfalse\ttrue\t{BASE} "),
+            format!("{HEAD}\tfalse\ttrue\t{BASE}  {BASE}"),
+            format!("{HEAD}\tfalse\ttrue\t{BASE}\n{HEAD}\tfalse\ttrue\t{BASE}"),
+        ] {
+            assert!(RecordedRevision::parse(&output).is_err(), "{output:?}");
+        }
+    }
+
+    #[test]
+    fn discovery_bookmarks_prefer_the_exact_commit_and_only_fall_back_on_absence() {
+        let revision = RecordedRevision::parse(&format!("{HEAD}\tfalse\ttrue\t{BASE}")).unwrap();
+        let mut calls = Vec::new();
+        let selected = select_discovery_bookmark(&revision, |sha| {
+            calls.push(sha.to_owned());
+            Ok("exact\tfalse\n".to_owned())
+        })
+        .unwrap();
+        assert_eq!(selected, (HEAD.to_owned(), "exact".to_owned()));
+        assert_eq!(calls, [HEAD]);
+
+        calls.clear();
+        let selected = select_discovery_bookmark(&revision, |sha| {
+            calls.push(sha.to_owned());
+            Ok(if sha == HEAD { "" } else { "parent\tfalse\n" }.to_owned())
+        })
+        .unwrap();
+        assert_eq!(selected, (BASE.to_owned(), "parent".to_owned()));
+        assert_eq!(calls, [HEAD, BASE]);
+
+        for output in [
+            None,
+            Some("bad"),
+            Some("a\ttrue\n"),
+            Some("a\tfalse\nb\tfalse\n"),
+        ] {
+            calls.clear();
+            assert!(
+                select_discovery_bookmark(&revision, |sha| {
+                    calls.push(sha.to_owned());
+                    output
+                        .map(str::to_owned)
+                        .context("Failed bookmark inspection")
+                })
+                .is_err()
+            );
+            assert_eq!(calls, [HEAD]);
+        }
+    }
+
+    #[test]
+    fn discovery_bookmarks_never_search_beyond_an_eligible_single_parent() {
+        for (conflict, empty, parents, expected) in [
+            (false, true, BASE.to_owned(), vec![HEAD, BASE]),
+            (false, false, BASE.to_owned(), vec![HEAD]),
+            (true, true, BASE.to_owned(), vec![HEAD]),
+            (
+                false,
+                true,
+                format!("{BASE} {}", "f".repeat(40)),
+                vec![HEAD],
+            ),
+            (false, true, String::new(), vec![HEAD]),
+        ] {
+            let revision =
+                RecordedRevision::parse(&format!("{HEAD}\t{conflict}\t{empty}\t{parents}"))
+                    .unwrap();
+            let mut calls = Vec::new();
+            assert!(
+                select_discovery_bookmark(&revision, |sha| {
+                    calls.push(sha.to_owned());
+                    Ok(String::new())
+                })
+                .is_err()
+            );
+            assert_eq!(calls, expected);
+        }
+    }
+
+    #[test]
     fn only_one_unconflicted_local_bookmark_is_accepted() {
         assert_eq!(
-            select_bookmark("feature/topic\tfalse\n").unwrap(),
-            "feature/topic"
+            select_bookmark("feature/topic\tfalse\n")
+                .unwrap()
+                .as_deref(),
+            Some("feature/topic")
         );
+        assert_eq!(select_bookmark("").unwrap(), None);
         for bad in [
-            "",
+            "\n",
             "a\ttrue\n",
             "a\tfalse\nb\tfalse\n",
             "a\tfalse\nb\ttrue\n",
@@ -2509,6 +2740,20 @@ mod tests {
         assert!(client.submit(&pr, &json!({"commit_id": BASE})).is_err());
         pr.reviewer = "someone-else".into();
         assert!(client.check_identity(&pr).is_err());
+        assert!(
+            client
+                .checkout_matches(&pr)
+                .unwrap_err()
+                .to_string()
+                .contains("reviewer does not match")
+        );
+        assert!(
+            client
+                .ensure_checkout(&pr)
+                .unwrap_err()
+                .to_string()
+                .contains("reviewer does not match")
+        );
         pr.reviewer = "reviewer".into();
         pr.repo = "other/project".into();
         assert!(client.check_identity(&pr).is_err());

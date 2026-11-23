@@ -271,6 +271,62 @@ os.execv(real_git, [real_git] + args)
         ])
     }
 
+    fn set_immutable_heads(&self, heads: &[&str]) -> Result<()> {
+        let mut revisions = vec!["root()".to_owned()];
+        revisions.extend(heads.iter().map(|head| format!("present({head})")));
+        self.jj(&[
+            "config",
+            "set",
+            "--repo",
+            "revset-aliases.\"immutable_heads()\"",
+            &revisions.join(" | "),
+        ])?;
+        Ok(())
+    }
+
+    fn assert_empty_child(&self, head: &str) -> Result<String> {
+        let child = self.sha("@")?;
+        assert_ne!(child, head);
+        assert_eq!(
+            self.sha("@-")?,
+            head,
+            "Exactly one parent must be the PR head"
+        );
+        assert_eq!(self.sha("@ & empty() & ~conflicts()")?, child);
+        Ok(child)
+    }
+
+    fn empty_immutable_head_child(&self) -> Result<String> {
+        self.jj(&[
+            "new",
+            "-m",
+            "Empty working copy above the immutable PR head",
+        ])?;
+        self.set_immutable_heads(&[&self.head])?;
+        assert_eq!(
+            self.jj(&[
+                "--ignore-working-copy",
+                "log",
+                "-r",
+                &self.head,
+                "--no-graph",
+                "-T",
+                "immutable",
+            ])?,
+            "true"
+        );
+        self.assert_empty_child(&self.head)
+    }
+
+    fn nonempty_child(&self, description: &str) -> Result<String> {
+        self.jj(&["new", "-m", description])?;
+        fs::write(self.repo.join("recorded local.txt"), "Not part of the PR\n")?;
+        self.jj(&["describe", "-m", description])?;
+        let child = self.sha("@")?;
+        assert_eq!(self.sha("@ & ~empty()")?, child);
+        Ok(child)
+    }
+
     fn control(&self) -> Result<Value> {
         read_json(&self.root.join("control.json"))
     }
@@ -1024,14 +1080,22 @@ impl NavigationTransport {
     }
 
     fn cleanup_assert_checkout(&self, number: u64) -> Result<PathBuf> {
+        self.assert_checkout_kind(number, false)
+    }
+
+    fn assert_checkout_kind(&self, number: u64, immutable: bool) -> Result<PathBuf> {
         let fixture = &self.fixture;
         let revision = &self.revisions[&number];
-        assert_eq!(
-            fixture.sha("@")?,
-            revision.head,
-            "Edit the exact PR head, not a child"
-        );
-        assert_eq!(fixture.sha("@-")?, revision.parent);
+        if immutable {
+            fixture.assert_empty_child(&revision.head)?;
+        } else {
+            assert_eq!(
+                fixture.sha("@")?,
+                revision.head,
+                "Edit the exact mutable PR head, not a child"
+            );
+            assert_eq!(fixture.sha("@-")?, revision.parent);
+        }
         assert_eq!(
             fixture.git(&["merge-base", &revision.head, &revision.base])?,
             revision.merge_base
@@ -1586,12 +1650,50 @@ fn navigation_missing_or_empty_context_uses_active_review_only_at_its_exact_head
 }
 
 #[test]
+fn navigation_empty_immutable_head_child_keeps_review_mode_in_zed_and_terminal() -> Result<()> {
+    let (fixture, session) = navigation_session()?;
+    let child = fixture.empty_immutable_head_child()?;
+    for keep_immutable in [true, false] {
+        if !keep_immutable {
+            fixture.set_immutable_heads(&[])?;
+        }
+        let before = NavigationCheckpoint::capture(&fixture)?;
+        navigation_clear_calls(&fixture)?;
+        for file in [
+            Some(session.join("head").join(FILE)),
+            Some(session.join("base").join(FILE)),
+            None,
+            Some(PathBuf::new()),
+        ] {
+            for args in [&["stack"][..], &["stack", "--watch"], &["sb"], &["sf"]] {
+                let start = fixture.calls()?.len();
+                let output =
+                    fixture.execute(navigation_command(&fixture, args, file.as_deref()), "")?;
+                success(&output);
+                assert!(
+                    fixture.calls()?[start..]
+                        .iter()
+                        .any(|call| { call["endpoint"] == PULLS_ENDPOINT }),
+                    "Expected review navigation for {args:?}, file {file:?}: {}",
+                    describe(&output)
+                );
+                if args[0] == "stack" {
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("* #17"));
+                }
+            }
+        }
+        before.assert_unchanged(&fixture)?;
+        assert_eq!(fixture.assert_empty_child(&fixture.head)?, child);
+    }
+    Ok(())
+}
+
+#[test]
 fn navigation_missing_or_empty_context_away_from_active_head_stays_local() -> Result<()> {
     let (fixture, _) = navigation_session()?;
     let active = fs::read(fixture.state.join("active.json"))?;
     let draft = fs::read(fixture.draft_path()?)?;
-    fixture.jj(&["new", "-m", "Unrelated local work"])?;
-    let away = fixture.sha("@")?;
+    let away = fixture.nonempty_child("Unrelated local work")?;
     fixture.jj(&["new", "-m", "Local child"])?;
     let child = fixture.sha("@")?;
     fixture.configure("deny_discovery", json!(true))?;
@@ -1857,7 +1959,7 @@ fn navigation_stale_selected_snapshot_rejects_checkout_and_remote_head_drift() -
         if remote_drift {
             fixture.configure("head", json!(fixture.base))?;
         } else {
-            fixture.jj(&["new", "-m", "Unrelated local checkout"])?;
+            fixture.nonempty_child("Unrelated local checkout")?;
         }
         let before = NavigationCheckpoint::capture(&fixture)?;
         navigation_clear_calls(&fixture)?;
@@ -2208,6 +2310,69 @@ fn navigation_transport_round_trip_non_colocated() -> Result<()> {
 #[test]
 fn navigation_transport_round_trip_colocated() -> Result<()> {
     navigation_transport_round_trip(true)
+}
+
+fn navigation_transport_immutable_round_trip(colocate: bool, terminal: bool) -> Result<()> {
+    let transport = NavigationTransport::new(colocate, false)?;
+    let fixture = &transport.fixture;
+    fixture.set_immutable_heads(&[
+        &transport.revisions[&17].head,
+        &transport.revisions[&18].head,
+    ])?;
+    success(&fixture.run_default(&["--pr", PR_URL, "open"], "")?);
+    let parent = transport.assert_checkout_kind(17, true)?;
+    let parent_checkout = fixture.sha("@")?;
+    let parent_draft = transport.comment(&parent, 17, "Keep the immutable parent's comment")?;
+    let parent_bytes = fs::read(&parent_draft)?;
+
+    let file = (!terminal).then(|| parent.join("head").join(FILE));
+    let stack = fixture.execute(navigation_command(fixture, &["stack"], file.as_deref()), "")?;
+    success(&stack);
+    let text = String::from_utf8_lossy(&stack.stdout);
+    assert!(text.contains("* #17") && text.contains("#18"), "{text}");
+    assert_eq!(fixture.sha("@")?, parent_checkout);
+    success(&fixture.execute(navigation_command(fixture, &["sf"], file.as_deref()), "")?);
+    let child = transport.assert_checkout_kind(18, true)?;
+    let child_checkout = fixture.sha("@")?;
+    let child_receipt = read_json(&child.parent().unwrap().join("last-checkout.json"))?;
+    assert_eq!(child_receipt["previous_commit"], parent_checkout);
+    let child_draft = transport.comment(&child, 18, "Keep the immutable child's comment")?;
+    let child_bytes = fs::read(&child_draft)?;
+    assert_eq!(fs::read(&parent_draft)?, parent_bytes);
+
+    success(&fixture.execute(
+        navigation_command(fixture, &["sb"], Some(&child.join("base").join(FILE))),
+        "",
+    )?);
+    let returned = transport.assert_checkout_kind(17, true)?;
+    assert_ne!(returned, parent);
+    assert_eq!(returned.parent(), parent.parent());
+    let receipt = read_json(&returned.parent().unwrap().join("last-checkout.json"))?;
+    assert_eq!(receipt["previous_commit"], child_checkout);
+    assert_eq!(fs::read(&parent_draft)?, parent_bytes);
+    assert_eq!(fs::read(&child_draft)?, child_bytes);
+    assert_eq!(transport.fetch_numbers()?, [17, 18, 17]);
+    assert_eq!(fixture.zed_calls()?.len(), 3);
+    let checkout = fixture.sha("@")?;
+    fixture.jj(&["status"])?;
+    assert_eq!(
+        fixture.sha("@")?,
+        checkout,
+        "Review state must stay ignored"
+    );
+    assert!(fixture.calls()?.iter().all(|call| call["method"] != "POST"));
+    assert!(fixture.editors()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn navigation_transport_round_trip_between_immutable_pr_heads_in_zed() -> Result<()> {
+    navigation_transport_immutable_round_trip(false, false)
+}
+
+#[test]
+fn navigation_transport_round_trip_between_immutable_pr_heads_including_terminal() -> Result<()> {
+    navigation_transport_immutable_round_trip(true, true)
 }
 
 #[test]
@@ -3140,6 +3305,102 @@ fn open_fetches_the_exact_pr_and_full_history_preserves_work_and_launches_from_r
 }
 
 #[test]
+fn immutable_head_child_supports_full_diff_comments_and_both_review_decisions() -> Result<()> {
+    for (colocate, action, event) in [
+        (false, "approve", "APPROVE"),
+        (true, "request-changes", "REQUEST_CHANGES"),
+    ] {
+        let transport = OpenFixture::new(colocate)?;
+        let fixture = &transport.fixture;
+        fixture.set_immutable_heads(&[&fixture.head])?;
+        success(&fixture.run_default(&["--pr", PR_URL, "open"], "")?);
+        let child = fixture.assert_empty_child(&fixture.head)?;
+        let opened = fixture.active_directory()?;
+        // Exercise validation both before and after removing the immutable config.
+        if !colocate {
+            fixture.set_immutable_heads(&[])?;
+        }
+        success(&fixture.run_default(&["diff"], "")?);
+        let session = fixture.active_directory()?;
+        assert_ne!(session, opened);
+        assert_eq!(fixture.sha("@")?, child);
+        let manifest = read_json(&session.join("manifest.json"))?;
+        assert_eq!(manifest["pr"]["head_sha"], fixture.head);
+        assert_eq!(manifest["pr"]["base_sha"], fixture.base);
+        assert_eq!(manifest["merge_base"], transport.common);
+        assert_eq!(manifest["files"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            fs::read_to_string(session.join("base").join(FILE))?,
+            "one\ntwo\nthree\n"
+        );
+        assert_eq!(
+            fs::read_to_string(session.join("head").join(FILE))?,
+            "ONE\ntwo\nTHREE\n"
+        );
+        assert_eq!(
+            fs::read_to_string(session.join("head/early change.txt"))?,
+            "first commit\n"
+        );
+        assert_eq!(
+            fs::read_to_string(session.join("head/late change.txt"))?,
+            "second commit\n"
+        );
+        assert_eq!(
+            fs::read_to_string(session.join("base/removed.txt"))?,
+            "old\n"
+        );
+        assert!(!session.join("head/removed.txt").exists());
+        for side in ["head", "base"] {
+            assert!(!session.join(side).join("base-only.txt").exists());
+            assert!(!session.join(side).join("unchanged.txt").exists());
+        }
+        assert!(
+            !fixture
+                .git(&["diff", "--name-only", &transport.first, &fixture.head])?
+                .lines()
+                .any(|path| path == "early change.txt")
+        );
+        let body = "Review the first commit, not just the empty working copy";
+        let mut command = fixture.default_cli(&["comment"]);
+        command
+            .env("ZED_FILE", session.join("head/early change.txt"))
+            .env("ZED_SELECTED_TEXT", "first commit\n");
+        success(&fixture.execute(command, body)?);
+        let comments = fixture.draft()?["comments"].clone();
+        assert_eq!(comments[0]["path"], "early change.txt");
+        assert_eq!(comments[0]["body"], body);
+        success(&fixture.run_session(&session, &[action], "")?);
+        let posts = fixture.posts()?;
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0]["payload"]["commit_id"], fixture.head);
+        assert_ne!(posts[0]["payload"]["commit_id"], child);
+        assert_eq!(posts[0]["payload"]["event"], event);
+        assert_eq!(posts[0]["payload"]["body"], SUMMARY);
+        assert_eq!(
+            posts[0]["payload"]["comments"],
+            json!([{
+                "path": "early change.txt", "line": 1, "side": "RIGHT", "body": body,
+            }])
+        );
+        assert_eq!(posts[0]["drafts_at_post"][0]["comments"], comments);
+        let editors = fixture.editors()?;
+        assert_eq!(editors.len(), 1);
+        let template = editors[0]["initial"].as_str().unwrap();
+        assert!(
+            template.contains("early change.txt:1–1 RIGHT"),
+            "{template}"
+        );
+        assert!(template.contains("#| > 1 | first commit"), "{template}");
+        assert!(template.contains(body), "{template}");
+        assert_eq!(fixture.zed_calls()?.len(), 2);
+        assert_eq!(fixture.assert_empty_child(&fixture.head)?, child);
+        fixture.jj(&["status"])?;
+        assert_eq!(fixture.sha("@")?, child);
+    }
+    Ok(())
+}
+
+#[test]
 fn open_accepts_global_pr_urls_and_a_single_prompt_line_without_a_positional_argument() -> Result<()>
 {
     for (args, input) in [
@@ -3697,7 +3958,7 @@ fn registered_session_refuses_all_review_actions_after_checkout_or_remote_head_d
         if remote_drift {
             fixture.configure("head", json!(fixture.base))?;
         } else {
-            fixture.jj(&["new", "-m", "Unrelated checkout"])?;
+            fixture.nonempty_child("Unrelated checkout")?;
         }
         for action in ["comment", "approve", "request-changes"] {
             let calls_before = fixture.calls()?.len();
@@ -3723,6 +3984,185 @@ fn registered_session_refuses_all_review_actions_after_checkout_or_remote_head_d
         assert_eq!(fixture.active_directory()?, session);
     }
     Ok(())
+}
+
+fn assert_checkout_guard_rejects_review_actions(fixture: &Fixture) -> Result<()> {
+    let checkout = fixture.sha("@")?;
+    let contents = fs::read(fixture.repo.join(FILE))?;
+    let state = guard_entries(&fixture.state)?;
+    for action in [
+        "diff",
+        "comment",
+        "approve",
+        "request-changes",
+        "stack",
+        "sb",
+        "sf",
+    ] {
+        let output = fixture.run(&["--pr", PR_URL, action], "Must not be saved")?;
+        failure(&output);
+        assert!(
+            describe(&output).contains("jj @"),
+            "{action}: {}",
+            describe(&output)
+        );
+        assert_eq!(
+            guard_entries(&fixture.state)?,
+            state,
+            "{action} changed review state"
+        );
+    }
+    for args in [
+        vec!["--reviewer", "alice"],
+        vec!["--pr", PR_URL, "--reviewer", "alice"],
+        vec![
+            "--pr",
+            "17",
+            "--repo",
+            "github.com/acme/widgets",
+            "--reviewer",
+            "alice",
+        ],
+    ] {
+        let output = fixture.run_ready(&args)?;
+        failure(&output);
+        assert!(
+            describe(&output).contains("jj @"),
+            "{args:?}: {}",
+            describe(&output)
+        );
+        assert_eq!(guard_entries(&fixture.state)?, state);
+    }
+    assert_eq!(fixture.sha("@")?, checkout);
+    assert_eq!(fs::read(fixture.repo.join(FILE))?, contents);
+    fixture.assert_ready_mutations(&[])?;
+    assert!(fixture.posts()?.is_empty());
+    assert!(fixture.editors()?.is_empty());
+    assert!(fixture.zed_calls()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn checkout_guard_rejects_an_empty_grandchild() -> Result<()> {
+    let fixture = Fixture::review()?;
+    fixture.comment(1, "one", "Keep the original PR draft")?;
+    let child = fixture.empty_immutable_head_child()?;
+    fixture.jj(&["new", "-m", "Empty grandchild is not the PR checkout"])?;
+    let grandchild = fixture.sha("@")?;
+    assert_eq!(fixture.sha("@ & empty() & ~conflicts()")?, grandchild);
+    assert_eq!(fixture.sha("@-")?, child);
+    assert_eq!(fixture.sha("@--")?, fixture.head);
+    assert_checkout_guard_rejects_review_actions(&fixture)
+}
+
+#[test]
+fn checkout_guard_rejects_an_unrelated_commit_with_the_same_tree() -> Result<()> {
+    let fixture = Fixture::review()?;
+    fixture.comment(1, "one", "Keep the original PR draft")?;
+    fixture.jj(&["new", &fixture.base, "-m", "Unrelated copy of the PR tree"])?;
+    fixture.jj(&["restore", "--from", &fixture.head, FILE])?;
+    let unrelated = fixture.sha("@")?;
+    fixture.jj(&["new", "-m", "Empty child of unrelated history"])?;
+    let checkout = fixture.sha("@")?;
+    assert_eq!(fixture.sha("@ & empty() & ~conflicts()")?, checkout);
+    assert_eq!(fixture.sha("@-")?, unrelated);
+    assert!(fixture.sha(&format!("@ & {}::", fixture.head))?.is_empty());
+    assert!(
+        fixture
+            .git(&["diff", "--name-only", &fixture.head, &checkout])?
+            .is_empty()
+    );
+    assert_checkout_guard_rejects_review_actions(&fixture)
+}
+
+fn checkout_guard_conflicted_merge(fixture: &Fixture) -> Result<String> {
+    fixture.jj(&[
+        "new",
+        &fixture.base,
+        "-m",
+        "Conflicting addition on another branch",
+    ])?;
+    fs::write(
+        fixture.repo.join(FILE),
+        "Conflicting content from another branch\n",
+    )?;
+    fixture.jj(&["describe", "-m", "Recorded conflicting addition"])?;
+    let other = fixture.sha("@")?;
+    fixture.jj(&["new", &fixture.head, &other, "-m", "Unresolved merge"])?;
+    let merge = fixture.sha("@")?;
+    assert_eq!(fixture.sha("@ & conflicts()")?, merge);
+    Ok(merge)
+}
+
+#[test]
+fn checkout_guard_rejects_a_conflicted_single_parent_child() -> Result<()> {
+    let fixture = Fixture::review()?;
+    fixture.comment(1, "one", "Keep the original PR draft")?;
+    let merge = checkout_guard_conflicted_merge(&fixture)?;
+    fixture.jj(&[
+        "new",
+        &fixture.head,
+        "-m",
+        "Conflicted child of the PR head",
+    ])?;
+    fixture.jj(&["restore", "--from", &merge, FILE])?;
+    let child = fixture.sha("@")?;
+    assert_eq!(fixture.sha("@ & conflicts()")?, child);
+    assert_eq!(fixture.sha("@-")?, fixture.head);
+    assert_checkout_guard_rejects_review_actions(&fixture)
+}
+
+#[test]
+fn checkout_guard_rejects_an_empty_conflicted_child_of_the_pr_head() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.head = checkout_guard_conflicted_merge(&fixture)?;
+    fixture.configure("head", json!(fixture.head))?;
+    fixture.jj(&["bookmark", "set", "topic", "-r", &fixture.head])?;
+    fixture.jj(&["new", "-m", "Empty child inherits the PR head's conflict"])?;
+    let child = fixture.sha("@")?;
+    assert_eq!(fixture.sha("@ & empty() & conflicts()")?, child);
+    assert_eq!(fixture.sha("@-")?, fixture.head);
+    // Without the conflict guard, this would qualify for the parent fallback.
+    failure(&fixture.run_ready(&[])?);
+    assert!(fixture.calls()?.is_empty());
+    let output = fixture.run_ready(&["--pr", PR_URL, "--reviewer", "alice"])?;
+    failure(&output);
+    assert!(describe(&output).contains("jj @"), "{}", describe(&output));
+    assert_eq!(fixture.sha("@")?, child);
+    fixture.assert_ready_mutations(&[])?;
+    fixture.assert_stateless_ready()
+}
+
+#[test]
+fn checkout_guard_rejects_an_empty_merge_containing_the_pr_head() -> Result<()> {
+    let fixture = Fixture::review()?;
+    fixture.comment(1, "one", "Keep the original PR draft")?;
+    fixture.jj(&[
+        "new",
+        &fixture.base,
+        "-m",
+        "Independent copy of the PR tree",
+    ])?;
+    fixture.jj(&["restore", "--from", &fixture.head, FILE])?;
+    let other = fixture.sha("@")?;
+    fixture.jj(&[
+        "new",
+        &fixture.head,
+        &other,
+        "-m",
+        "Empty merge of identical trees",
+    ])?;
+    let merge = fixture.sha("@")?;
+    assert_eq!(fixture.sha("@ & empty() & ~conflicts()")?, merge);
+    let parents = fixture.sha("@-")?;
+    assert_eq!(parents.len(), 80, "The merge must have exactly two parents");
+    assert!(parents.contains(&fixture.head) && parents.contains(&other));
+    assert!(
+        fixture
+            .git(&["diff", "--name-only", &fixture.head, &merge])?
+            .is_empty()
+    );
+    assert_checkout_guard_rejects_review_actions(&fixture)
 }
 
 #[test]
@@ -4826,6 +5266,150 @@ fn ready_accepts_explicit_pr_url_or_number_and_repo_without_a_bookmark() -> Resu
     Ok(())
 }
 
+#[test]
+fn ready_accepts_empty_immutable_head_children_with_or_without_the_immutable_config() -> Result<()>
+{
+    for mode in ["automatic", "url", "number", "session"] {
+        for keep_immutable in [true, false] {
+            let fixture = if mode == "session" {
+                Fixture::review()?
+            } else {
+                Fixture::new()?
+            };
+            let child = fixture.empty_immutable_head_child()?;
+            if !keep_immutable {
+                fixture.set_immutable_heads(&[])?;
+            }
+            if mode != "automatic" {
+                fixture.jj(&["bookmark", "delete", "topic"])?;
+            }
+            let mut args = vec!["--reviewer", "alice"];
+            match mode {
+                "url" => args.extend(["--pr", PR_URL]),
+                "number" => args.extend(["--pr", "17", "--repo", "acme/widgets"]),
+                _ => {}
+            }
+            let state = guard_entries(&fixture.state)?;
+            let output = fixture.run_ready(&args)?;
+            success(&output);
+            fixture.assert_ready_mutations(&["ready", "request-reviewer"])?;
+            assert_eq!(
+                fixture.ready_mutations()?[0]["payload"]["variables"],
+                json!({"id": PR_NODE_ID})
+            );
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                text.contains(&child) && text.contains(&fixture.head) && text.contains(PR_URL),
+                "{text}"
+            );
+            assert_eq!(fixture.assert_empty_child(&fixture.head)?, child);
+            assert_eq!(guard_entries(&fixture.state)?, state);
+            assert!(fixture.posts()?.is_empty());
+            assert!(fixture.editors()?.is_empty());
+            if mode != "session" {
+                fixture.assert_stateless_ready()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn ready_empty_immutable_head_child_keeps_the_captured_pr_when_checkout_moves() -> Result<()> {
+    for mode in ["automatic", "explicit", "session"] {
+        let mut cases = vec![
+            ("pr_read_changes", json!({"1": {"jj_new": true}})),
+            ("ready_after", json!({"jj_new": true})),
+        ];
+        if mode == "automatic" {
+            cases.extend([
+                ("repo_view_changes", json!({"jj_new": true})),
+                ("pr_list_changes", json!({"jj_new": true})),
+            ]);
+        }
+        for (hook, changes) in cases {
+            let fixture = if mode == "session" {
+                Fixture::review()?
+            } else {
+                Fixture::new()?
+            };
+            let captured = fixture.empty_immutable_head_child()?;
+            fixture.set_immutable_heads(&[])?;
+            let mut args = vec!["--reviewer", "alice"];
+            if mode != "automatic" {
+                fixture.jj(&["bookmark", "delete", "topic"])?;
+            }
+            if mode == "explicit" {
+                args.extend(["--pr", PR_URL]);
+            }
+            fixture.configure("pr_reads", json!(0))?;
+            fs::write(fixture.root.join("gh.jsonl"), "")?;
+            fixture.configure(hook, changes)?;
+            assert_ready_ignores_checkout_movement(&fixture, &args)
+                .with_context(|| format!("{mode} from an empty child, movement at {hook}"))?;
+            assert_eq!(fixture.sha("@-")?, captured);
+            assert_eq!(fixture.sha("@--")?, fixture.head);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn ready_empty_child_prefers_its_own_bookmark_and_pr_over_its_parent() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let child = fixture.empty_immutable_head_child()?;
+    fixture.jj(&["bookmark", "create", "parent-topic", "-r", &fixture.head])?;
+    fixture.jj(&["bookmark", "set", "topic", "-r", &child])?;
+    fixture.configure("head", json!(child))?;
+    success(&fixture.run_ready(&[])?);
+    fixture.assert_ready_mutations(&["ready"])?;
+    let calls = fixture.calls()?;
+    let listings: Vec<_> = calls
+        .iter()
+        .filter(|call| call["args"][0] == "pr")
+        .collect();
+    assert_eq!(listings.len(), 1);
+    assert_eq!(listings[0]["args"][5], "topic");
+    assert_eq!(fixture.sha("@")?, child);
+    fixture.assert_stateless_ready()
+}
+
+#[test]
+fn ready_empty_child_does_not_hide_ambiguous_bookmarks_by_using_its_parent() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let child = fixture.empty_immutable_head_child()?;
+    fixture.jj(&["bookmark", "create", "first-child", "second-child"])?;
+    let output = fixture.run_ready(&[])?;
+    failure(&output);
+    assert!(describe(&output).to_ascii_lowercase().contains("bookmark"));
+    assert!(
+        fixture.calls()?.is_empty(),
+        "Do not fall back to the parent's topic bookmark"
+    );
+    assert_eq!(fixture.sha("@")?, child);
+    fixture.assert_stateless_ready()
+}
+
+#[test]
+fn ready_empty_child_does_not_retry_parent_discovery_after_its_own_pr_mismatches() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let child = fixture.empty_immutable_head_child()?;
+    fixture.jj(&["bookmark", "create", "parent-topic", "-r", &fixture.head])?;
+    fixture.jj(&["bookmark", "set", "topic", "-r", &child])?;
+    // The listed PR still has the parent's SHA, not this bookmark's commit.
+    failure(&fixture.run_ready(&[])?);
+    let calls = fixture.calls()?;
+    let listings: Vec<_> = calls
+        .iter()
+        .filter(|call| call["args"][0] == "pr")
+        .collect();
+    assert_eq!(listings.len(), 1);
+    assert_eq!(listings[0]["args"][5], "topic");
+    fixture.assert_ready_mutations(&[])?;
+    assert_eq!(fixture.sha("@")?, child);
+    fixture.assert_stateless_ready()
+}
+
 fn ready_checkout_movement_cases() -> Vec<(&'static str, Value)> {
     // Discovery, baseline, mark guard, mark verification, reviewer guard, and
     // reviewer verification must all keep the original revision.
@@ -4845,6 +5429,7 @@ fn ready_checkout_movement_cases() -> Vec<(&'static str, Value)> {
 }
 
 fn assert_ready_ignores_checkout_movement(fixture: &Fixture, args: &[&str]) -> Result<()> {
+    let captured = fixture.sha("@")?;
     let state_before = guard_entries(&fixture.state)?;
     let output = fixture.run_ready(args)?;
     ensure!(output.status.success(), "{}", describe(&output));
@@ -4865,8 +5450,9 @@ fn assert_ready_ignores_checkout_movement(fixture: &Fixture, args: &[&str]) -> R
         .context("The checkout movement hook must run")?;
     assert_ne!(moved, fixture.head);
     assert_eq!(fixture.sha("@")?, moved, "Leave the new checkout untouched");
-    assert_eq!(fixture.sha("@-")?, fixture.head);
+    assert_eq!(fixture.sha("@-")?, captured);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&captured), "{}", describe(&output));
     assert!(stdout.contains(PR_URL), "{}", describe(&output));
     assert!(stdout.contains(&fixture.head), "{}", describe(&output));
     assert!(!stdout.contains(moved), "{}", describe(&output));
@@ -5085,10 +5671,9 @@ fn ready_rejects_a_pr_head_that_differs_from_jj_at() -> Result<()> {
 }
 
 #[test]
-fn ready_never_falls_back_to_an_ancestor_even_with_an_explicit_pr() -> Result<()> {
+fn ready_never_falls_back_from_nonempty_work_even_with_an_explicit_pr() -> Result<()> {
     let fixture = Fixture::new()?;
-    fixture.jj(&["new", "-m", "Unbookmarked child of the PR head"])?;
-    let child = fixture.sha("@")?;
+    let child = fixture.nonempty_child("Unbookmarked nonempty child of the PR head")?;
     assert_ne!(child, fixture.head);
     assert_eq!(fixture.sha("@-")?, fixture.head);
     failure(&fixture.run_ready(&[])?);
@@ -5114,11 +5699,10 @@ fn ready_never_falls_back_to_an_ancestor_even_with_an_explicit_pr() -> Result<()
 }
 
 #[test]
-fn ready_existing_session_never_authorizes_an_initial_checkout_at_a_child() -> Result<()> {
+fn ready_existing_session_never_authorizes_an_initial_checkout_at_a_nonempty_child() -> Result<()> {
     let fixture = Fixture::review()?;
     fixture.jj(&["bookmark", "delete", "topic"])?;
-    fixture.jj(&["new", "-m", "Unbookmarked child of the session head"])?;
-    let child = fixture.sha("@")?;
+    let child = fixture.nonempty_child("Unbookmarked nonempty child of the session head")?;
     let state_before = guard_entries(&fixture.state)?;
     let output = fixture.run_ready(&["--reviewer", "alice"])?;
     failure(&output);

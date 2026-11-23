@@ -84,7 +84,8 @@ struct Cleanup {
 
 impl Session {
     /// Read pinned local blobs without fetching, checking out, or requiring jj @
-    /// to match. The caller must check the current PR and jj @ before commenting.
+    /// to match. Before commenting, the caller must verify the current PR and
+    /// require jj @ to be its pinned head or an unchanged single-parent child.
     pub fn prepare(client: &Client, store: &Store, pr: &PullRequest) -> Result<Self> {
         let root = workspace_root(&client.root)?;
         let merge_base = client.merge_base(pr)?;
@@ -224,7 +225,8 @@ pub fn load_for_file(root: &Path, state_base: &Path, file: &Path) -> Result<Opti
 
 /// Load immutable context from either side, including removed snapshots after
 /// cleanup. Also suitable for non-comment commands; comment coordinates remain
-/// RHS-only. The caller must still check jj @ and the current PR revision.
+/// RHS-only. The caller must still check the current PR revision and require jj @
+/// to be its pinned head or an unchanged single-parent child.
 pub fn load_for_navigation(root: &Path, state_base: &Path, file: &Path) -> Result<Option<Session>> {
     load_for_snapshot(root, state_base, file, true)
 }
