@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use zed_pr_review::github::{Client, workspace_git_dir, workspace_root};
+use zed_pr_review::github::{Client, checkout_sha, workspace_git_dir, workspace_root};
 use zed_pr_review::message::{review_summary, review_template};
 use zed_pr_review::model::{Comment, PullRequest};
 use zed_pr_review::ready;
@@ -56,7 +56,7 @@ enum Action {
     Sb,
     /// Open a child PR in review mode; otherwise run jj sf.
     Sf,
-    /// Mark the exact PR head at jj @ ready and optionally request a reviewer.
+    /// Capture jj @, mark its exact PR head ready, and optionally request a reviewer.
     Ready {
         /// GitHub login or organization/team-slug; defaults to ZED_REVISION_READY_REVIEWER.
         #[arg(long)]
@@ -120,6 +120,8 @@ fn run(cli: Cli) -> Result<()> {
         );
         let reviewer = ready::requested_reviewer(reviewer.as_deref())?;
         let root = workspace_root(&directory)?;
+        let head_sha = checkout_sha(&root)?;
+        println!("Captured jj @: {head_sha}");
         let state = chosen_state(&cli, &root)?;
         let has_session =
             state == root.join("scratch/zed-pr-review") && state.join("active.json").exists();
@@ -127,10 +129,11 @@ fn run(cli: Cli) -> Result<()> {
             let git_dir = workspace_git_dir(&root)?;
             let state = prepare_directory(&root, &git_dir, &state, None)?;
             let selected = selected_session(&root, &state, false)?;
-            let (client, current) = discover_session(&cli, &root, selected.as_ref())?;
+            let (client, current) =
+                discover_session(&cli, &root, selected.as_ref(), Some(&head_sha))?;
             (client, current)
         } else {
-            Client::discover(&root, cli.pr.as_deref(), cli.repo.as_deref())?
+            Client::discover_at(&root, cli.pr.as_deref(), cli.repo.as_deref(), &head_sha)?
         };
         println!("{} — {}", pr.url, printable(&pr.title));
         return ready::run(&client, &pr, reviewer.as_deref());
@@ -196,7 +199,7 @@ fn run(cli: Cli) -> Result<()> {
         } else {
             selected_session(&root, &state_dir, false)?
         };
-        let (client, current) = discover_session(&cli, &root, review_session.as_ref())?;
+        let (client, current) = discover_session(&cli, &root, review_session.as_ref(), None)?;
         prepare_directory(&root, &git_dir, &state_dir, Some(&current.head_sha))?;
         let store = Store::open(&state_dir, &current)?;
         let draft = store.load()?.unwrap_or_else(|| Draft::new(current.clone()));
@@ -864,12 +867,16 @@ fn discover_session(
     cli: &Cli,
     root: &Path,
     session: Option<&Session>,
+    captured_head: Option<&str>,
 ) -> Result<(Client, PullRequest)> {
     let pr = cli
         .pr
         .as_deref()
         .or_else(|| session.map(|session| session.pr.url.as_str()));
-    let (client, current) = Client::discover(root, pr, cli.repo.as_deref())?;
+    let (client, current) = match captured_head {
+        Some(head) => Client::discover_at(root, pr, cli.repo.as_deref(), head)?,
+        None => Client::discover(root, pr, cli.repo.as_deref())?,
+    };
     if let Some(session) = session {
         ensure!(
             session.pr.same_revision(&current),
@@ -921,7 +928,7 @@ fn navigate(cli: &Cli, directory: &Path) -> Result<()> {
     let git_dir = workspace_git_dir(&root)?;
     let state = prepare_directory(&root, &git_dir, &state, None)?;
     let _workspace = Store::at(&state.join("workspace"))?;
-    let (client, current) = discover_session(cli, &root, Some(&selected))?;
+    let (client, current) = discover_session(cli, &root, Some(&selected), None)?;
     let stack = Stack::discover(&client, &current)?;
     client.ensure_checkout(&current)?;
     println!("PR stack — {}/{}\n", current.host, current.repo);

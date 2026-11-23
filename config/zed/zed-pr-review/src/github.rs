@@ -59,23 +59,51 @@ impl Client {
         pr: Option<&str>,
         repo: Option<&str>,
     ) -> Result<(Self, PullRequest)> {
+        let (client, pull) = Self::discover_revision(directory, pr, repo, None)?;
+        client.ensure_checkout(&pull)?;
+        Ok((client, pull))
+    }
+
+    /// Discover a PR for a previously captured jj `@`, even if the checkout moves.
+    /// The caller must capture `head_sha` before discovery; no live `@` check follows.
+    pub fn discover_at(
+        directory: &Path,
+        pr: Option<&str>,
+        repo: Option<&str>,
+        head_sha: &str,
+    ) -> Result<(Self, PullRequest)> {
+        Self::discover_revision(directory, pr, repo, Some(head_sha))
+    }
+
+    fn discover_revision(
+        directory: &Path,
+        pr: Option<&str>,
+        repo: Option<&str>,
+        captured_head: Option<&str>,
+    ) -> Result<(Self, PullRequest)> {
         let explicit_pr = pr.map(parse_pr_spec).transpose()?;
         let explicit_repo = repo.map(parse_repo_spec).transpose()?;
         // Reject conflicting explicit arguments before invoking any subprocess.
         let explicit_target = explicit_target(explicit_pr.as_ref(), explicit_repo.as_ref())?;
         let root = workspace_root(directory)?;
-        let head_sha = checkout_sha(&root)?;
+        let head_sha = match captured_head {
+            Some(sha) => {
+                validate_sha(sha)?;
+                sha.to_ascii_lowercase()
+            }
+            None => checkout_sha(&root)?,
+        };
         let bookmark = if explicit_pr.is_none() {
             Some(select_bookmark(&text(run(
                 jj_command(&root).args([
                     "bookmark",
                     "list",
                     "-r",
-                    "@",
+                    &head_sha,
                     "--template",
                     BOOKMARK_TEMPLATE,
                 ]),
-                "list local bookmarks at jj @",
+                "list local bookmarks at the captured jj @",
             )?)?)?)
         } else {
             None
@@ -113,7 +141,7 @@ impl Client {
         let pull = client.read_pr(number)?;
         ensure!(
             pull.head_sha == head_sha,
-            "PR head {} does not equal jj @ {}; check out the exact PR head and retry (ancestors are not considered)",
+            "PR head {} does not equal captured jj @ {}; check out the exact PR head and retry (ancestors are not considered)",
             pull.head_sha,
             head_sha
         );
@@ -125,7 +153,7 @@ impl Client {
             );
         }
         client.reviewer = pull.reviewer.clone();
-        client.ensure_checkout(&pull)?;
+        client.check_identity(&pull)?;
         Ok((client, pull))
     }
 
@@ -209,7 +237,7 @@ impl Client {
     }
 
     pub(crate) fn mark_ready(&self, state: &ReadyState) -> Result<()> {
-        self.ensure_checkout(&state.pr)?;
+        self.check_identity(&state.pr)?;
         let response = self.post_json("graphql", &json!({
             "query": "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { id isDraft } } }",
             "variables": {"id": state.node_id},
@@ -224,7 +252,7 @@ impl Client {
 
     pub(crate) fn request_reviewer(&self, pr: &PullRequest, reviewer: &str) -> Result<()> {
         let payload = reviewer_payload(&pr.repo, reviewer)?;
-        self.ensure_checkout(pr)?;
+        self.check_identity(pr)?;
         // REST adds requests without replacing concurrent requests by other users.
         let endpoint = format!("{}/requested_reviewers", self.pr_endpoint(pr.number)?);
         self.post_json(&endpoint, &payload)?;
@@ -1394,7 +1422,7 @@ impl Client {
         validate_repo(&self.repo)
     }
 
-    fn check_identity(&self, pr: &PullRequest) -> Result<()> {
+    pub(crate) fn check_identity(&self, pr: &PullRequest) -> Result<()> {
         self.validate_target()?;
         ensure!(pr.number > 0, "PR number must be positive");
         ensure!(
@@ -2019,7 +2047,8 @@ fn gh_command(directory: &Path, host: Option<&str>) -> Command {
     command
 }
 
-fn checkout_sha(root: &Path) -> Result<String> {
+/// Capture the recorded working-copy commit without snapshotting or importing refs.
+pub fn checkout_sha(root: &Path) -> Result<String> {
     let sha = text(run(
         jj_command(root).args(["log", "-r", "@", "--no-graph", "-T", "commit_id"]),
         "read the exact jj @ commit",

@@ -210,13 +210,18 @@ Rust `ready` command. Their other task settings are unchanged.
 ~/.config/zed/zed-pr-review/target/release/zed-pr-review --pr 123 --repo owner/repo ready
 ```
 
-The recorded **jj `@` must equal the current PR head**, including when `--pr` is
-explicit. Unlike the former script, this never searches ancestors for a bookmark.
-If you have moved to a new child revision, open the PR again or `jj edit` its
-head before running it. An existing session can supply the PR without its
-original bookmark. Otherwise, automatic discovery requires one unambiguous
-non-tool bookmark at `@`; explicit `--pr` can select the PR without a bookmark
-but cannot bypass the head check.
+The command first captures the recorded **jj `@`**, before contacting GitHub.
+That commit must equal the current PR head, including when `--pr` is explicit.
+Discovery uses the captured commit, and all later checks and writes use the same
+PR. You can move to another revision while `ready` runs; it will finish on the
+original PR without changing your new checkout.
+
+Unlike the former script, this never searches ancestors for a bookmark. If you
+have already moved to a new child revision before starting `ready`, open the PR
+again or `jj edit` its head first. An existing session can supply the PR without
+its original bookmark. Otherwise, automatic discovery requires one unambiguous
+non-tool bookmark at the captured commit; explicit `--pr` can select the PR
+without a bookmark but cannot bypass the initial head check.
 
 `ready` marks a draft PR ready; an already-ready PR does not need that mutation.
 An optional `--reviewer LOGIN` requests one user. Use `--reviewer org/team-slug`
@@ -226,25 +231,26 @@ value means no request. The flag takes precedence, and an explicitly blank flag
 is an error. Reviewer requests add to existing requests rather than replacing
 the reviewer list. Repeating `ready --reviewer ...` may notify the reviewer again.
 
-The command rechecks the PR head, base commit and branch, identity, authenticated
-account, and recorded jj `@` before and after each mutation. A change detected
-after marking ready stops the command before it requests a reviewer. A failed
+The command rechecks the remote PR head, base commit and branch, identity, and
+authenticated account before and after each mutation. It does not recheck the
+live jj `@`. A remote change detected after marking ready stops the command
+before it requests a reviewer. A failed
 request reports that the PR was already ready and that the request may have
 succeeded despite the error. No mutation is automatically retried or rolled back;
 check GitHub before trying again.
 
 GitHub's mark-ready API has no atomic expected-head condition. Another push can
 race with the final check; post-action checks report a detected change but cannot
-undo a notification. These checks compare the recorded revision, not unsaved Zed
-buffers or file edits that jj has not recorded. Keep the viewed files unchanged
-when using this shortcut.
+undo a notification. The initial capture uses the recorded revision, not unsaved
+Zed buffers or file edits that jj has not recorded. Those edits are not included
+in the PR by this command.
 
 `ready` never pushes, fetches, or snapshots the working copy. It does not open an
 editor or read, lock, create, or alter a private review draft, so an existing
 review or uncertain submission does not block it. Normally it creates no private
 state. It can read an existing local session association and validate that state;
 `--state-dir` or `ZED_PR_REVIEW_STATE_DIR` affects whether that association is
-used. The exact-head and before/after mutation checks still apply. `--editor`
+used. The initial exact-head and remote before/after mutation checks still apply. `--editor`
 has no effect; `--draft-dir` is rejected.
 
 ### Add a comment

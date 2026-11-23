@@ -18,11 +18,13 @@ Ready controls:
 - node_id defaults to PR_fixture17; omit_node_id removes the response field.
 - base_ref defaults to main, independently of the base SHA.
 - ready / request_reviewer: success (default), fail, or lost_response.
+- repo_view_changes / pr_list_changes: patches before responding to discovery.
 - pr_read_changes: patches keyed by the 1-based GET PR count, before responding.
 - ready_after / request_reviewer_after: patches after an accepted mutation,
   including lost_response. A fail does not apply the mutation or its patch.
 Patches update control fields; jj_new=True also moves the fixture checkout to a
-new child commit. pr_reads and requested_reviewers persist across invocations.
+new child commit and records its SHA as jj_new_head so tests can check it is left
+untouched. pr_reads and requested_reviewers persist across invocations.
 requested_reviewers contains logins or org/team strings; REST requests add to it
 without removing existing entries. Ready writes use only explicit-host gh api.
 """
@@ -86,6 +88,14 @@ def apply_changes(changes):
         )
         if result.returncode:
             unexpected("Cannot move fixture checkout: " + result.stderr)
+        head = subprocess.run(
+            ["jj", "--no-pager", "--ignore-working-copy", "log", "-r", "@",
+             "--no-graph", "-T", "commit_id"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if head.returncode:
+            unexpected("Cannot read moved fixture checkout: " + head.stderr)
+        control["jj_new_head"] = head.stdout.strip()
     control.update(changes)
 
 
@@ -147,6 +157,9 @@ def graphql_tokens(query):
 
 if args == ["repo", "view", "--json", "nameWithOwner,url"]:
     discovery_allowed()
+    if "repo_view_changes" in control:
+        apply_changes(control["repo_view_changes"])
+        save_control()
     emit({"nameWithOwner": repo, "url": f"https://{host}/{repo}"})
 
 if args[:2] == ["pr", "list"]:
@@ -158,6 +171,9 @@ if args[:2] == ["pr", "list"]:
     if args != expected:
         unexpected("Unexpected gh pr list arguments")
     discovery_allowed()
+    if "pr_list_changes" in control:
+        apply_changes(control["pr_list_changes"])
+        save_control()
     if control.get("pr_state", "open") != "open":
         emit([])
     emit([{

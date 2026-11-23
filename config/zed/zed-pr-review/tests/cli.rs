@@ -4826,6 +4826,141 @@ fn ready_accepts_explicit_pr_url_or_number_and_repo_without_a_bookmark() -> Resu
     Ok(())
 }
 
+fn ready_checkout_movement_cases() -> Vec<(&'static str, Value)> {
+    // Discovery, baseline, mark guard, mark verification, reviewer guard, and
+    // reviewer verification must all keep the original revision.
+    let mut cases: Vec<_> = (1..=6)
+        .map(|read| {
+            (
+                "pr_read_changes",
+                json!({(read.to_string()): {"jj_new": true}}),
+            )
+        })
+        .collect();
+    cases.extend([
+        ("ready_after", json!({"jj_new": true})),
+        ("request_reviewer_after", json!({"jj_new": true})),
+    ]);
+    cases
+}
+
+fn assert_ready_ignores_checkout_movement(fixture: &Fixture, args: &[&str]) -> Result<()> {
+    let state_before = guard_entries(&fixture.state)?;
+    let output = fixture.run_ready(args)?;
+    ensure!(output.status.success(), "{}", describe(&output));
+    fixture.assert_ready_mutations(&["ready", "request-reviewer"])?;
+    let mutations = fixture.ready_mutations()?;
+    assert_eq!(
+        mutations[0]["payload"]["variables"],
+        json!({"id": PR_NODE_ID})
+    );
+    assert_eq!(mutations[1]["payload"], json!({"reviewers": ["alice"]}));
+
+    let control = fixture.control()?;
+    assert_eq!(control["draft"], false);
+    assert_eq!(control["requested_reviewers"], json!(["alice"]));
+    assert_eq!(control["head"], fixture.head);
+    let moved = control["jj_new_head"]
+        .as_str()
+        .context("The checkout movement hook must run")?;
+    assert_ne!(moved, fixture.head);
+    assert_eq!(fixture.sha("@")?, moved, "Leave the new checkout untouched");
+    assert_eq!(fixture.sha("@-")?, fixture.head);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(PR_URL), "{}", describe(&output));
+    assert!(stdout.contains(&fixture.head), "{}", describe(&output));
+    assert!(!stdout.contains(moved), "{}", describe(&output));
+
+    let calls = fixture.calls()?;
+    let marked = calls
+        .iter()
+        .position(|call| call["mutation"] == "ready")
+        .unwrap();
+    let requested = calls
+        .iter()
+        .position(|call| call["mutation"] == "request-reviewer")
+        .unwrap();
+    assert_ready_checks(&calls[..marked], 3);
+    assert_ready_checks(&calls[marked + 1..requested], 2);
+    assert_ready_checks(&calls[requested + 1..], 1);
+    assert_eq!(guard_entries(&fixture.state)?, state_before);
+    assert!(fixture.posts()?.is_empty());
+    assert!(fixture.editors()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn ready_automatic_discovery_ignores_checkout_movement_at_every_pr_read_and_write() -> Result<()> {
+    for (hook, changes) in ready_checkout_movement_cases() {
+        let fixture = Fixture::new()?;
+        fixture.configure(hook, changes.clone())?;
+        assert_ready_ignores_checkout_movement(&fixture, &["--reviewer", "alice"])
+            .with_context(|| format!("Checkout movement at {hook}: {changes}"))?;
+        fixture.assert_stateless_ready()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn ready_explicit_pr_ignores_checkout_movement_at_every_pr_read_and_write() -> Result<()> {
+    for args in [
+        vec!["--pr", PR_URL, "--reviewer", "alice"],
+        vec![
+            "--pr",
+            "17",
+            "--repo",
+            "acme/widgets",
+            "--reviewer",
+            "alice",
+        ],
+    ] {
+        for (hook, changes) in ready_checkout_movement_cases() {
+            let fixture = Fixture::new()?;
+            fixture.jj(&["bookmark", "delete", "topic"])?;
+            fixture.configure(hook, changes.clone())?;
+            assert_ready_ignores_checkout_movement(&fixture, &args)
+                .with_context(|| format!("{args:?}, checkout movement at {hook}: {changes}"))?;
+            assert!(fixture.calls()?.iter().all(|call| call["args"][0] == "api"));
+            fixture.assert_stateless_ready()?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn ready_existing_session_without_a_bookmark_ignores_checkout_movement() -> Result<()> {
+    for (hook, changes) in ready_checkout_movement_cases() {
+        let fixture = Fixture::review()?;
+        fixture.jj(&["bookmark", "delete", "topic"])?;
+        // Session setup already read the PR; count only reads made by ready.
+        fixture.configure("pr_reads", json!(0))?;
+        fs::write(fixture.root.join("gh.jsonl"), "")?;
+        fixture.configure(hook, changes.clone())?;
+        assert_ready_ignores_checkout_movement(&fixture, &["--reviewer", "alice"])
+            .with_context(|| format!("Session checkout movement at {hook}: {changes}"))?;
+        assert!(fixture.calls()?.iter().all(|call| call["args"][0] == "api"));
+    }
+    Ok(())
+}
+
+#[test]
+fn ready_automatic_discovery_pins_the_revision_before_repo_view_and_pr_list() -> Result<()> {
+    for hook in ["repo_view_changes", "pr_list_changes"] {
+        let fixture = Fixture::new()?;
+        fixture.configure(hook, json!({"jj_new": true}))?;
+        assert_ready_ignores_checkout_movement(&fixture, &["--reviewer", "alice"])
+            .with_context(|| format!("Checkout movement at {hook}"))?;
+        let calls = fixture.calls()?;
+        assert_eq!(calls[0]["args"][0], "repo");
+        assert_eq!(calls[0]["args"][1], "view");
+        assert_eq!(calls[1]["args"][0], "pr");
+        assert_eq!(calls[1]["args"][1], "list");
+        assert_eq!(calls[2]["endpoint"], PR_ENDPOINT);
+        fixture.assert_stateless_ready()?;
+    }
+    Ok(())
+}
+
 #[test]
 fn ready_uses_the_explicit_reviewer_or_environment_and_accepts_org_teams() -> Result<()> {
     for (environment, explicit, expected) in [
@@ -4979,6 +5114,29 @@ fn ready_never_falls_back_to_an_ancestor_even_with_an_explicit_pr() -> Result<()
 }
 
 #[test]
+fn ready_existing_session_never_authorizes_an_initial_checkout_at_a_child() -> Result<()> {
+    let fixture = Fixture::review()?;
+    fixture.jj(&["bookmark", "delete", "topic"])?;
+    fixture.jj(&["new", "-m", "Unbookmarked child of the session head"])?;
+    let child = fixture.sha("@")?;
+    let state_before = guard_entries(&fixture.state)?;
+    let output = fixture.run_ready(&["--reviewer", "alice"])?;
+    failure(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("jj @"),
+        "{}",
+        describe(&output)
+    );
+    fixture.assert_ready_mutations(&[])?;
+    assert_eq!(fixture.sha("@")?, child);
+    assert_eq!(fixture.sha("@-")?, fixture.head);
+    assert_eq!(guard_entries(&fixture.state)?, state_before);
+    assert!(fixture.posts()?.is_empty());
+    assert!(fixture.editors()?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn ready_bypasses_a_locked_uncertain_review_draft_without_changing_it() -> Result<()> {
     let fixture = Fixture::review()?;
     fixture.fail_submission("lost_response")?;
@@ -5123,15 +5281,14 @@ fn ready_reviewer_failure_reports_partial_success_without_retrying() -> Result<(
 }
 
 #[test]
-fn ready_rechecks_pr_account_and_checkout_before_marking() -> Result<()> {
-    for field in ["head", "base", "reviewer", "pr_state", "jj_new"] {
+fn ready_rechecks_pr_and_account_before_marking() -> Result<()> {
+    for field in ["head", "base", "reviewer", "pr_state"] {
         let fixture = Fixture::new()?;
         let changed = match field {
             "head" => json!(fixture.base),
             "base" => json!(fixture.head),
             "reviewer" => json!("different-account"),
             "pr_state" => json!("closed"),
-            "jj_new" => json!(true),
             _ => unreachable!(),
         };
         // GET #1 belongs to discover; GET #2 is the first ready-specific read.
@@ -5139,9 +5296,6 @@ fn ready_rechecks_pr_account_and_checkout_before_marking() -> Result<()> {
         failure(&fixture.run_ready(&["--pr", PR_URL, "--reviewer", "alice"])?);
         assert!(fixture.control()?["pr_reads"].as_u64().unwrap() >= 2);
         fixture.assert_ready_mutations(&[])?;
-        if field == "jj_new" {
-            assert_ne!(fixture.sha("@")?, fixture.head);
-        }
         fixture.assert_stateless_ready()?;
     }
     Ok(())
@@ -5150,7 +5304,7 @@ fn ready_rechecks_pr_account_and_checkout_before_marking() -> Result<()> {
 #[test]
 fn ready_detects_changes_after_marking_and_stops_before_requesting_a_reviewer() -> Result<()> {
     for field in [
-        "head", "base", "base_ref", "node_id", "reviewer", "pr_state", "draft", "jj_new",
+        "head", "base", "base_ref", "node_id", "reviewer", "pr_state", "draft",
     ] {
         let fixture = Fixture::new()?;
         let changed = match field {
@@ -5160,7 +5314,7 @@ fn ready_detects_changes_after_marking_and_stops_before_requesting_a_reviewer() 
             "pr_state" => json!("closed"),
             "base_ref" => json!("release"),
             "node_id" => json!("PR_replaced17"),
-            "draft" | "jj_new" => json!(true),
+            "draft" => json!(true),
             _ => unreachable!(),
         };
         fixture.configure("ready_after", json!({(field): changed}))?;
@@ -5178,9 +5332,6 @@ fn ready_detects_changes_after_marking_and_stops_before_requesting_a_reviewer() 
             assert_ready_checks(&calls[marked + 1..], 1);
         }
         assert!(fixture.control()?.get("requested_reviewers").is_none());
-        if field == "jj_new" {
-            assert_ne!(fixture.sha("@")?, fixture.head);
-        }
         fixture.assert_stateless_ready()?;
     }
     Ok(())
@@ -5188,27 +5339,14 @@ fn ready_detects_changes_after_marking_and_stops_before_requesting_a_reviewer() 
 
 #[test]
 fn ready_rechecks_after_requesting_a_reviewer_even_if_the_response_is_lost() -> Result<()> {
-    for (mode, field) in [
-        ("success", "head"),
-        ("lost_response", "head"),
-        ("success", "jj_new"),
-    ] {
+    for mode in ["success", "lost_response"] {
         let fixture = Fixture::new()?;
         fixture.configure("request_reviewer", json!(mode))?;
-        let changed = if field == "head" {
-            json!(fixture.base)
-        } else {
-            json!(true)
-        };
-        fixture.configure("request_reviewer_after", json!({(field): changed}))?;
+        fixture.configure("request_reviewer_after", json!({"head": fixture.base}))?;
         let output = fixture.run_ready(&["--reviewer", "alice"])?;
         failure(&output);
         let error = String::from_utf8_lossy(&output.stderr).to_lowercase();
-        assert!(
-            error.contains(if field == "head" { "head" } else { "jj @" }),
-            "{}",
-            describe(&output)
-        );
+        assert!(error.contains("head"), "{}", describe(&output));
         fixture.assert_ready_mutations(&["ready", "request-reviewer"])?;
         assert_eq!(fixture.control()?["draft"], false);
         assert_eq!(fixture.control()?["requested_reviewers"], json!(["alice"]));

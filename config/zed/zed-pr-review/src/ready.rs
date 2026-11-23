@@ -18,6 +18,7 @@ pub fn requested_reviewer(override_reviewer: Option<&str>) -> Result<Option<Stri
     Ok(Some(reviewer.to_owned()))
 }
 
+/// Operate on the PR discovered for the initial jj `@`, not the live checkout.
 /// Readiness is independent of private review drafts, including uncertain submissions.
 pub fn run(client: &Client, pr: &PullRequest, reviewer: Option<&str>) -> Result<()> {
     if let Some(reviewer) = reviewer {
@@ -28,8 +29,8 @@ pub fn run(client: &Client, pr: &PullRequest, reviewer: Option<&str>) -> Result<
         pr.same_revision(&pinned.pr),
         "The PR head, base, or identity changed since discovery"
     );
-    client.ensure_checkout(pr)?;
-    println!("PR head at jj @: {}", pr.head_sha);
+    client.check_identity(pr)?;
+    println!("PR head at captured jj @: {}", pr.head_sha);
     if checked_state(client, &pinned)? {
         let outcome = client.mark_ready(&pinned);
         // Recheck even after a failed command: the server may have accepted it.
@@ -71,7 +72,7 @@ fn checked_state(client: &Client, pinned: &ReadyState) -> Result<bool> {
             && pinned.node_id == current.node_id,
         "The PR head, base branch, or identity changed. Check out the exact PR head and retry"
     );
-    client.ensure_checkout(&pinned.pr)?;
+    client.check_identity(&pinned.pr)?;
     Ok(current.draft)
 }
 
