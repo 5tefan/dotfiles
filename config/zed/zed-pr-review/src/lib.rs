@@ -1,4 +1,6 @@
 pub mod github;
+pub mod log_data;
+pub mod log_view;
 pub mod message;
 pub mod model;
 pub mod ready;

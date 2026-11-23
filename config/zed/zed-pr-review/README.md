@@ -11,8 +11,10 @@ and can request a reviewer. This uses Zed tasks, not a GUI extension.
 ## Setup
 
 Install Rust **1.89 or newer** with Cargo, `jj`, `git`, `gh`, and the `zed` CLI.
-These commands must be on the PATH available to Zed tasks. Authenticate `gh` as
-the reviewer, using the appropriate `--hostname` for GitHub Enterprise:
+Use **jj 0.47.1 (tested)**; the live log needs a recent jj with JSON template
+metadata support. Viddy is not required. These commands must be on the PATH
+available to Zed tasks. Authenticate `gh` as the reviewer, using the appropriate
+`--hostname` for GitHub Enterprise:
 
 ```sh
 gh auth login
@@ -28,7 +30,8 @@ cargo build --locked --release --manifest-path ~/.config/zed/zed-pr-review/Cargo
 
 The tasks in `../tasks.json` run
 `~/.config/zed/zed-pr-review/target/release/zed-pr-review`. Rebuild after changing
-the Rust source; the tasks do not build automatically.
+the Rust source, including when upgrading to the live log viewer; the tasks do
+not build automatically.
 
 Open the jj workspace in Zed, press **Ctrl-Shift-G**, and enter a PR number or
 URL. You do not need to fetch or track its original branch first. `open` fetches
@@ -194,8 +197,8 @@ The three shortcuts decide their mode from Zed's task context:
   checkout must still match the pinned PR revision. An old or altered tab fails closed;
   it never falls back to jj navigation or binds itself to a newer session.
 - **Ordinary source file:** normal jj mode, even if a review session exists.
-  J and K run the configured `jj sb` and `jj sf` aliases. L retains
-  `viddy --unfold -n 1 jj l --color always`.
+  J and K run the configured `jj sb` and `jj sf` aliases. L opens the Rust live
+  log viewer described below, not viddy.
 - **No file, such as a terminal:** use the active review only while `@` equals
   its pinned head or qualifies as its empty child. Otherwise, use normal jj mode. A corrupt active pointer is
   an error, not permission to change revisions.
@@ -205,8 +208,60 @@ Navigation from either diff side does not enable deleted-side comments:
 before running, as the previous jj tasks did. They share the workspace lock
 with comment input and review submission. For direct CLI use, save buffers
 first. Run `stack` for a one-time local jj log; `stack --watch` enables the
-normal live log. `--pr` cannot force a source buffer into review mode; use
-`open` first.
+normal live log only when **both stdin and stdout are terminals**. If either is
+redirected or piped, it runs the existing `jj l` once instead. In review mode,
+`stack --watch` still reads the PR stack once; review routing is unchanged.
+`--pr` cannot force a source buffer into review mode; use `open` first.
+
+### Use the live jj log
+
+In normal jj mode, **Ctrl-Shift-L** runs `stack --watch` in a Rust terminal UI.
+It refreshes once per second using the configured `jj l` graph and colors, with
+metadata added through template aliases for this invocation only. It does not
+change your jj configuration or contact GitHub. There is no fallback to viddy
+and no use of system URL handlers for clicks.
+
+| Input                       | Action                               |
+| --------------------------- | ------------------------------------ |
+| Click a mutable change ID   | Run `jj edit` for that revision.     |
+| Wheel, `j` / `k`, Up / Down | Scroll vertically.                   |
+| `h` / `l`, Left / Right     | Scroll horizontally.                 |
+| PageUp / PageDown           | Scroll by a page.                    |
+| Ctrl-U / Ctrl-D             | Scroll by half a page.               |
+| Home / End, `g` / `G`       | Go to the top / bottom.              |
+| Tab / Shift-Tab             | Select the next / previous revision. |
+| Enter                       | Edit the selected revision.          |
+| `@`                         | Reveal the working-copy revision.    |
+| `r`                         | Refresh now.                         |
+| `q`, Esc, Ctrl-C            | Exit.                                |
+
+A mouse click requires a press and release on the same ID without dragging.
+Immutable and divergent revisions appear inactive and cannot be edited. Before
+an edit, the CLI rechecks the target and refuses stale or divergent revisions.
+It respects jj's immutable rules and never passes `--ignore-immutable`. Edits
+use normal jj snapshotting and take the workspace lock if review state already
+exists. They do not create a review session. The lock does not exclude unrelated
+jj commands or file edits; avoid concurrent workspace changes. An edit can
+snapshot local work even if a later check rejects the target.
+
+Refreshes keep the same revision at the top when possible, rather than just the
+same row number. The viewer reveals `@` initially and when its change identity
+moves, not on ordinary refreshes or content-only snapshots of that change.
+Press `@` to return after scrolling away. Resizing preserves your position when
+possible.
+
+**Saving and polling:** the `jj l` task uses `save: all` on startup, not on each
+click. Zed's `autosave: on_focus_change` still matters when moving from an editor
+to the running viewer; the CLI cannot save all buffers on every edit. Save
+buffers yourself before using the CLI directly. Polls use
+`--ignore-working-copy --at-operation=@`: they neither snapshot files nor merge
+concurrent operations. Unsaved buffers and file changes that jj has not yet
+snapshotted do not appear in the log. Even `r` only rereads recorded state;
+another normal jj command must record those changes.
+
+**Limits:** custom templates that bypass the formatter aliases can still print
+IDs, but those IDs have no clickable metadata and cannot be selected for edits.
+The viewer has no viddy history, search, or diff view.
 
 ### Mark a PR ready
 
@@ -421,24 +476,24 @@ Run the binary directly for actions without tasks or for explicit PR selection:
 The PR number and repository above are examples. `comment` normally runs through
 Zed because it requires the selection variables from the task environment.
 
-| Subcommand        | Behavior                                                                                |
-| ----------------- | --------------------------------------------------------------------------------------- |
-| `open`            | Fetch, track when safe, preserve local work, check out the PR, and open a session.      |
-| `stack`           | Show the GitHub stack in review context; otherwise run `jj l` once.                     |
-| `stack --watch`   | Same as `stack`, but use viddy for the normal jj log, never for GitHub polling.         |
-| `sb` / `sf`       | Open the parent/child PR in review context; otherwise run the corresponding jj alias.   |
-| `ready`           | Mark the selected PR ready from its head or empty child; optionally use `--reviewer`.   |
-| `comment`         | Read a multiline body from stdin until EOF; save a local inline comment.                |
-| `approve`         | Edit a nonblank summary; send one approval with all saved comments.                     |
-| `request-changes` | Edit a nonblank summary; send one request for changes with all saved comments.          |
-| `list`            | Print one-based comment indices, pinned revision, status, and draft directory.          |
-| `edit INDEX`      | Edit a saved comment body; a blank edit preserves the original.                         |
-| `remove INDEX`    | Remove a saved comment locally.                                                         |
-| `discard`         | Ask for `yes`, archive the draft, and clear it locally.                                 |
-| `discard --yes`   | Archive and clear without prompting; never delete a GitHub review.                      |
-| `recover`         | Reconcile an uncertain submission or retry snapshot cleanup; never send another review. |
-| `recover --retry` | If safe to proceed, ask for `yes` to permit a later attempt; do not post.               |
-| `diff`            | Build a frozen full-PR session for the checked-out PR, without fetching or switching.   |
+| Subcommand        | Behavior                                                                                                 |
+| ----------------- | -------------------------------------------------------------------------------------------------------- |
+| `open`            | Fetch, track when safe, preserve local work, check out the PR, and open a session.                       |
+| `stack`           | Show the GitHub stack in review context; otherwise run `jj l` once.                                      |
+| `stack --watch`   | Live local Rust log when stdin/stdout are terminals; otherwise `jj l` once. Review stack stays one-shot. |
+| `sb` / `sf`       | Open the parent/child PR in review context; otherwise run the corresponding jj alias.                    |
+| `ready`           | Mark the selected PR ready from its head or empty child; optionally use `--reviewer`.                    |
+| `comment`         | Read a multiline body from stdin until EOF; save a local inline comment.                                 |
+| `approve`         | Edit a nonblank summary; send one approval with all saved comments.                                      |
+| `request-changes` | Edit a nonblank summary; send one request for changes with all saved comments.                           |
+| `list`            | Print one-based comment indices, pinned revision, status, and draft directory.                           |
+| `edit INDEX`      | Edit a saved comment body; a blank edit preserves the original.                                          |
+| `remove INDEX`    | Remove a saved comment locally.                                                                          |
+| `discard`         | Ask for `yes`, archive the draft, and clear it locally.                                                  |
+| `discard --yes`   | Archive and clear without prompting; never delete a GitHub review.                                       |
+| `recover`         | Reconcile an uncertain submission or retry snapshot cleanup; never send another review.                  |
+| `recover --retry` | If safe to proceed, ask for `yes` to permit a later attempt; do not post.                                |
+| `diff`            | Build a frozen full-PR session for the checked-out PR, without fetching or switching.                    |
 
 Indices are one-based and refer to the current `list` output. All of these flags
 are global:
@@ -561,8 +616,11 @@ another submission. **Do not retry just because `gh` failed.**
 ## Tests and validation limits
 
 The Rust tests run offline. Integration tests use real local jj/Git objects, a
-fake `gh`, and a non-GUI editor. Stack tests cover pagination, exact branch
-relationships, ambiguity, and changes during navigation. Local transport tests
+fake `gh`, and a non-GUI editor. Navigation tests redirect stdin and stdout and
+require `stack --watch` to run `jj l` once in local mode, with no viddy or GitHub
+calls. Review regression tests keep the one-shot PR stack and checkout guards.
+Stack tests cover pagination, exact branch relationships, ambiguity, and changes
+during navigation. Local transport tests
 cover fetching, tracking, pending-ref refusals, complete parent/child navigation,
 and preserved drafts. Immutable-head tests cover empty-child checkouts, review
 commands, navigation, and protection of ignored files. Cleanup tests cover both review decisions, recovery,
@@ -575,6 +633,15 @@ Zed GUI or mutate live GitHub reviews. Run them with:
 cargo test --locked --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml -- --test-threads=4
 cargo clippy --locked --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml --all-targets -- -D warnings
 ```
+
+For just the navigation regressions:
+
+```sh
+cargo test --locked --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml --test cli navigation_ -- --test-threads=4
+```
+
+These redirected CLI tests do not exercise an interactive terminal. Check mouse
+press/release, scrolling, resize behavior, and saving buffers in Zed separately.
 
 The selection contract was checked against the Zed 1.29.3 source, with the same
 relevant code in 1.29.2. This is a version-specific constraint, not a guarantee

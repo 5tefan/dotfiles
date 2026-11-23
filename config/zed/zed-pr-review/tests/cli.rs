@@ -798,8 +798,8 @@ args = sys.argv[1:]
 with (root / 'navigation.jsonl').open('a') as stream:
     stream.write(json.dumps({{'program': program, 'args': args, 'cwd': os.getcwd()}}) + '\n')
 if program == 'viddy':
-    assert args == ['--unfold', '-n', '1', 'jj', 'l', '--color', 'always'], args
-    sys.exit(0)
+    print('Navigation must never invoke viddy', file=sys.stderr)
+    sys.exit(97)
 if 'fetch' in args:
     print('Navigation fixture refused network transport', file=sys.stderr)
     sys.exit(96)
@@ -851,6 +851,39 @@ fn navigation_clear_calls(fixture: &Fixture) -> Result<()> {
     for name in ["navigation.jsonl", "gh.jsonl"] {
         fs::write(fixture.root.join(name), "")?;
     }
+    Ok(())
+}
+
+fn navigation_assert_local_alias(fixture: &Fixture, alias: &str) -> Result<()> {
+    let calls = navigation_calls(fixture)?;
+    assert!(
+        calls.iter().all(|call| call["program"] != "viddy"),
+        "Navigation must never invoke viddy: {calls:?}"
+    );
+    let aliases: Vec<_> = calls
+        .iter()
+        .filter(|call| {
+            call["program"] == "jj"
+                && call["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|arg| arg == "l" || arg == "sb" || arg == "sf")
+        })
+        .collect();
+    assert_eq!(aliases.len(), 1, "Expected one local alias call: {calls:?}");
+    assert!(
+        aliases[0]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == alias)
+    );
+    assert_eq!(aliases[0]["cwd"], json!(fixture.repo));
+    assert!(
+        fixture.calls()?.is_empty(),
+        "Local navigation must not invoke gh"
+    );
     Ok(())
 }
 
@@ -1536,7 +1569,8 @@ fn failure(output: &Output) {
 }
 
 #[test]
-fn navigation_local_without_session_uses_jj_aliases_and_only_watch_runs_viddy() -> Result<()> {
+fn navigation_local_without_session_uses_jj_aliases_and_watch_is_one_shot_without_a_tty()
+-> Result<()> {
     let fixture = navigation_fixture()?;
     fixture.configure("deny_discovery", json!(true))?;
     for file in [
@@ -1544,56 +1578,26 @@ fn navigation_local_without_session_uses_jj_aliases_and_only_watch_runs_viddy() 
         Some(Path::new("")),
         Some(fixture.repo.join(FILE).as_path()),
     ] {
-        navigation_clear_calls(&fixture)?;
-        let output = fixture.execute(navigation_command(&fixture, &["stack"], file), "")?;
-        success(&output);
-        assert!(String::from_utf8_lossy(&output.stdout).contains("Navigation PR head"));
-        let calls = navigation_calls(&fixture)?;
-        assert!(calls.iter().any(|call| {
-            call["program"] == "jj"
-                && call["args"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|arg| arg == "l")
-        }));
-        assert!(calls.iter().all(|call| call["program"] != "viddy"));
-        success(&fixture.execute(
-            navigation_command(&fixture, &["stack", "--watch"], file),
-            "",
-        )?);
-        let watchers: Vec<_> = navigation_calls(&fixture)?
-            .into_iter()
-            .filter(|call| call["program"] == "viddy")
-            .collect();
-        assert_eq!(watchers.len(), 1);
-        assert_eq!(
-            watchers[0]["args"],
-            json!(["--unfold", "-n", "1", "jj", "l", "--color", "always"])
-        );
-        assert_eq!(watchers[0]["cwd"], json!(fixture.repo));
-        success(&fixture.execute(navigation_command(&fixture, &["sb"], file), "")?);
-        assert_eq!(fixture.sha("@")?, fixture.base);
-        success(&fixture.execute(navigation_command(&fixture, &["sf"], file), "")?);
-        assert_eq!(fixture.sha("@")?, fixture.head);
-        for action in ["sb", "sf"] {
-            assert!(navigation_calls(&fixture)?.iter().any(|call| {
-                call["program"] == "jj"
-                    && call["args"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|arg| arg == action)
-            }));
+        for (args, alias, expected) in [
+            (&["stack"][..], "l", &fixture.head),
+            (&["stack", "--watch"][..], "l", &fixture.head),
+            (&["sb"][..], "sb", &fixture.base),
+            (&["sf"][..], "sf", &fixture.head),
+        ] {
+            navigation_clear_calls(&fixture)?;
+            // The fixture redirects stdin and stdout, so --watch must not open a TUI.
+            let output = fixture.execute(navigation_command(&fixture, args, file), "")?;
+            success(&output);
+            if alias == "l" {
+                assert!(String::from_utf8_lossy(&output.stdout).contains("Navigation PR head"));
+            }
+            navigation_assert_local_alias(&fixture, alias)?;
+            assert_eq!(&fixture.sha("@")?, expected);
+            assert!(
+                !fixture.state.exists(),
+                "Normal navigation must not create review state"
+            );
         }
-        assert!(
-            fixture.calls()?.is_empty(),
-            "Normal navigation must not invoke gh"
-        );
-        assert!(
-            !fixture.state.exists(),
-            "Normal navigation must not create review state"
-        );
     }
     Ok(())
 }
@@ -1608,9 +1612,11 @@ fn navigation_source_context_ignores_active_review_even_if_its_pointer_is_invali
             fs::write(fixture.state.join("active.json"), "not valid JSON\n")?;
         }
         let active = fs::read(fixture.state.join("active.json"))?;
-        navigation_clear_calls(&fixture)?;
         for args in [&["stack"][..], &["stack", "--watch"], &["sb"], &["sf"]] {
+            navigation_clear_calls(&fixture)?;
             success(&fixture.run_default(args, "")?);
+            let alias = if args[0] == "stack" { "l" } else { args[0] };
+            navigation_assert_local_alias(&fixture, alias)?;
         }
         assert_eq!(fixture.sha("@")?, fixture.head);
         assert!(fixture.calls()?.is_empty());
@@ -1707,6 +1713,8 @@ fn navigation_missing_or_empty_context_away_from_active_head_stays_local() -> Re
             fixture.jj(&["edit", &away])?;
             navigation_clear_calls(&fixture)?;
             success(&fixture.execute(navigation_command(&fixture, args, file), "")?);
+            let alias = if args[0] == "stack" { "l" } else { args[0] };
+            navigation_assert_local_alias(&fixture, alias)?;
             assert_eq!(&fixture.sha("@")?, expected);
             assert!(fixture.calls()?.is_empty());
             assert_eq!(fs::read(fixture.state.join("active.json"))?, active);

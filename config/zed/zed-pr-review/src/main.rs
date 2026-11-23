@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use zed_pr_review::github::{Client, checkout_sha, workspace_git_dir, workspace_root};
@@ -48,7 +48,7 @@ enum Action {
     Open,
     /// Show the GitHub stack in a review diff; otherwise run jj l.
     Stack {
-        /// Keep the normal jj log live with viddy; PR stacks are always one-shot reads.
+        /// Open the clickable live jj log; PR stacks and non-terminal output are one-shot reads.
         #[arg(long)]
         watch: bool,
     },
@@ -992,6 +992,12 @@ fn navigate(cli: &Cli, directory: &Path) -> Result<()> {
 }
 
 fn navigate_local(root: &Path, action: &Action) -> Result<()> {
+    if matches!(action, Action::Stack { watch: true })
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+    {
+        return zed_pr_review::log_view::run(root);
+    }
     let _workspace = if matches!(action, Action::Sb | Action::Sf)
         && root
             .join("scratch/zed-pr-review")
@@ -1005,11 +1011,7 @@ fn navigate_local(root: &Path, action: &Action) -> Result<()> {
         None
     };
     let (program, args): (&str, &[&str]) = match action {
-        Action::Stack { watch: true } => (
-            "viddy",
-            &["--unfold", "-n", "1", "jj", "l", "--color", "always"],
-        ),
-        Action::Stack { watch: false } => ("jj", &["l", "--color", "always"]),
+        Action::Stack { .. } => ("jj", &["l", "--color", "always"]),
         Action::Sb => ("jj", &["sb"]),
         Action::Sf => ("jj", &["sf"]),
         _ => unreachable!("only stack shortcuts use local navigation"),
