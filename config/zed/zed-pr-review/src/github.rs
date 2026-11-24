@@ -404,10 +404,7 @@ impl Client {
             .context("Invalid transport token")?;
         let head_ref = format!("refs/heads/zed-pr-review/{namespace}/head");
         let fetched_base = format!("refs/heads/zed-pr-review/{namespace}/base");
-        let mut imported_refs = vec![
-            (head_ref.clone(), pr.head_sha.clone()),
-            (fetched_base.clone(), pr.base_sha.clone()),
-        ];
+
         let existing = run(
             self.git_command().args([
                 "for-each-ref",
@@ -452,17 +449,47 @@ impl Client {
             &mut fetch,
             "fetch the pinned PR and base history (check gh authentication)",
         )?;
-        for (reference, expected) in [(&head_ref, &pr.head_sha), (&fetched_base, &pr.base_sha)] {
-            let actual = text(run(
-                self.git_command()
-                    .args(["rev-parse", "--verify", reference]),
-                "verify the fetched PR ref",
-            )?)?;
+        let actual_head = self
+            .git_ref_target(&head_ref)?
+            .context("Fetched PR head ref is missing")?;
+        ensure!(
+            actual_head.eq_ignore_ascii_case(&pr.head_sha),
+            "PR #{} head moved during fetch: expected {}, fetched {}. Resolve the PR again before opening it",
+            pr.number,
+            pr.head_sha,
+            actual_head
+        );
+        let actual_base = self
+            .git_ref_target(&fetched_base)?
+            .context("Fetched PR base ref is missing")?;
+        if !actual_base.eq_ignore_ascii_case(&pr.base_sha) {
+            // GitHub's PR base SHA can lag behind the branch tip. Fetching the
+            // branch supplies its history; it must not change our pinned diff.
+            let ancestor = self
+                .git_command()
+                .args(["merge-base", "--is-ancestor", &pr.base_sha, &actual_base])
+                .output()
+                .context("Cannot check the fetched base history")?;
             ensure!(
-                actual.trim().eq_ignore_ascii_case(expected),
-                "PR head or base moved during fetch; resolve the PR again before opening it"
+                ancestor.status.code() != Some(1),
+                "Fetched base branch {base_ref} at {actual_base} does not contain pinned PR base {}. The branch was rewound or diverged; resolve the PR again before opening it",
+                pr.base_sha
             );
+            successful_output(
+                ancestor,
+                "check that the fetched base contains the pinned commit",
+            )
+            .with_context(|| {
+                format!(
+                    "Cannot verify pinned PR base {} against fetched {base_ref} at {actual_base}",
+                    pr.base_sha
+                )
+            })?;
         }
+        let mut imported_refs = vec![
+            (head_ref.clone(), pr.head_sha.clone()),
+            (fetched_base.clone(), actual_base),
+        ];
         if let Some(source) = &source {
             let actual_url = text(run(
                 self.fetch_command_for(&pr.head_repo)
@@ -891,10 +918,10 @@ impl Client {
         Ok(())
     }
 
-    /// Snapshot current work and pin it with a unique bookmark. Edit a mutable PR
-    /// head, or create an empty child of an immutable head without overriding it.
-    /// Returns the preserved commit ID. Never forces a conflicted checkout.
-    /// A failure after preservation leaves the bookmark available for manual recovery.
+    /// Snapshot current work, then edit a mutable PR head or create an empty
+    /// child of an immutable head without overriding it. Creates no bookmarks.
+    /// Returns the previous commit ID for recovery, including an empty commit
+    /// that jj may hide when switching away. Never forces a conflicted checkout.
     /// Sparse workspaces, submodules, and non-UTF-8 paths are conservatively refused.
     /// The caller must serialize review operations; do not run other jj commands while switching.
     pub fn checkout_pr(&self, pr: &PullRequest) -> Result<String> {
@@ -923,19 +950,10 @@ impl Client {
             "Current jj @ has conflicts; resolve them before opening a PR"
         );
         self.check_checkout_target(pr)?;
-        self.check_obstructions(&self.checkout_commit()?, &pr.head_sha)?;
-        let token = transport_token(&self.git_dir)?;
-        let bookmark = format!(
-            "zed-pr-review/previous-{}",
-            token.path().file_name().unwrap().to_string_lossy()
-        );
-        run(
-            jj_workspace_command(&self.root).args(["bookmark", "create", &bookmark, "-r", "@"]),
-            "preserve current jj work with a unique bookmark",
-        )?;
+        let previous = self.checkout_commit()?;
+        self.check_obstructions(&previous, &pr.head_sha)?;
         let result = (|| {
             ensure!(!self.commit_state("@")?.0, "Current jj @ has conflicts");
-            let previous = self.checkout_commit()?;
             self.check_obstructions(&previous, &pr.head_sha)?;
             self.check_ignore_changes(&previous, &pr.head_sha)?;
             let immutable = self.check_checkout_target(pr)?;
@@ -966,23 +984,11 @@ impl Client {
                 "verify the checked-out working copy",
             )?;
             self.ensure_checkout(pr)?;
-            let previous = text(run(
-                jj_command(&self.root).args([
-                    "log",
-                    "-r",
-                    &bookmark,
-                    "--no-graph",
-                    "-T",
-                    "commit_id",
-                ]),
-                "read the preserved previous commit",
-            )?)?;
-            validate_sha(previous.trim())?;
-            Ok(previous.trim().to_ascii_lowercase())
+            Ok(previous.clone())
         })();
         result.with_context(|| {
             format!(
-                "Previous work is preserved at jj bookmark {bookmark}; no rollback was attempted"
+                "Previous work was snapshotted as {previous}. Return with: jj edit {previous} (or jj new {previous} if immutable); no rollback was attempted"
             )
         })
     }

@@ -290,7 +290,7 @@ if method == "POST":
     review_id = 501
     review = {
         "id": review_id, "html_url": url + f"#pullrequestreview-{review_id}",
-        "state": {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED"}[payload["event"]],
+        "state": {"COMMENT": "COMMENTED", "APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED"}[payload["event"]],
         "body": payload["body"], "commit_id": payload["commit_id"],
         "user": {"login": reviewer}, "submitted_at": "2026-01-01T00:00:00Z",
     }

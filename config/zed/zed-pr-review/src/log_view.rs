@@ -4,7 +4,7 @@
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -263,24 +263,41 @@ fn worker(root: &Path) -> Result<(mpsc::Sender<Job>, mpsc::Receiver<Reply>)> {
     Ok((requests, replies))
 }
 
-struct Screen {
-    stopped: Arc<AtomicBool>,
+pub(crate) struct Screen {
+    pub(crate) stopped: Arc<AtomicBool>,
     signals: Vec<signal_hook::SigId>,
+    default_signals: Arc<AtomicBool>,
 }
 
 impl Screen {
-    fn enter() -> Result<Self> {
-        enable_raw_mode()?;
+    pub(crate) fn enter() -> Result<Self> {
+        // Unregistering callbacks does not restore default signal handling. Keep
+        // these callbacks for the process lifetime, enabled outside a Screen.
+        // Install them while enabled so partial setup cannot swallow signals.
+        static DEFAULT_SIGNALS: OnceLock<io::Result<Arc<AtomicBool>>> = OnceLock::new();
+        let default_signals = match DEFAULT_SIGNALS.get_or_init(|| {
+            let enabled = Arc::new(AtomicBool::new(true));
+            for signal in [SIGINT, SIGTERM, SIGHUP] {
+                signal_hook::flag::register_conditional_default(signal, enabled.clone())?;
+            }
+            Ok(enabled)
+        }) {
+            Ok(enabled) => enabled.clone(),
+            Err(error) => bail!("Cannot install default signal handlers: {error}"),
+        };
         let mut screen = Self {
             stopped: Arc::new(AtomicBool::new(false)),
             signals: Vec::new(),
+            default_signals,
         };
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         for signal in [SIGINT, SIGTERM, SIGHUP] {
             screen
                 .signals
                 .push(signal_hook::flag::register(signal, screen.stopped.clone())?);
         }
+        screen.default_signals.store(false, Ordering::SeqCst);
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(screen)
     }
 }
@@ -294,13 +311,14 @@ impl Drop for Screen {
             Show
         );
         let _ = disable_raw_mode();
+        self.default_signals.store(true, Ordering::SeqCst);
         for signal in self.signals.drain(..) {
             signal_hook::low_level::unregister(signal);
         }
     }
 }
 
-fn plain_status(value: &str) -> String {
+pub(crate) fn plain_status(value: &str) -> String {
     value
         .chars()
         .take(500)

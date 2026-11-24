@@ -271,6 +271,34 @@ os.execv(real_git, [real_git] + args)
         ])
     }
 
+    fn previous_bookmarks(&self) -> Result<BTreeMap<String, String>> {
+        let listing = self.jj(&["--ignore-working-copy", "bookmark", "list", "-T",
+            r#"if(name.starts_with("zed-pr-review/previous-"), name ++ "\t" ++ normal_target.commit_id() ++ "\n")"#])?;
+        listing
+            .lines()
+            .map(|line| {
+                let (name, sha) = line
+                    .split_once('\t')
+                    .context("Malformed previous bookmark")?;
+                Ok((name.to_owned(), sha.to_owned()))
+            })
+            .collect()
+    }
+
+    fn checkout_previous(&self, session: &Path) -> Result<String> {
+        let receipt = read_json(&session.parent().unwrap().join("last-checkout.json"))?;
+        let previous = receipt["previous_commit"]
+            .as_str()
+            .context("Missing previous commit in checkout receipt")?;
+        assert_eq!(
+            previous.len(),
+            40,
+            "Receipt must retain the full commit SHA"
+        );
+        assert_eq!(self.sha(previous)?, previous);
+        Ok(previous.to_owned())
+    }
+
     fn set_immutable_heads(&self, heads: &[&str]) -> Result<()> {
         let mut revisions = vec!["root()".to_owned()];
         revisions.extend(heads.iter().map(|head| format!("present({head})")));
@@ -576,7 +604,8 @@ fn session_fixture_child() -> Result<()> {
         return Ok(());
     }
     let root = std::env::current_dir()?;
-    let (client, pr) = Client::resolve(&root, PR_URL, None)?;
+    let pr_url = std::env::var("ZPR_PREPARE_SESSION_PR").unwrap_or_else(|_| PR_URL.into());
+    let (client, pr) = Client::resolve(&root, &pr_url, None)?;
     let state = prepare_directory(
         &client.root,
         &client.git_dir,
@@ -1194,11 +1223,7 @@ impl NavigationTransport {
             launch["checkouts"][relative], receipt,
             "Write receipt before launching Zed"
         );
-        assert!(
-            self.previous_bookmarks()?
-                .values()
-                .any(|sha| receipt["previous_commit"] == *sha)
-        );
+        fixture.checkout_previous(&session)?;
         Ok(session)
     }
 
@@ -1215,8 +1240,14 @@ impl NavigationTransport {
     }
 
     fn open_parent(&self) -> Result<PathBuf> {
-        success(&self.fixture.run_default(&["--pr", PR_URL, "open"], "")?);
-        self.assert_checkout(17)
+        let fixture = &self.fixture;
+        let bookmarks = fixture.previous_bookmarks()?;
+        let output = fixture.run_default(&["--pr", PR_URL, "open"], "")?;
+        success(&output);
+        let session = self.assert_checkout(17)?;
+        assert_eq!(fixture.previous_bookmarks()?, bookmarks);
+        assert_return_command(&output, &fixture.checkout_previous(&session)?);
+        Ok(session)
     }
 
     fn navigate(&self, action: &str, number: u64, side: &str, input: &str) -> Result<PathBuf> {
@@ -1225,7 +1256,16 @@ impl NavigationTransport {
         let calls_before = fixture.calls()?.len();
         let fetches_before = self.fetch_numbers()?.len();
         let launches_before = fixture.zed_calls()?.len();
-        let bookmarks_before = self.previous_bookmarks()?;
+        let bookmarks_before = fixture.previous_bookmarks()?;
+        let previous_change = fixture.jj(&[
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "@",
+            "--no-graph",
+            "-T",
+            "change_id",
+        ])?;
         let output = fixture.execute(
             navigation_command(fixture, &[action], Some(&old.join(side).join(FILE))),
             input,
@@ -1242,15 +1282,22 @@ impl NavigationTransport {
         assert_ne!(session, old);
         assert_eq!(fixture.zed_calls()?.len(), launches_before + 1);
         assert_eq!(&self.fetch_numbers()?[fetches_before..], &[number]);
-        let bookmarks_after = self.previous_bookmarks()?;
-        assert_eq!(bookmarks_after.len(), bookmarks_before.len() + 1);
-        for (name, sha) in bookmarks_before {
-            assert_eq!(
-                bookmarks_after.get(&name),
-                Some(&sha),
-                "Preserved bookmark changed"
-            );
-        }
+        assert_eq!(fixture.previous_bookmarks()?, bookmarks_before);
+        let previous = fixture.checkout_previous(&session)?;
+        assert_return_command(&output, &previous);
+        assert_eq!(
+            fixture.jj(&[
+                "--ignore-working-copy",
+                "log",
+                "-r",
+                &previous,
+                "--no-graph",
+                "-T",
+                "change_id",
+            ])?,
+            previous_change,
+            "Receipt must identify the checkout before navigation, including any snapshot"
+        );
         let calls = fixture.calls()?;
         let calls = &calls[calls_before..];
         let listings: Vec<_> = calls
@@ -1290,20 +1337,6 @@ impl NavigationTransport {
                     .find_map(|arg| arg.strip_prefix("refs/pull/"))
                     .context("Missing exact PR ref")?;
                 Ok(reference.split('/').next().unwrap().parse()?)
-            })
-            .collect()
-    }
-
-    fn previous_bookmarks(&self) -> Result<BTreeMap<String, String>> {
-        let listing = self.fixture.jj(&["--ignore-working-copy", "bookmark", "list", "-T",
-            r#"if(name.starts_with("zed-pr-review/previous-"), name ++ "\t" ++ normal_target.commit_id() ++ "\n")"#])?;
-        listing
-            .lines()
-            .map(|line| {
-                let (name, sha) = line
-                    .split_once('\t')
-                    .context("Malformed previous bookmark")?;
-                Ok((name.to_owned(), sha.to_owned()))
             })
             .collect()
     }
@@ -1556,6 +1589,20 @@ fn describe(output: &Output) -> String {
     )
 }
 
+fn assert_return_command(output: &Output, previous: &str) {
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains(&format!("Return with: jj edit {previous}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "If that revision is immutable, use: jj new {previous}"
+        )),
+        "{text}"
+    );
+}
+
 fn success(output: &Output) {
     assert!(output.status.success(), "{}", describe(output));
 }
@@ -1684,7 +1731,7 @@ fn navigation_empty_immutable_head_child_keeps_review_mode_in_zed_and_terminal()
                     describe(&output)
                 );
                 if args[0] == "stack" {
-                    assert!(String::from_utf8_lossy(&output.stdout).contains("* #17"));
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("@ #17"));
                 }
             }
         }
@@ -1755,23 +1802,35 @@ fn navigation_registered_head_and_base_list_the_paginated_stack_without_mutation
                 "Stack parent",
                 "First child",
                 "Second child",
-                "acme/widgets:topic",
-                "acme/widgets:main",
-                "draft",
-                "ready",
+                "#17 topic [draft]",
+                "#16 main",
+                "◆ trunk (base)",
+                "[ready]",
                 "current",
                 PR_URL,
             ] {
                 assert!(text.contains(expected), "Missing {expected:?}: {text}");
             }
-            assert!(text.contains("* #17"), "{text}");
+            assert!(text.contains("@ #17"), "{text}");
+            assert!(
+                !text.contains('\u{1b}'),
+                "Redirected output must be plain: {text:?}"
+            );
+            assert_eq!(text.matches("(base)").count(), 1, "{text}");
+            let lines: Vec<_> = text.lines().collect();
+            let current = lines
+                .iter()
+                .position(|line| line.starts_with("@ #17 "))
+                .unwrap();
+            assert_eq!(lines[current + 1], "│ Offline review fixture");
+            assert_eq!(lines[current + 2], format!("│ {PR_URL}"));
             assert!(
                 !text.contains("#99"),
                 "Unrelated PR is not in the stack: {text}"
             );
-            assert!(text.find("#16") < text.find("#17"));
-            assert!(text.find("#17") < text.find("#18"));
             assert!(text.find("#18") < text.find("#19"));
+            assert!(text.find("#19") < text.find("#17"));
+            assert!(text.find("#17") < text.find("#16"));
         }
     }
     before.assert_unchanged(&fixture)?;
@@ -1796,6 +1855,204 @@ fn navigation_registered_head_and_base_list_the_paginated_stack_without_mutation
         "uncommitted work must stay untouched\n"
     );
     Ok(())
+}
+
+// Reuse the strict navigation transport and a real saved draft, but list enough
+// PRs to put the current review below the first page of a ten-row terminal.
+fn stack_terminal_fixture() -> Result<(Fixture, PathBuf)> {
+    let (fixture, session) = navigation_session()?;
+    let mut control = fixture.control()?;
+    let mut prs = serde_json::Map::new();
+    prs.insert(
+        "16".into(),
+        json!({
+            "head": fixture.base, "base": format!("{:040x}", 16),
+            "head_ref": "main", "base_ref": "trunk",
+            "title": "Stack level 16", "draft": false
+        }),
+    );
+    let mut parent_head = fixture.head.clone();
+    let mut parent_branch = String::from("topic");
+    for number in 18..=23 {
+        let head = format!("{number:040x}");
+        let branch = format!("topic-{number}");
+        prs.insert(
+            number.to_string(),
+            json!({
+                "head": head, "base": parent_head,
+                "head_ref": branch, "base_ref": parent_branch,
+                "title": format!("Stack level {number}"), "draft": false
+            }),
+        );
+        parent_head = head;
+        parent_branch = branch;
+    }
+    control["prs"] = Value::Object(prs);
+    control["pulls_pages"] = json!([[20, 16, 23], [18, 21, 17], [22, 19]]);
+    fixture.set_control(control)?;
+    Ok((fixture, session))
+}
+
+fn run_stack_terminal_test(scenario: &str) -> Result<()> {
+    let (fixture, session) = stack_terminal_fixture()?;
+    if matches!(scenario, "active-review" | "initial-active-review") {
+        // Two real sessions share the same local commits, but belong to separate
+        // PR stacks. Switching only the active pointer isolates viewer following
+        // from checkout/transport mutations and keeps the read-only checkpoint.
+        let mut control = fixture.control()?;
+        control["prs"]["24"] = json!({
+            "head": fixture.head, "base": fixture.base,
+            "head_ref": "alternate-topic", "base_ref": "alternate-main",
+            "title": "New active review", "draft": false
+        });
+        control["pulls_pages"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!([24]));
+        fixture.set_control(control)?;
+        let active = fixture.state.join("active.json");
+        let original = fs::read(&active)?;
+        let mut prepare = fixture.command(std::env::current_exe()?);
+        prepare
+            .args(["--exact", "session_fixture_child", "--nocapture"])
+            .env("ZPR_PREPARE_SESSION", "1")
+            .env(
+                "ZPR_PREPARE_SESSION_PR",
+                "https://github.com/acme/widgets/pull/24",
+            );
+        success(&fixture.execute(prepare, "")?);
+        fs::copy(&active, fixture.root.join("stack-next-active.json"))?;
+        fs::write(active, original)?;
+    }
+    let work = "unsnapshotted work must survive the PR viewer\n";
+    fs::write(fixture.repo.join(FILE), work)?;
+    let before = NavigationCheckpoint::capture(&fixture)?;
+    let bookmarks = fixture.jj(&["--ignore-working-copy", "bookmark", "list", "--all-remotes"])?;
+    let refs = fixture.git(&["for-each-ref", "--format=%(refname) %(objectname)"])?;
+    navigation_clear_calls(&fixture)?;
+
+    let transcript = fixture.root.join("stack-terminal-output.txt");
+    let output = File::create(&transcript)?;
+    // This environment is constructed by Fixture, not inherited from the test
+    // runner. The Python child and viewer must keep the offline gh/Git/jj shims.
+    let mut command = fixture.command("python3");
+    command
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/stack_terminal.py"))
+        .arg(env!("CARGO_BIN_EXE_zed-pr-review"))
+        .arg(scenario)
+        .env("TERM", "xterm-256color")
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .stdin(Stdio::null())
+        .stdout(output.try_clone()?)
+        .stderr(output);
+    match scenario {
+        "escape" => {
+            command.env_remove("ZED_FILE");
+        }
+        "ctrl-c" => {
+            command.env("ZED_FILE", session.join("base").join(FILE));
+        }
+        _ => {
+            command.env("ZED_FILE", session.join("head").join(FILE));
+        }
+    }
+    let mut child = command
+        .spawn()
+        .context("Python 3 is required for the PR stack PTY tests")?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    // Python creates a session containing the viewer and its transport children.
+    // Clean up the whole group even if an assertion or timeout interrupts a read.
+    let _ = Command::new("kill")
+        .args(["-KILL", &format!("-{}", child.id())])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let output = fs::read_to_string(transcript)?;
+    ensure!(
+        status.is_some(),
+        "PR stack PTY {scenario} exceeded 60 seconds:\n{output}"
+    );
+    ensure!(
+        status.unwrap().success(),
+        "PR stack PTY {scenario} failed:\n{output}"
+    );
+    for call in fixture.calls()? {
+        ensure!(
+            call.get("unexpected").is_none(),
+            "Offline gh rejected: {call}"
+        );
+    }
+    before.assert_unchanged(&fixture)?;
+    assert_eq!(fs::read_to_string(fixture.repo.join(FILE))?, work);
+    assert_eq!(
+        fixture.jj(&["--ignore-working-copy", "bookmark", "list", "--all-remotes"])?,
+        bookmarks
+    );
+    assert_eq!(
+        fixture.git(&["for-each-ref", "--format=%(refname) %(objectname)"])?,
+        refs
+    );
+    assert!(
+        fixture
+            .calls()?
+            .iter()
+            .any(|call| call["endpoint"] == PULLS_ENDPOINT)
+    );
+    Ok(())
+}
+
+#[test]
+fn stack_terminal_navigation_refresh_and_quit_are_read_only() -> Result<()> {
+    run_stack_terminal_test("navigation")
+}
+
+#[test]
+fn stack_terminal_coalesces_refresh_requests_while_reading() -> Result<()> {
+    run_stack_terminal_test("queued-refresh")
+}
+
+#[test]
+fn stack_terminal_follows_active_review_after_initial_discovery_failure() -> Result<()> {
+    run_stack_terminal_test("initial-active-review")
+}
+
+#[test]
+fn stack_terminal_automatic_refresh_updates_title_and_draft_without_input() -> Result<()> {
+    run_stack_terminal_test("automatic-refresh")
+}
+
+#[test]
+fn stack_terminal_follows_changed_active_review_without_rebinding_original_diff() -> Result<()> {
+    run_stack_terminal_test("active-review")
+}
+
+#[test]
+fn stack_terminal_ctrl_c_restores_the_terminal() -> Result<()> {
+    run_stack_terminal_test("ctrl-c")
+}
+
+#[test]
+fn stack_terminal_escape_restores_the_terminal_in_active_review_context() -> Result<()> {
+    run_stack_terminal_test("escape")
+}
+
+#[test]
+fn stack_terminal_stdout_only_tty_with_piped_stdin_is_one_shot() -> Result<()> {
+    run_stack_terminal_test("stdin-pipe")
 }
 
 #[test]
@@ -2194,9 +2451,19 @@ fn navigation_transport_round_trip(colocate: bool) -> Result<()> {
     let transport = NavigationTransport::new(colocate, false)?;
     let fixture = &transport.fixture;
     let original_checkout = fixture.sha("@")?;
+    // Leave an old preservation bookmark alone, without snapshotting the pending work.
+    fixture.jj(&[
+        "--ignore-working-copy",
+        "bookmark",
+        "create",
+        "zed-pr-review/previous-legacy",
+        "-r",
+        "@-",
+    ])?;
+    let legacy_bookmarks = fixture.previous_bookmarks()?;
+    assert_eq!(legacy_bookmarks.len(), 1);
     let parent = transport.open_parent()?;
-    let receipt = read_json(&parent.parent().unwrap().join("last-checkout.json"))?;
-    let local_work = receipt["previous_commit"].as_str().unwrap().to_owned();
+    let local_work = fixture.checkout_previous(&parent)?;
     assert_ne!(
         local_work, original_checkout,
         "Preserve edits present before the first open"
@@ -2222,8 +2489,7 @@ fn navigation_transport_round_trip(colocate: bool) -> Result<()> {
     assert_eq!(fixture.sha("@")?, transport.revisions[&17].head);
 
     let child = transport.navigate("sf", 18, "base", "single child needs no choice\n")?;
-    let receipt = read_json(&child.parent().unwrap().join("last-checkout.json"))?;
-    let parent_work = receipt["previous_commit"].as_str().unwrap().to_owned();
+    let parent_work = fixture.checkout_previous(&child)?;
     assert_ne!(
         parent_work, transport.revisions[&17].head,
         "Snapshot the parent's pending edits before switching"
@@ -2252,6 +2518,10 @@ fn navigation_transport_round_trip(colocate: bool) -> Result<()> {
     transport.assert_stale_tab(&parent)?;
 
     let returned_parent = transport.navigate("sb", 17, "head", "")?;
+    assert_eq!(
+        fixture.checkout_previous(&returned_parent)?,
+        transport.revisions[&18].head
+    );
     assert_ne!(
         returned_parent, parent,
         "Returning must create a fresh frozen session"
@@ -2273,6 +2543,10 @@ fn navigation_transport_round_trip(colocate: bool) -> Result<()> {
     transport.assert_stale_tab(&child)?;
 
     let returned_child = transport.navigate("sf", 18, "head", "")?;
+    assert_eq!(
+        fixture.checkout_previous(&returned_child)?,
+        transport.revisions[&17].head
+    );
     assert_ne!(returned_child, child);
     assert_eq!(returned_child.parent(), child.parent());
     assert_eq!(fs::read(&parent_draft)?, parent_bytes);
@@ -2293,7 +2567,7 @@ fn navigation_transport_round_trip(colocate: bool) -> Result<()> {
         fixture.sha("keep-child-head")?,
         transport.revisions[&18].head
     );
-    assert_eq!(transport.previous_bookmarks()?.len(), 4);
+    assert_eq!(fixture.previous_bookmarks()?, legacy_bookmarks);
     assert_eq!(transport.fetch_numbers()?, [17, 18, 17, 18]);
     assert_eq!(fixture.zed_calls()?.len(), 4);
     fixture.jj(&["status"])?;
@@ -2307,6 +2581,24 @@ fn navigation_transport_round_trip(colocate: bool) -> Result<()> {
             .jj(&["file", "list"])?
             .contains("scratch/zed-pr-review")
     );
+    // Recover by the saved receipt SHAs, not by any user or legacy bookmark.
+    fixture.jj(&["edit", &parent_work])?;
+    assert_eq!(fixture.sha("@")?, parent_work);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join(FILE))?,
+        "ONE\nlocal parent edit\nTHREE\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("parent local.txt"))?,
+        "Unsnapshotted work while reviewing the parent\n"
+    );
+    fixture.jj(&["edit", &local_work])?;
+    assert_eq!(fixture.sha("@")?, local_work);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("keep local.txt"))?,
+        "Unsnapshotted work\n"
+    );
+    assert_eq!(fixture.previous_bookmarks()?, legacy_bookmarks);
     Ok(())
 }
 
@@ -2327,8 +2619,13 @@ fn navigation_transport_immutable_round_trip(colocate: bool, terminal: bool) -> 
         &transport.revisions[&17].head,
         &transport.revisions[&18].head,
     ])?;
-    success(&fixture.run_default(&["--pr", PR_URL, "open"], "")?);
+    let output = fixture.run_default(&["--pr", PR_URL, "open"], "")?;
+    success(&output);
     let parent = transport.assert_checkout_kind(17, true)?;
+    let local_work = fixture.checkout_previous(&parent)?;
+    assert_eq!(fixture.sha("unrelated-local-work")?, local_work);
+    assert_return_command(&output, &local_work);
+    assert!(fixture.previous_bookmarks()?.is_empty());
     let parent_checkout = fixture.sha("@")?;
     let parent_draft = transport.comment(&parent, 17, "Keep the immutable parent's comment")?;
     let parent_bytes = fs::read(&parent_draft)?;
@@ -2337,26 +2634,32 @@ fn navigation_transport_immutable_round_trip(colocate: bool, terminal: bool) -> 
     let stack = fixture.execute(navigation_command(fixture, &["stack"], file.as_deref()), "")?;
     success(&stack);
     let text = String::from_utf8_lossy(&stack.stdout);
-    assert!(text.contains("* #17") && text.contains("#18"), "{text}");
+    assert!(text.contains("@ #17") && text.contains("#18"), "{text}");
     assert_eq!(fixture.sha("@")?, parent_checkout);
-    success(&fixture.execute(navigation_command(fixture, &["sf"], file.as_deref()), "")?);
+    let output = fixture.execute(navigation_command(fixture, &["sf"], file.as_deref()), "")?;
+    success(&output);
     let child = transport.assert_checkout_kind(18, true)?;
     let child_checkout = fixture.sha("@")?;
-    let child_receipt = read_json(&child.parent().unwrap().join("last-checkout.json"))?;
-    assert_eq!(child_receipt["previous_commit"], parent_checkout);
+    let previous_parent = fixture.checkout_previous(&child)?;
+    assert_eq!(previous_parent, parent_checkout);
+    assert_return_command(&output, &previous_parent);
+    assert!(fixture.previous_bookmarks()?.is_empty());
     let child_draft = transport.comment(&child, 18, "Keep the immutable child's comment")?;
     let child_bytes = fs::read(&child_draft)?;
     assert_eq!(fs::read(&parent_draft)?, parent_bytes);
 
-    success(&fixture.execute(
+    let output = fixture.execute(
         navigation_command(fixture, &["sb"], Some(&child.join("base").join(FILE))),
         "",
-    )?);
+    )?;
+    success(&output);
     let returned = transport.assert_checkout_kind(17, true)?;
     assert_ne!(returned, parent);
     assert_eq!(returned.parent(), parent.parent());
-    let receipt = read_json(&returned.parent().unwrap().join("last-checkout.json"))?;
-    assert_eq!(receipt["previous_commit"], child_checkout);
+    let previous_child = fixture.checkout_previous(&returned)?;
+    assert_eq!(previous_child, child_checkout);
+    assert_return_command(&output, &previous_child);
+    assert!(fixture.previous_bookmarks()?.is_empty());
     assert_eq!(fs::read(&parent_draft)?, parent_bytes);
     assert_eq!(fs::read(&child_draft)?, child_bytes);
     assert_eq!(transport.fetch_numbers()?, [17, 18, 17]);
@@ -2370,6 +2673,15 @@ fn navigation_transport_immutable_round_trip(colocate: bool, terminal: bool) -> 
     );
     assert!(fixture.calls()?.iter().all(|call| call["method"] != "POST"));
     assert!(fixture.editors()?.is_empty());
+    // jj can abandon these empty working copies; their full receipt SHAs still work.
+    for (previous, head) in [
+        (&previous_parent, &transport.revisions[&17].head),
+        (&previous_child, &transport.revisions[&18].head),
+    ] {
+        fixture.jj(&["edit", previous])?;
+        assert_eq!(&fixture.assert_empty_child(head)?, previous);
+    }
+    assert!(fixture.previous_bookmarks()?.is_empty());
     Ok(())
 }
 
@@ -2431,7 +2743,7 @@ fn navigation_transport_multiple_children_open_the_offered_pr_number_and_keep_se
     );
     transport.assert_stale_tab(&first)?;
     assert_eq!(transport.fetch_numbers()?, [17, 19, 17, 18, 17, 19]);
-    assert_eq!(transport.previous_bookmarks()?.len(), 6);
+    assert!(fixture.previous_bookmarks()?.is_empty());
     assert_eq!(fixture.zed_calls()?.len(), 6);
     Ok(())
 }
@@ -2854,21 +3166,21 @@ fn cleanup_navigate(
     let before = NavigationCheckpoint::capture(fixture)?;
     let fetches = transport.fetch_numbers()?.len();
     let launches = fixture.zed_calls()?.len();
-    let bookmarks = transport.previous_bookmarks()?;
+    let bookmarks = fixture.previous_bookmarks()?;
     let posts: Vec<_> = fixture
         .calls()?
         .into_iter()
         .filter(|call| call["method"] == "POST")
         .collect();
-    success(&fixture.execute(command, "")?);
+    let output = fixture.execute(command, "")?;
+    success(&output);
     let session = transport.cleanup_assert_checkout(number)?;
+    let previous = fixture.checkout_previous(&session)?;
+    assert_eq!(previous, before.head);
+    assert_return_command(&output, &previous);
     assert_eq!(&transport.fetch_numbers()?[fetches..], &[number]);
     assert_eq!(fixture.zed_calls()?.len(), launches + 1);
-    let after_bookmarks = transport.previous_bookmarks()?;
-    assert_eq!(after_bookmarks.len(), bookmarks.len() + 1);
-    for (name, sha) in bookmarks {
-        assert_eq!(after_bookmarks.get(&name), Some(&sha));
-    }
+    assert_eq!(fixture.previous_bookmarks()?, bookmarks);
     assert_eq!(
         NavigationCheckpoint::capture(fixture)?.drafts,
         before.drafts
@@ -2899,6 +3211,10 @@ fn cleanup_navigation_round_trip(action: &str, state: &str, colocate: bool) -> R
     let child_before = read_json(&child_draft)?;
     let child_bytes = fs::read(&child_draft)?;
     let active = fs::read(fixture.state.join("active.json"))?;
+    let checkout_receipt_path = parent.parent().unwrap().join("last-checkout.json");
+    let checkout_receipt = fs::read(&checkout_receipt_path)?;
+    let bookmarks = fixture.previous_bookmarks()?;
+    assert!(bookmarks.is_empty());
     let wrong_root = Fixture::new()?;
     let wrong_head = wrong_root.sha("@")?;
     let selected = parent
@@ -2912,6 +3228,8 @@ fn cleanup_navigation_round_trip(action: &str, state: &str, colocate: bool) -> R
     old_parent.assert_cleaned(&parent_receipt)?;
     parent_session.assert_cleaned(&parent_receipt)?;
     child_session.assert_kept()?;
+    assert_eq!(fs::read(&checkout_receipt_path)?, checkout_receipt);
+    assert_eq!(fixture.previous_bookmarks()?, bookmarks);
     assert_eq!(fs::read(&child_draft)?, child_bytes);
     assert_eq!(fs::read(fixture.state.join("active.json"))?, active);
     let parent_bytes = fs::read(&parent_draft)?;
@@ -2931,7 +3249,7 @@ fn cleanup_navigation_round_trip(action: &str, state: &str, colocate: bool) -> R
         )?;
         success(&output);
         let text = String::from_utf8_lossy(&output.stdout);
-        assert!(text.contains("* #17") && text.contains("#18"), "{text}");
+        assert!(text.contains("@ #17") && text.contains("#18"), "{text}");
     }
     for side in ["head", "base"] {
         let file = parent.join(side).join(FILE);
@@ -3022,6 +3340,7 @@ fn cleanup_navigation_round_trip(action: &str, state: &str, colocate: bool) -> R
     assert_eq!(fs::read(&parent_draft)?, parent_bytes);
     assert_eq!(fs::read(&child_draft)?, child_bytes);
     assert_eq!(transport.fetch_numbers()?, [17, 18, 17, 18, 17, 18]);
+    assert_eq!(fixture.previous_bookmarks()?, bookmarks);
     assert_eq!(fixture.zed_calls()?.len(), 6);
     assert_eq!(
         fixture
@@ -3142,7 +3461,8 @@ fn open_fetches_the_exact_pr_and_full_history_preserves_work_and_launches_from_r
         let mut command = fixture.default_cli(&["--pr", "17", "open"]);
         command.current_dir(fixture.root.join("home"));
         // An explicit global PR wins even when stdin supplies an invalid value.
-        success(&fixture.execute(command, "not a PR\n")?);
+        let output = fixture.execute(command, "not a PR\n")?;
+        success(&output);
         assert_eq!(fixture.sha("@")?, fixture.head);
         assert_ne!(fixture.head, old_head);
         assert_eq!(
@@ -3209,12 +3529,10 @@ fn open_fetches_the_exact_pr_and_full_history_preserves_work_and_launches_from_r
             "-T",
             "name ++ \"\\n\"",
         ])?;
-        let pins: Vec<_> = bookmarks
-            .lines()
-            .filter(|name| name.starts_with("zed-pr-review/previous-"))
-            .collect();
-        assert_eq!(pins.len(), 1, "{bookmarks}");
-        let previous = fixture.sha(pins[0])?;
+        assert!(fixture.previous_bookmarks()?.is_empty(), "{bookmarks}");
+        let previous = fixture.checkout_previous(&session)?;
+        assert_eq!(fixture.sha("unrelated-local-work")?, previous);
+        assert_return_command(&output, &previous);
         assert_ne!(
             previous, old_head,
             "Preserve unsnapshotted edits, not just the old recorded commit"
@@ -3260,15 +3578,8 @@ fn open_fetches_the_exact_pr_and_full_history_preserves_work_and_launches_from_r
         );
         let (path, receipt) = receipts.iter().next().unwrap();
         assert_eq!(*receipt, read_json(&fixture.state.join(path))?);
-        let receipt = serde_json::to_string(receipt)?;
-        assert!(
-            receipt.contains(&previous),
-            "Receipt must retain the preserved revision: {receipt}"
-        );
-        assert!(
-            receipt.contains(&fixture.head),
-            "Receipt must retain the checked-out head: {receipt}"
-        );
+        assert_eq!(receipt["previous_commit"], previous);
+        assert_eq!(receipt["pr"]["head_sha"], fixture.head);
         let calls = read_json_lines(&fixture.root.join("git.jsonl"))?;
         let fetches: Vec<_> = calls
             .iter()
@@ -3308,6 +3619,54 @@ fn open_fetches_the_exact_pr_and_full_history_preserves_work_and_launches_from_r
         assert_eq!(fixture.draft()?["pr"]["base_sha"], fixture.base);
         assert!(fixture.posts()?.is_empty());
         fixture.assert_default_state_ignored()?;
+        fixture.jj(&["edit", &previous])?;
+        assert_eq!(fixture.sha("@")?, previous);
+        assert_eq!(
+            fs::read_to_string(fixture.repo.join("keep local.txt"))?,
+            "Unsnapshotted work\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.repo.join(FILE))?,
+            "one\ntwo\nthree\n"
+        );
+        assert!(fixture.previous_bookmarks()?.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn open_recovers_unbookmarked_unsnapshotted_work_from_receipt() -> Result<()> {
+    for (colocate, immutable) in [(false, false), (true, true)] {
+        let transport = OpenFixture::new(colocate)?;
+        let fixture = &transport.fixture;
+        fixture.jj(&[
+            "--ignore-working-copy",
+            "bookmark",
+            "delete",
+            "unrelated-local-work",
+        ])?;
+        if immutable {
+            fixture.set_immutable_heads(&[&fixture.head])?;
+        }
+        let old_head = fixture.sha("@")?;
+        let output = fixture.run_default(&["--pr", PR_URL, "open"], "")?;
+        success(&output);
+        let previous = fixture.checkout_previous(&fixture.active_directory()?)?;
+        assert_ne!(previous, old_head, "The receipt must include pending edits");
+        assert_return_command(&output, &previous);
+        assert!(fixture.previous_bookmarks()?.is_empty());
+        assert!(!fixture.repo.join("keep local.txt").exists());
+        fixture.jj(&["edit", &previous])?;
+        assert_eq!(fixture.sha("@")?, previous);
+        assert_eq!(
+            fs::read_to_string(fixture.repo.join("keep local.txt"))?,
+            "Unsnapshotted work\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.repo.join(FILE))?,
+            "one\ntwo\nthree\n"
+        );
+        assert!(fixture.previous_bookmarks()?.is_empty());
     }
     Ok(())
 }
@@ -3421,6 +3780,7 @@ fn open_accepts_global_pr_urls_and_a_single_prompt_line_without_a_positional_arg
         success(&fixture.run_default(&args, &input)?);
         assert_eq!(fixture.sha("@")?, fixture.head);
         assert_eq!(fixture.zed_calls()?.len(), 1);
+        assert!(fixture.previous_bookmarks()?.is_empty());
         assert!(fixture.calls()?.iter().all(|call| call["args"][0] != "pr"));
         assert!(fixture.calls()?.iter().all(|call| call["method"] != "POST"));
     }
@@ -6078,6 +6438,920 @@ fn ready_requires_a_nonempty_node_id_without_changing_discovery() -> Result<()> 
         );
         fixture.assert_ready_mutations(&[])?;
         fixture.assert_stateless_ready()?;
+    }
+    Ok(())
+}
+
+// Finish/cancel/submit-comment regressions use only the public CLI after setup.
+fn review_flow_command(fixture: &Fixture, directory: &Path, side: &str, args: &[&str]) -> Command {
+    navigation_command(fixture, args, Some(&directory.join(side).join(FILE)))
+}
+
+fn review_flow_assert_cancelled(session: &CleanupSession) -> Result<()> {
+    let files = cleanup_contents(&session.directory)?;
+    assert_eq!(
+        files.keys().cloned().collect::<Vec<_>>(),
+        [
+            PathBuf::from("cancelled.json"),
+            PathBuf::from("manifest.json")
+        ]
+    );
+    assert_eq!(
+        files[Path::new("manifest.json")],
+        session.files[Path::new("manifest.json")]
+    );
+    assert!(!session.directory.join("head").exists());
+    assert!(!session.directory.join("base").exists());
+    Ok(())
+}
+
+struct ReviewFlowCheckout {
+    head: String,
+    bookmarks: String,
+    refs: String,
+    work: Vec<u8>,
+}
+
+impl ReviewFlowCheckout {
+    fn capture(fixture: &Fixture) -> Result<Self> {
+        Ok(Self {
+            head: fixture.sha("@")?,
+            bookmarks: fixture.jj(&[
+                "--ignore-working-copy",
+                "bookmark",
+                "list",
+                "--all-remotes",
+            ])?,
+            refs: fixture.git(&["for-each-ref", "--format=%(refname) %(objectname)"])?,
+            work: fs::read(fixture.repo.join(FILE))?,
+        })
+    }
+
+    fn assert_kept(&self, fixture: &Fixture) -> Result<()> {
+        let after = Self::capture(fixture)?;
+        assert_eq!(
+            after.head, self.head,
+            "Review action moved or snapshotted the checkout"
+        );
+        assert_eq!(after.bookmarks, self.bookmarks);
+        assert_eq!(after.refs, self.refs);
+        assert_eq!(after.work, self.work);
+        for call in navigation_calls(fixture)? {
+            let args = call["args"].as_array().unwrap();
+            for forbidden in [
+                "edit", "new", "describe", "abandon", "restore", "fetch", "push", "sb", "sf",
+            ] {
+                assert!(
+                    !args.iter().any(|arg| arg == forbidden),
+                    "Unexpected mutation: {call}"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn review_flow_menu_abandons_empty_or_commented_drafts_from_either_side_offline() -> Result<()> {
+    for side in ["head", "base"] {
+        for commented in [false, true] {
+            let fixture = navigation_fixture()?;
+            let first = CleanupSession::capture(&fixture.prepare_session()?)?;
+            let latest = CleanupSession::capture(&fixture.prepare_session()?)?;
+            if commented {
+                success(&fixture.run_session(
+                    &latest.directory,
+                    &["comment"],
+                    "Private draft\nKeep in the archive",
+                )?);
+            }
+            let before = fixture
+                .drafts()?
+                .first()
+                .map(|path| read_json(path))
+                .transpose()?;
+            // No discovery or implicit jj snapshot is permissible, even with stale
+            // remote metadata and unsaved source edits outside the frozen diff.
+            fixture.configure("head", json!(fixture.base))?;
+            fixture.configure("deny_discovery", json!(true))?;
+            fs::write(
+                fixture.repo.join(FILE),
+                "Unsaved source edits must survive\n",
+            )?;
+            let checkout = ReviewFlowCheckout::capture(&fixture)?;
+            let control = fixture.control()?;
+            navigation_clear_calls(&fixture)?;
+            let output = fixture.execute(
+                review_flow_command(&fixture, &first.directory, side, &["finish"]),
+                "1\n",
+            )?;
+            success(&output);
+            assert!(describe(&output).contains("Nothing was submitted to GitHub"));
+            for session in [&first, &latest] {
+                review_flow_assert_cancelled(session)?;
+            }
+            assert!(fixture.drafts()?.is_empty());
+            assert!(!fixture.state.join("active.json").exists());
+            let archived = archives(first.directory.parent().unwrap())?;
+            assert_eq!(archived.len(), 1);
+            if let Some(before) = before {
+                assert_eq!(archived[0], before);
+            } else {
+                assert_eq!(archived[0]["comments"], json!([]));
+                assert_eq!(archived[0]["pr"]["head_sha"], fixture.head);
+                assert!(archived[0]["attempt"].is_null());
+                assert!(archived[0]["submitted"].is_null());
+            }
+            assert!(fixture.calls()?.is_empty());
+            assert!(fixture.editors()?.is_empty());
+            assert!(fixture.zed_calls()?.is_empty());
+            assert_eq!(fixture.control()?, control);
+            checkout.assert_kept(&fixture)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn review_flow_stale_draft_in_new_diff_refuses_submission_but_cancels_locally() -> Result<()> {
+    for (side, args, input) in [
+        ("head", vec!["finish"], "1\n"),
+        ("base", vec!["cancel", "--yes"], ""),
+    ] {
+        let (fixture, directory) = navigation_session()?;
+        let old = CleanupSession::capture(&directory)?;
+        let draft = fixture.draft()?;
+        let draft_bytes = fs::read(fixture.draft_path()?)?;
+        fixture.jj(&["new", "-m", "H2 of the same PR"])?;
+        fs::write(fixture.repo.join(FILE), "one\ntwo\nFOUR\n")?;
+        fixture.jj(&["describe", "-m", "H2 of the same PR"])?;
+        let h2 = fixture.sha("@")?;
+        assert_ne!(h2, fixture.head);
+        fixture.configure("head", json!(h2))?;
+        fixture.configure(
+            "files",
+            json!([{
+                "filename": FILE, "status": "modified",
+                "patch": "@@ -1,3 +1,3 @@\n one\n two\n-three\n+FOUR"
+            }]),
+        )?;
+        let latest = CleanupSession::capture(&fixture.prepare_session()?)?;
+        assert_eq!(old.directory.parent(), latest.directory.parent());
+        assert_eq!(
+            read_json(&latest.directory.join("manifest.json"))?["pr"]["head_sha"],
+            h2
+        );
+        assert_eq!(draft["pr"]["head_sha"], fixture.head);
+        assert_eq!(fs::read(fixture.draft_path()?)?, draft_bytes);
+        let before = NavigationCheckpoint::capture(&fixture)?;
+        let checkout = ReviewFlowCheckout::capture(&fixture)?;
+        navigation_clear_calls(&fixture)?;
+        for choice in ["2\n", "3\n", "4\n"] {
+            let output = fixture.execute(
+                review_flow_command(&fixture, &latest.directory, side, &["finish"]),
+                choice,
+            )?;
+            failure(&output);
+            assert!(
+                describe(&output).contains("1 pending comment"),
+                "{}",
+                describe(&output)
+            );
+            assert!(
+                describe(&output).contains("PR head, base, or identity has changed"),
+                "{}",
+                describe(&output)
+            );
+            before.assert_unchanged(&fixture)?;
+            old.assert_kept()?;
+            latest.assert_kept()?;
+            assert!(archives(directory.parent().unwrap())?.is_empty());
+        }
+        // Cancellation must use the saved H1 draft, not replace it with an empty
+        // H2 draft or require the remote revision to match that older draft.
+        fixture.configure("deny_discovery", json!(true))?;
+        let control = fixture.control()?;
+        navigation_clear_calls(&fixture)?;
+        success(&fixture.execute(
+            review_flow_command(&fixture, &latest.directory, side, &args),
+            input,
+        )?);
+        review_flow_assert_cancelled(&old)?;
+        review_flow_assert_cancelled(&latest)?;
+        assert_eq!(archives(directory.parent().unwrap())?, vec![draft]);
+        assert!(fixture.drafts()?.is_empty());
+        assert!(!fixture.state.join("active.json").exists());
+        assert!(fixture.calls()?.is_empty());
+        assert!(fixture.editors()?.is_empty());
+        assert_eq!(fixture.control()?, control);
+        checkout.assert_kept(&fixture)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn review_flow_plain_menu_reads_one_choice_and_keeps_state_on_dismissal_or_invalid_input()
+-> Result<()> {
+    let (fixture, directory) = navigation_session()?;
+    let before = NavigationCheckpoint::capture(&fixture)?;
+    let files = cleanup_contents(&fixture.state)?;
+    let checkout = ReviewFlowCheckout::capture(&fixture)?;
+    navigation_clear_calls(&fixture)?;
+    for (input, valid) in [
+        ("", true),
+        ("\n1\n", true),
+        (" \t\n2\n", true),
+        ("q\n1\n", true),
+        ("\u{1b}\n", true),
+        ("\u{3}\n", true),
+        ("0\n1\n", false),
+        ("5\n", false),
+        ("approve\n3\n", false),
+        ("1 2\n", false),
+    ] {
+        let output = fixture.execute(
+            review_flow_command(&fixture, &directory, "base", &["finish"]),
+            input,
+        )?;
+        if valid {
+            success(&output);
+        } else {
+            failure(&output);
+        }
+        for choice in [
+            "1  Exit + abandon",
+            "2  Comment",
+            "3  Approve",
+            "4  Request changes",
+            "1 pending comment",
+        ] {
+            assert!(
+                describe(&output).contains(choice),
+                "Missing {choice}: {}",
+                describe(&output)
+            );
+        }
+        before.assert_unchanged(&fixture)?;
+        assert_eq!(cleanup_contents(&fixture.state)?, files);
+        assert!(fixture.calls()?.is_empty());
+    }
+    checkout.assert_kept(&fixture)?;
+    Ok(())
+}
+
+#[test]
+fn review_flow_cancel_confirmation_and_yes_work_after_checkout_and_remote_drift() -> Result<()> {
+    for yes_flag in [false, true] {
+        let (fixture, directory) = navigation_session()?;
+        let session = CleanupSession::capture(&directory)?;
+        let draft = fixture.draft()?;
+        fixture.nonempty_child("Unrelated local work")?;
+        fixture.configure("head", json!(fixture.base))?;
+        fixture.configure("pr_state", json!("closed"))?;
+        fixture.configure("deny_discovery", json!(true))?;
+        let before = NavigationCheckpoint::capture(&fixture)?;
+        let checkout = ReviewFlowCheckout::capture(&fixture)?;
+        navigation_clear_calls(&fixture)?;
+        for input in ["", "\n", "no\nyes\n", "y\n"] {
+            success(&fixture.execute(
+                review_flow_command(&fixture, &directory, "head", &["cancel"]),
+                input,
+            )?);
+            before.assert_unchanged(&fixture)?;
+            session.assert_kept()?;
+            assert!(archives(directory.parent().unwrap())?.is_empty());
+        }
+        let args = if yes_flag {
+            vec!["cancel", "--yes"]
+        } else {
+            vec!["cancel"]
+        };
+        let input = if yes_flag { "no\n" } else { "yes\n" };
+        success(&fixture.execute(
+            review_flow_command(&fixture, &directory, "base", &args),
+            input,
+        )?);
+        review_flow_assert_cancelled(&session)?;
+        assert_eq!(archives(directory.parent().unwrap())?, vec![draft]);
+        assert!(fixture.drafts()?.is_empty());
+        assert!(!fixture.state.join("active.json").exists());
+        assert!(fixture.calls()?.is_empty());
+        checkout.assert_kept(&fixture)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn review_flow_context_guards_refuse_before_input_network_or_state_writes() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.use_default_state();
+    for active in [false, true] {
+        if active {
+            fixture.prepare_session()?;
+        }
+        for file in [None, Some(PathBuf::new()), Some(fixture.repo.join(FILE))] {
+            for action in ["finish", "cancel", "submit-comment"] {
+                assert_review_guard_refusal(
+                    &fixture,
+                    navigation_command(&fixture, &[action], file.as_deref()),
+                )?;
+            }
+        }
+        if !active {
+            assert!(!fixture.state.exists());
+        }
+    }
+    let directory = fixture.active_directory()?;
+    for action in ["finish", "cancel"] {
+        for args in [
+            vec!["--pr", PR_URL],
+            vec!["--repo", "acme/widgets"],
+            vec!["--draft-dir", directory.parent().unwrap().to_str().unwrap()],
+        ] {
+            let mut command = review_flow_command(&fixture, &directory, "head", &[action]);
+            command.args(args);
+            assert_review_guard_refusal(&fixture, command)?;
+        }
+    }
+    for action in ["finish", "cancel", "submit-comment"] {
+        for file in [
+            directory.join("manifest.json"),
+            directory.join("head/missing.txt"),
+            directory.join("head/../head").join(FILE),
+        ] {
+            assert_review_guard_refusal(
+                &fixture,
+                navigation_command(&fixture, &[action], Some(&file)),
+            )?;
+        }
+        for environment in [false, true] {
+            let external = fixture.root.join("external state");
+            let mut command = review_flow_command(&fixture, &directory, "head", &[action]);
+            if environment {
+                command.env("ZED_PR_REVIEW_STATE_DIR", &external);
+            } else {
+                command.arg("--state-dir").arg(&external);
+            }
+            assert_review_guard_refusal(&fixture, command)?;
+            assert!(!external.exists());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn review_flow_cancel_refuses_uncertain_attempt_retry_history_and_submitted_receipt() -> Result<()>
+{
+    let fixture = Fixture::review()?;
+    fixture.comment(1, "one", "Keep until recovery is certain")?;
+    let directory = fixture.active_directory()?;
+    let session = CleanupSession::capture(&directory)?;
+    fixture.configure("post", json!("fail"))?;
+    failure(&fixture.run(&["submit-comment"], "")?);
+    for retriable in [false, true] {
+        if retriable {
+            success(&fixture.saved(&["recover", "--retry"], "yes\n")?);
+            assert!(fixture.draft()?["attempt"].is_null());
+            assert_eq!(
+                fixture.draft()?["retry_history"].as_array().unwrap().len(),
+                1
+            );
+        } else {
+            assert!(!fixture.draft()?["attempt"].is_null());
+        }
+        let before = cleanup_contents(&fixture.state)?;
+        let calls = fixture.calls()?;
+        let editors = fixture.editors()?;
+        for (args, input) in [
+            (vec!["cancel", "--yes"], ""),
+            (vec!["cancel"], "yes\n"),
+            (vec!["finish"], "1\n"),
+        ] {
+            let output = fixture.execute(
+                review_flow_command(&fixture, &directory, "head", &args),
+                input,
+            )?;
+            failure(&output);
+            assert!(describe(&output).contains("recover"));
+            assert_eq!(cleanup_contents(&fixture.state)?, before);
+        }
+        session.assert_kept()?;
+        assert_eq!(fixture.calls()?, calls);
+        assert_eq!(fixture.editors()?, editors);
+    }
+    fixture.configure("post", json!("success"))?;
+    success(&fixture.run(&["submit-comment"], "")?);
+    let before = cleanup_contents(&fixture.state)?;
+    let calls = fixture.calls()?;
+    for args in [vec!["cancel", "--yes"], vec!["finish"]] {
+        failure(&fixture.execute(
+            review_flow_command(&fixture, &directory, "head", &args),
+            "1\n",
+        )?);
+        assert_eq!(cleanup_contents(&fixture.state)?, before);
+        assert_eq!(fixture.calls()?, calls);
+    }
+    assert_eq!(fixture.draft()?["submitted"]["state"], "COMMENTED");
+    Ok(())
+}
+
+#[test]
+fn review_flow_cancelled_tab_can_retry_cleanup_but_cannot_touch_a_new_diff() -> Result<()> {
+    let fixture = Fixture::review()?;
+    fixture.comment(1, "one", "Archive only this old comment")?;
+    let old = fixture.active_directory()?;
+    success(&fixture.execute(
+        review_flow_command(&fixture, &old, "head", &["cancel", "--yes"]),
+        "",
+    )?);
+    let cancelled = cleanup_contents(&fixture.state)?;
+    let calls = fixture.calls()?;
+    for args in [vec!["cancel", "--yes"], vec!["finish"]] {
+        success(&fixture.execute(review_flow_command(&fixture, &old, "head", &args), "1\n")?);
+        assert_eq!(cleanup_contents(&fixture.state)?, cancelled);
+        assert_eq!(fixture.calls()?, calls);
+    }
+    for action in ["comment", "submit-comment", "approve", "request-changes"] {
+        assert_review_guard_refusal(
+            &fixture,
+            review_flow_command(&fixture, &old, "head", &[action]),
+        )?;
+    }
+    success(&fixture.run_default(&["diff", "--pr", PR_URL], "")?);
+    let fresh = fixture.active_directory()?;
+    assert_ne!(fresh, old);
+    success(&fixture.run_session(&fresh, &["comment"], "New draft belongs to the new diff")?);
+    let before = cleanup_contents(&fixture.state)?;
+    for action in [
+        "finish",
+        "cancel",
+        "comment",
+        "submit-comment",
+        "approve",
+        "request-changes",
+    ] {
+        assert_review_guard_refusal(
+            &fixture,
+            review_flow_command(&fixture, &old, "head", &[action]),
+        )?;
+    }
+    assert_eq!(cleanup_contents(&fixture.state)?, before);
+    assert_eq!(
+        fixture.draft()?["comments"][0]["body"],
+        "New draft belongs to the new diff"
+    );
+    assert_eq!(archives(old.parent().unwrap())?.len(), 1);
+    assert!(fixture.posts()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn review_flow_cancelling_an_old_pr_keeps_the_other_active_pr_and_its_draft() -> Result<()> {
+    let (fixture, old) = navigation_session()?;
+    let old_session = CleanupSession::capture(&old)?;
+    let old_draft = fixture.draft()?;
+    fixture.configure("additional_pr_numbers", json!([18]))?;
+    let mut prepare = fixture.command(std::env::current_exe()?);
+    prepare
+        .args(["--exact", "session_fixture_child", "--nocapture"])
+        .env("ZPR_PREPARE_SESSION", "1")
+        .env(
+            "ZPR_PREPARE_SESSION_PR",
+            "https://github.com/acme/widgets/pull/18",
+        );
+    success(&fixture.execute(prepare, "")?);
+    let other = fixture.active_directory()?;
+    success(&fixture.run_session(&other, &["comment"], "Other PR private draft")?);
+    let other_files = cleanup_contents(other.parent().unwrap())?;
+    let active = fs::read(fixture.state.join("active.json"))?;
+    navigation_clear_calls(&fixture)?;
+    success(&fixture.execute(
+        review_flow_command(&fixture, &old, "base", &["finish"]),
+        "1\n",
+    )?);
+    review_flow_assert_cancelled(&old_session)?;
+    assert_eq!(archives(old.parent().unwrap())?, vec![old_draft]);
+    assert_eq!(cleanup_contents(other.parent().unwrap())?, other_files);
+    assert_eq!(fs::read(fixture.state.join("active.json"))?, active);
+    assert!(fixture.calls()?.is_empty());
+    Ok(())
+}
+
+fn review_flow_assert_submission(
+    fixture: &Fixture,
+    session: &CleanupSession,
+    event: &str,
+    state: &str,
+    commented: bool,
+) -> Result<()> {
+    let posts = fixture.posts()?;
+    assert_eq!(posts.len(), 1);
+    let comments = if commented {
+        json!([
+            {"path": FILE, "start_line": 1, "line": 2, "start_side": "RIGHT", "side": "RIGHT", "body": "First inline comment\n#| Literal text"},
+            {"path": FILE, "line": 3, "side": "RIGHT", "body": "Second inline comment"},
+        ])
+    } else {
+        json!([])
+    };
+    let payload =
+        json!({"event": event, "commit_id": fixture.head, "body": SUMMARY, "comments": comments});
+    assert_eq!(posts[0]["payload"], payload);
+    let at_post = &posts[0]["drafts_at_post"][0];
+    assert_eq!(at_post["attempt"]["payload"], payload);
+    assert!(at_post["submitted"].is_null());
+    assert_eq!(
+        posts[0]["sessions_at_post"][session.directory.to_str().unwrap()],
+        json!({"head": true, "base": true, "cleanup.json": false})
+    );
+    let receipt = cleanup_assert_receipt(&fixture.draft_path()?, at_post, state)?;
+    session.assert_cleaned(&receipt)?;
+    assert_eq!(fixture.editors()?.len(), 1);
+    if commented {
+        assert_review_template(&fixture.editors()?[0], &at_post["comments"]);
+    } else {
+        assert_eq!(fixture.editors()?[0]["initial"], "");
+    }
+    assert!(archives(session.directory.parent().unwrap())?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn review_flow_menu_submit_choices_and_submit_comment_use_editor_payload_receipt_and_cleanup()
+-> Result<()> {
+    for commented in [false, true] {
+        for (action, input, event, state) in [
+            ("finish", "2\nignored stdin", "COMMENT", "COMMENTED"),
+            ("finish", "3\nignored stdin", "APPROVE", "APPROVED"),
+            (
+                "finish",
+                "4\nignored stdin",
+                "REQUEST_CHANGES",
+                "CHANGES_REQUESTED",
+            ),
+            ("submit-comment", "ignored stdin", "COMMENT", "COMMENTED"),
+        ] {
+            let fixture = Fixture::review()?;
+            let session = CleanupSession::capture(&fixture.active_directory()?)?;
+            if commented {
+                fixture.comment(1, "one\ntwo\n", "First inline comment\n#| Literal text")?;
+                fixture.comment(3, "three", "Second inline comment")?;
+            }
+            fixture.configure("editor_mode", json!("prepend"))?;
+            fixture.configure(
+                "editor_body",
+                json!(format!(
+                    "{SUMMARY}\n  #| This reference is not the summary\n"
+                )),
+            )?;
+            fixture.configure("observe_sessions", json!([session.directory]))?;
+            let checkout = ReviewFlowCheckout::capture(&fixture)?;
+            let active = fs::read(fixture.state.join("active.json"))?;
+            success(&fixture.execute(
+                review_flow_command(&fixture, &session.directory, "head", &[action]),
+                input,
+            )?);
+            review_flow_assert_submission(&fixture, &session, event, state, commented)?;
+            assert_eq!(fs::read(fixture.state.join("active.json"))?, active);
+            checkout.assert_kept(&fixture)?;
+            assert_review_guard_refusal(
+                &fixture,
+                review_flow_command(&fixture, &session.directory, "head", &["submit-comment"]),
+            )?;
+            assert_eq!(fixture.posts()?.len(), 1);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn review_flow_comment_submission_accepts_base_context_without_a_selection() -> Result<()> {
+    for (action, input) in [("finish", "2\n"), ("submit-comment", "")] {
+        let (fixture, directory) = navigation_session()?;
+        let session = CleanupSession::capture(&directory)?;
+        let before = fixture.draft()?;
+        success(&fixture.execute(
+            review_flow_command(&fixture, &directory, "base", &[action]),
+            input,
+        )?);
+        let receipt = cleanup_assert_receipt(&fixture.draft_path()?, &before, "COMMENTED")?;
+        session.assert_cleaned(&receipt)?;
+        assert_eq!(fixture.posts()?.len(), 1);
+        assert_eq!(fixture.posts()?[0]["payload"]["event"], "COMMENT");
+        assert_eq!(fixture.posts()?[0]["payload"]["comments"][0]["path"], FILE);
+        assert_eq!(fixture.editors()?.len(), 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn review_flow_blank_summary_or_editor_failure_keeps_draft_and_snapshots() -> Result<()> {
+    for commented in [false, true] {
+        let fixture = Fixture::review()?;
+        let session = CleanupSession::capture(&fixture.active_directory()?)?;
+        if commented {
+            fixture.comment(1, "one", "Do not abandon this inline comment")?;
+        }
+        for (mode, body) in [
+            ("write", " \n\t"),
+            ("unchanged", "Not written"),
+            ("fail", SUMMARY),
+        ] {
+            fixture.configure("editor_mode", json!(mode))?;
+            fixture.configure("editor_body", json!(body))?;
+            for (action, input) in [
+                ("finish", "2\n"),
+                ("finish", "3\n"),
+                ("finish", "4\n"),
+                ("submit-comment", ""),
+            ] {
+                let before = NavigationCheckpoint::capture(&fixture)?;
+                let archived = archives(session.directory.parent().unwrap())?;
+                let editors = fixture.editors()?.len();
+                let output = fixture.execute(
+                    review_flow_command(&fixture, &session.directory, "head", &[action]),
+                    input,
+                )?;
+                if mode == "fail" {
+                    failure(&output);
+                } else {
+                    success(&output);
+                }
+                assert_eq!(fixture.editors()?.len(), editors + 1);
+                let after = NavigationCheckpoint::capture(&fixture)?;
+                assert_eq!(after.head, before.head);
+                assert_eq!(after.active, before.active);
+                assert_eq!(after.drafts, before.drafts);
+                assert_eq!(archives(session.directory.parent().unwrap())?, archived);
+                session.assert_kept()?;
+                assert!(fixture.posts()?.is_empty());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn review_flow_comment_submission_still_requires_current_checkout_and_remote_revision() -> Result<()>
+{
+    for drift in ["checkout", "remote"] {
+        let fixture = Fixture::review()?;
+        fixture.comment(1, "one", "Keep the stale review")?;
+        let directory = fixture.active_directory()?;
+        if drift == "checkout" {
+            fixture.nonempty_child("Leave the reviewed checkout")?;
+        } else {
+            fixture.configure("head", json!(fixture.base))?;
+        }
+        let before = cleanup_contents(&fixture.state)?;
+        let checkout = ReviewFlowCheckout::capture(&fixture)?;
+        for (action, input) in [
+            ("finish", "2\n"),
+            ("finish", "3\n"),
+            ("finish", "4\n"),
+            ("submit-comment", ""),
+        ] {
+            failure(&fixture.execute(
+                review_flow_command(&fixture, &directory, "head", &[action]),
+                input,
+            )?);
+            assert_eq!(cleanup_contents(&fixture.state)?, before);
+            assert!(fixture.posts()?.is_empty());
+            assert!(fixture.editors()?.is_empty());
+        }
+        checkout.assert_kept(&fixture)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn review_flow_comment_lost_response_and_delayed_acceptance_recover_without_reposting() -> Result<()>
+{
+    for (mode, action, input) in [
+        ("lost_response", "finish", "2\n"),
+        ("delayed_acceptance", "submit-comment", ""),
+    ] {
+        let fixture = Fixture::review()?;
+        fixture.comment(1, "one\ntwo\n", "Recover this exact inline comment")?;
+        let session = CleanupSession::capture(&fixture.active_directory()?)?;
+        fixture.configure("post", json!(mode))?;
+        failure(&fixture.execute(
+            review_flow_command(&fixture, &session.directory, "head", &[action]),
+            input,
+        )?);
+        let uncertain = fixture.draft()?;
+        assert_eq!(uncertain["attempt"]["payload"]["event"], "COMMENT");
+        assert!(uncertain["submitted"].is_null());
+        session.assert_kept()?;
+        failure(&fixture.run(&["submit-comment"], "")?);
+        assert_eq!(fixture.draft()?, uncertain);
+        if mode == "delayed_acceptance" {
+            success(&fixture.saved(&["recover", "--retry"], "yes\n")?);
+            assert_eq!(
+                fixture.draft()?["retry_history"],
+                json!([uncertain["attempt"]])
+            );
+            fixture.accept_delayed_review()?;
+        }
+        let before = fixture.draft()?;
+        fixture.nonempty_child("Recovery away from the reviewed checkout")?;
+        fixture.configure("deny_discovery", json!(true))?;
+        success(&fixture.saved(&["recover"], "")?);
+        let receipt = cleanup_assert_receipt(&fixture.draft_path()?, &before, "COMMENTED")?;
+        session.assert_cleaned(&receipt)?;
+        assert_eq!(fixture.posts()?.len(), 1);
+        assert_eq!(fixture.editors()?.len(), 1);
+        success(&fixture.saved(&["recover"], "")?);
+        assert_eq!(fixture.posts()?.len(), 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn review_flow_own_pr_allows_comment_but_not_approve_or_request_changes() -> Result<()> {
+    for (action, input) in [("finish", "2\n"), ("submit-comment", "")] {
+        let fixture = Fixture::review()?;
+        fixture.configure("author", json!("ReViEwEr"))?;
+        fixture.comment(1, "one", "Author's own comment")?;
+        let directory = fixture.active_directory()?;
+        let before = cleanup_contents(&fixture.state)?;
+        for (refused, choice) in [
+            ("finish", "3\n"),
+            ("finish", "4\n"),
+            ("approve", ""),
+            ("request-changes", ""),
+        ] {
+            let output = fixture.execute(
+                review_flow_command(&fixture, &directory, "head", &[refused]),
+                choice,
+            )?;
+            failure(&output);
+            assert!(describe(&output).contains("your own PR"));
+            assert_eq!(cleanup_contents(&fixture.state)?, before);
+            assert!(fixture.posts()?.is_empty());
+            assert!(fixture.editors()?.is_empty());
+        }
+        success(&fixture.execute(
+            review_flow_command(&fixture, &directory, "head", &[action]),
+            input,
+        )?);
+        assert_eq!(fixture.posts()?.len(), 1);
+        assert_eq!(fixture.posts()?[0]["payload"]["event"], "COMMENT");
+        assert_eq!(fixture.draft()?["submitted"]["state"], "COMMENTED");
+    }
+    Ok(())
+}
+
+fn run_review_flow_terminal(scenario: &str) -> Result<()> {
+    let (fixture, directory) = navigation_session()?;
+    let session = CleanupSession::capture(&directory)?;
+    let before = NavigationCheckpoint::capture(&fixture)?;
+    let draft = fixture.draft()?;
+    let checkout = ReviewFlowCheckout::capture(&fixture)?;
+    navigation_clear_calls(&fixture)?;
+    let transcript = fixture.root.join("review-terminal-output.txt");
+    let output = File::create(&transcript)?;
+    let mut command = fixture.command("python3");
+    command
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/review_terminal.py"))
+        .arg(env!("CARGO_BIN_EXE_zed-pr-review"))
+        .arg(scenario)
+        .env("TERM", "xterm-256color")
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("ZED_FILE", directory.join("head").join(FILE))
+        .stdin(Stdio::null())
+        .stdout(output.try_clone()?)
+        .stderr(output);
+    let mut child = command
+        .spawn()
+        .context("Python 3 is required for review PTY tests")?;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let _ = Command::new("kill")
+        .args(["-KILL", &format!("-{}", child.id())])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let output = fs::read_to_string(transcript)?;
+    ensure!(
+        status.is_some(),
+        "Review PTY {scenario} exceeded 45 seconds:\n{output}"
+    );
+    ensure!(
+        status.unwrap().success(),
+        "Review PTY {scenario} failed:\n{output}"
+    );
+    for call in fixture.calls()? {
+        ensure!(
+            call.get("unexpected").is_none(),
+            "Offline gh rejected: {call}"
+        );
+    }
+    match scenario {
+        "1" => {
+            review_flow_assert_cancelled(&session)?;
+            assert_eq!(archives(directory.parent().unwrap())?, vec![draft]);
+            assert!(fixture.drafts()?.is_empty());
+            assert!(!fixture.state.join("active.json").exists());
+            assert!(fixture.calls()?.is_empty());
+            assert!(fixture.editors()?.is_empty());
+        }
+        "2" | "3" | "4" | "down-comment" | "up-request" => {
+            let (event, state) = match scenario {
+                "2" | "down-comment" => ("COMMENT", "COMMENTED"),
+                "3" => ("APPROVE", "APPROVED"),
+                _ => ("REQUEST_CHANGES", "CHANGES_REQUESTED"),
+            };
+            let receipt = cleanup_assert_receipt(&fixture.draft_path()?, &draft, state)?;
+            session.assert_cleaned(&receipt)?;
+            assert_eq!(fixture.posts()?.len(), 1);
+            assert_eq!(
+                fixture.posts()?[0]["payload"],
+                json!({
+                    "event": event, "body": SUMMARY, "commit_id": fixture.head,
+                    "comments": [{"path": FILE, "line": 1, "side": "RIGHT", "body": draft["comments"][0]["body"]}]
+                })
+            );
+            assert_eq!(fixture.editors()?.len(), 1);
+        }
+        "editor-sigint" | "editor-sigterm" | "editor-sighup" => {
+            before.assert_unchanged(&fixture)?;
+            session.assert_kept()?;
+            assert!(archives(directory.parent().unwrap())?.is_empty());
+            let calls = fixture.calls()?;
+            assert!(
+                !calls.is_empty(),
+                "The selected submission must reach discovery before the editor"
+            );
+            // A second local finish acquires both the workspace and draft locks.
+            // It must succeed after the killed CLI and paused editor are gone.
+            success(&fixture.execute(
+                review_flow_command(&fixture, &directory, "head", &["finish"]),
+                "q\n",
+            )?);
+            assert_eq!(fixture.calls()?, calls);
+            before.assert_unchanged(&fixture)?;
+            session.assert_kept()?;
+        }
+        _ => {
+            before.assert_unchanged(&fixture)?;
+            session.assert_kept()?;
+            assert!(fixture.calls()?.is_empty());
+        }
+    }
+    assert!(fixture.zed_calls()?.is_empty());
+    checkout.assert_kept(&fixture)?;
+    Ok(())
+}
+
+#[test]
+fn review_flow_terminal_editor_sigint_terminates_cli_without_losing_draft() -> Result<()> {
+    run_review_flow_terminal("editor-sigint")
+}
+
+#[test]
+fn review_flow_terminal_editor_sigterm_terminates_cli_without_losing_draft() -> Result<()> {
+    run_review_flow_terminal("editor-sigterm")
+}
+
+#[test]
+fn review_flow_terminal_editor_sighup_terminates_cli_without_losing_draft() -> Result<()> {
+    run_review_flow_terminal("editor-sighup")
+}
+
+#[test]
+fn review_flow_terminal_dismissals_restore_terminal_and_keep_draft() -> Result<()> {
+    for scenario in ["quit", "escape", "ctrl-c", "enter", "invalid"] {
+        run_review_flow_terminal(scenario)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn review_flow_terminal_numbered_choices_restore_terminal_before_action() -> Result<()> {
+    for scenario in ["1", "2", "3", "4"] {
+        run_review_flow_terminal(scenario)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn review_flow_terminal_arrows_and_enter_submit_the_selected_action() -> Result<()> {
+    for scenario in ["down-comment", "up-request"] {
+        run_review_flow_terminal(scenario)?;
     }
     Ok(())
 }

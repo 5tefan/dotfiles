@@ -3,13 +3,14 @@
 //! Git, jj, GraphQL, checkout, commit ancestry, or mutation commands are permitted.
 
 use anyhow::{Context, Result, ensure};
+use ratatui::style::Modifier;
 use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use zed_pr_review::github::Client;
 use zed_pr_review::model::PullRequest;
-use zed_pr_review::stack::Stack;
+use zed_pr_review::stack::{RenderedStack, Stack};
 
 const REPO: &str = "acme/widgets";
 const HOST: &str = "github.com";
@@ -119,7 +120,77 @@ fn run(plan: Value) -> Result<Value> {
 fn success(plan: Value) -> Result<Value> {
     let result = run(plan)?;
     ensure!(result.get("error").is_none(), "Unexpected error: {result}");
+    let plain = result["render"].as_str().unwrap();
+    let lines = rendered_lines(&result);
+    assert_eq!(plain, format!("{}\n", lines.join("\n")));
+    assert!(!plain.contains('\x1b'));
+    let colored = result["colored"].as_str().unwrap();
+    assert_eq!(without_sgr(colored), plain);
+    assert!(colored.ends_with("\x1b[0m\n"));
+    let current_row = result["current_row"].as_u64().unwrap() as usize;
+    assert!(lines[current_row].contains(&format!("@ #{} ", result["current"])));
+    assert_eq!(
+        result["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|line| {
+                let spans = line["spans"].as_array().unwrap();
+                spans.len() >= 8 && spans[1]["text"] == "@"
+            })
+            .count(),
+        1
+    );
     Ok(result)
+}
+
+fn rendered_lines(result: &Value) -> Vec<&str> {
+    result["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line["text"].as_str().unwrap())
+        .collect()
+}
+
+// Accept only SGR escapes, so a matching plain rendering cannot hide an OSC
+// hyperlink, cursor movement, or another terminal command in colored output.
+fn without_sgr(colored: &str) -> String {
+    let mut plain = String::new();
+    let mut chars = colored.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            plain.push(c);
+            continue;
+        }
+        assert_eq!(chars.next(), Some('['));
+        loop {
+            let code = chars.next().expect("unterminated SGR");
+            if code == 'm' {
+                break;
+            }
+            assert!(code.is_ascii_digit() || code == ';', "non-SGR escape");
+        }
+    }
+    plain
+}
+
+fn graph(result: &Value) -> Vec<String> {
+    rendered_lines(result)
+        .into_iter()
+        .filter_map(|line| {
+            if let Some((prefix, metadata)) = line.split_once(" #") {
+                Some(format!(
+                    "{prefix} #{}",
+                    metadata.split_whitespace().next().unwrap()
+                ))
+            } else if line.ends_with('╯') {
+                Some(line.to_owned())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn rejected(plan: Value, message: &str) -> Result<()> {
@@ -156,8 +227,31 @@ fn stack_child() -> Result<()> {
             let refreshed = client.read_pr(number)?;
             stack.verify_adjacent(&client, &refreshed)?;
         }
+        let rendered: RenderedStack = stack.render_log();
+        let lines: Vec<_> = rendered
+            .lines
+            .iter()
+            .map(|line| {
+                let spans: Vec<_> = line
+                    .spans
+                    .iter()
+                    .map(|span| {
+                        let style = line.style.patch(span.style);
+                        json!({
+                            "text": span.content,
+                            "fg": style.fg.map(|color| format!("{color:?}")),
+                            "bold": style.add_modifier.contains(Modifier::BOLD),
+                            "dim": style.add_modifier.contains(Modifier::DIM),
+                        })
+                    })
+                    .collect();
+                json!({"text": line.to_string(), "spans": spans})
+            })
+            .collect();
         Ok(json!({
-            "render": stack.render(), "current": stack.current().pr.number,
+            "render": stack.render(), "colored": stack.render_colored(),
+            "lines": lines, "current_row": rendered.current_row,
+            "current": stack.current().pr.number,
             "parent": stack.parent()?.map(|entry| entry.pr.number),
             "children": stack.children().iter().map(|entry| entry.pr.number).collect::<Vec<_>>()
         }))
@@ -183,12 +277,24 @@ fn linear_stack_uses_branches_not_numbers_titles_or_commit_counts() -> Result<()
     assert_eq!(result["parent"], 90);
     assert_eq!(result["children"], json!([3]));
     let text = result["render"].as_str().unwrap();
-    assert!(text.find("#90 ").unwrap() < text.find("#7 ").unwrap());
-    assert!(text.find("#7 ").unwrap() < text.find("#3 ").unwrap());
-    assert!(text.contains("  * #7 Change 7 [open; draft] (current)"));
-    assert!(text.contains("    - #3"));
-    assert!(text.contains("acme/widgets:unrelated-name -> acme/widgets:arbitrary-foundation"));
-    assert!(text.contains("https://github.com/acme/widgets/pull/7"));
+    assert_eq!(
+        text,
+        concat!(
+            "○ #3 another-name [ready]\n",
+            "│ Change 3\n",
+            "│ https://github.com/acme/widgets/pull/3\n",
+            "@ #7 unrelated-name [draft] (current)\n",
+            "│ Change 7\n",
+            "│ https://github.com/acme/widgets/pull/7\n",
+            "○ #90 arbitrary-foundation [ready]\n",
+            "│ Change 90\n",
+            "│ https://github.com/acme/widgets/pull/90\n",
+            "◆ main (base)\n",
+        )
+    );
+    assert_eq!(result["current_row"], 3);
+    assert!(!text.contains(" -> "));
+    assert!(!text.contains("acme/widgets:"));
     Ok(())
 }
 
@@ -202,10 +308,249 @@ fn branch_points_return_every_child_and_include_the_connected_tree() -> Result<(
     let result = success(plan(&bottom, vec![all.clone()], all.clone()))?;
     assert_eq!(result["parent"], Value::Null);
     assert_eq!(result["children"], json!([2, 4]));
+    assert_eq!(graph(&result), ["○ #2", "│ ○ #8", "│ ○ #4", "├─╯", "@ #1"]);
+    assert_eq!(result["current_row"], 10);
     let result = success(plan(&left, vec![all.clone()], all))?;
     assert_eq!(result["parent"], 1);
     assert_eq!(result["children"], json!([8]));
-    assert!(result["render"].as_str().unwrap().contains("#2 "));
+    assert_eq!(graph(&result), ["○ #2", "│ ○ #8", "│ @ #4", "├─╯", "○ #1"]);
+    assert_eq!(result["current_row"], 6);
+    let lines = rendered_lines(&result);
+    assert_eq!(lines[4], "│ │ Change 8");
+    assert_eq!(lines[7], "│ │ Change 4");
+    assert_eq!(lines[9], "├─╯");
+    assert_eq!(lines.last(), Some(&"◆ main (base)"));
+    Ok(())
+}
+
+#[test]
+fn nested_forks_keep_edges_separate_and_ignore_page_order() -> Result<()> {
+    let all = vec![
+        pr(1, "one", "main", 10, 1),
+        pr(2, "two", "one", 20, 10),
+        pr(3, "three", "one", 30, 10),
+        pr(4, "four", "one", 40, 10),
+        pr(5, "five", "two", 50, 20),
+        pr(6, "six", "two", 60, 20),
+        pr(7, "seven", "three", 70, 30),
+        pr(8, "eight", "three", 80, 30),
+        pr(9, "nine", "six", 90, 60),
+        pr(10, "ten", "six", 100, 60),
+    ];
+    let current = &all[5];
+    let result = success(plan(current, vec![all.clone()], all.clone()))?;
+    assert_eq!(
+        graph(&result),
+        [
+            "○ #5",
+            "│ ○ #9",
+            "│ │ ○ #10",
+            "│ ├─╯",
+            "│ @ #6",
+            "├─╯",
+            "○ #2",
+            "│ ○ #7",
+            "│ │ ○ #8",
+            "│ ├─╯",
+            "│ ○ #3",
+            "├─╯",
+            "│ ○ #4",
+            "├─╯",
+            "○ #1",
+        ]
+    );
+    assert_eq!(result["current_row"], 10);
+    let lines = rendered_lines(&result);
+    assert_eq!(lines[7], "│ │ │ Change 10");
+    assert_eq!(lines[11], "│ │ Change 6");
+    assert_eq!(lines[15], "│ Change 2");
+    let mut shuffled = all.clone();
+    shuffled.reverse();
+    shuffled.rotate_left(3);
+    let reordered = success(plan(
+        current,
+        vec![shuffled[..4].to_vec(), vec![], shuffled[4..].to_vec()],
+        all.clone(),
+    ))?;
+    for key in ["render", "colored", "lines", "current_row"] {
+        assert_eq!(result[key], reordered[key], "page order changed {key}");
+    }
+    Ok(())
+}
+
+#[test]
+fn wide_forks_reuse_lanes_after_each_join() -> Result<()> {
+    let root = pr(100, "root", "main", 1000, 1);
+    let mut all = vec![root.clone()];
+    all.extend((1..=8).map(|n| pr(n, &format!("side-{n}"), "root", n + 10, 1000)));
+    let result = success(plan(&root, vec![all.clone()], all))?;
+    let mut expected = vec!["○ #1".to_owned()];
+    for number in 2..=8 {
+        expected.push(format!("│ ○ #{number}"));
+        expected.push("├─╯".to_owned());
+    }
+    expected.push("@ #100".to_owned());
+    assert_eq!(graph(&result), expected);
+    assert_eq!(result["current_row"], 31);
+    assert!(
+        rendered_lines(&result)
+            .iter()
+            .all(|line| !line.starts_with("│ │ │"))
+    );
+    Ok(())
+}
+
+#[test]
+fn deep_linear_stacks_never_increase_the_graph_indent() -> Result<()> {
+    let depth = 128;
+    let all: Vec<_> = (1..=depth)
+        .map(|n| {
+            let base = if n == 1 {
+                "main".into()
+            } else {
+                format!("topic-{}", n - 1)
+            };
+            pr(n, &format!("topic-{n}"), &base, n + 1, n)
+        })
+        .collect();
+    let current_number = depth / 2;
+    let result = success(plan(
+        &all[current_number as usize - 1],
+        vec![all.clone()],
+        all.clone(),
+    ))?;
+    let lines = rendered_lines(&result);
+    assert_eq!(lines.len(), 3 * depth as usize + 1);
+    for (index, number) in (1..=depth).rev().enumerate() {
+        let row = index * 3;
+        let marker = if number == current_number { '@' } else { '○' };
+        assert!(lines[row].starts_with(&format!("{marker} #{number} ")));
+        assert_eq!(lines[row + 1], format!("│ Change {number}"));
+        assert_eq!(
+            lines[row + 2],
+            format!("│ https://{HOST}/{REPO}/pull/{number}")
+        );
+    }
+    assert_eq!(result["current_row"], 3 * (depth - current_number));
+    assert_eq!(lines.last(), Some(&"◆ main (base)"));
+    Ok(())
+}
+
+#[test]
+fn current_row_tracks_root_middle_tip_and_single_pr() -> Result<()> {
+    let all = vec![
+        pr(9, "bottom", "main", 10, 1),
+        pr(2, "middle", "bottom", 20, 10),
+        pr(5, "tip", "middle", 30, 20),
+    ];
+    for (index, current) in all.iter().enumerate() {
+        let result = success(plan(current, vec![all.clone()], all.clone()))?;
+        assert_eq!(result["current_row"], 3 * (2 - index));
+        let expected: Vec<_> = [5, 2, 9]
+            .into_iter()
+            .map(|number| {
+                let marker = if current["number"] == number {
+                    '@'
+                } else {
+                    '○'
+                };
+                format!("{marker} #{number}")
+            })
+            .collect();
+        assert_eq!(graph(&result), expected);
+    }
+    let mut single = pr(42, "only", "trunk", 10, 1);
+    // Text that resembles a marker must not determine the current row.
+    single["title"] = "Discuss @ #42 and ○ #5".into();
+    let result = success(plan(
+        &single,
+        vec![vec![single.clone()]],
+        vec![single.clone()],
+    ))?;
+    assert_eq!(result["current_row"], 0);
+    assert_eq!(rendered_lines(&result).len(), 4);
+    assert_eq!(rendered_lines(&result)[3], "◆ trunk (base)");
+    Ok(())
+}
+
+fn span_with_text<'a>(result: &'a Value, text: &str) -> &'a Value {
+    result["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|line| line["spans"].as_array().unwrap())
+        .find(|span| span["text"] == text)
+        .unwrap_or_else(|| panic!("missing span {text:?}"))
+}
+
+#[test]
+fn semantic_colors_match_ansi_and_do_not_leak_into_plain_text() -> Result<()> {
+    let root = pr(10, "foundation", "main", 10, 1);
+    let mut current = pr(20, "next", "foundation", 20, 10);
+    current["draft"] = true.into();
+    let sibling = pr(30, "side", "foundation", 30, 10);
+    let all = vec![root, current.clone(), sibling];
+    let result = success(plan(&current, vec![all.clone()], all))?;
+    for (text, color) in [
+        ("#20", "Magenta"),
+        ("#10", "Magenta"),
+        ("next", "Cyan"),
+        ("foundation", "Cyan"),
+        ("main", "Cyan"),
+        ("[draft]", "Yellow"),
+        ("[ready]", "Green"),
+        ("@", "Green"),
+        (" (current)", "Green"),
+    ] {
+        assert_eq!(span_with_text(&result, text)["fg"], color, "{text}");
+    }
+    for text in ["@", " (current)"] {
+        assert_eq!(span_with_text(&result, text)["bold"], true);
+        assert_eq!(span_with_text(&result, text)["dim"], false);
+    }
+    for text in [
+        "○",
+        "│ ",
+        "│ │ ",
+        "├─╯",
+        "https://github.com/acme/widgets/pull/20",
+    ] {
+        assert_eq!(span_with_text(&result, text)["dim"], true, "{text}");
+    }
+    let title = span_with_text(&result, "Change 20");
+    assert_eq!(title["fg"], Value::Null);
+    assert_eq!(title["bold"], false);
+    assert_eq!(title["dim"], false);
+    let ansi = result["colored"].as_str().unwrap();
+    for fragment in [
+        "\x1b[0;35m#20",
+        "\x1b[0;36mnext",
+        "\x1b[0;33m[draft]",
+        "\x1b[0;32m[ready]",
+        "\x1b[0;1;32m@",
+        "\x1b[0;2m├─╯",
+        "\x1b[0;2mhttps://github.com/acme/widgets/pull/20",
+        "\x1b[0mChange 20",
+    ] {
+        assert!(
+            ansi.contains(fragment),
+            "missing ANSI fragment {fragment:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn same_named_heads_in_different_repositories_stay_distinct() -> Result<()> {
+    let root = pr(1, "topic", "main", 10, 1);
+    let mut fork = pr(2, "topic", "topic", 20, 10);
+    fork["head"]["repo"]["full_name"] = "contributor/widgets".into();
+    let all = vec![root.clone(), fork];
+    let result = success(plan(&root, vec![all.clone()], all))?;
+    let lines = rendered_lines(&result);
+    assert_eq!(lines[0], "○ #2 contributor/widgets:topic [ready]");
+    assert_eq!(lines[3], "@ #1 topic [ready] (current)");
+    assert_eq!(lines[6], "◆ acme/widgets:main (base)");
     Ok(())
 }
 
@@ -245,6 +590,11 @@ fn fork_and_branch_identity_are_exact() -> Result<()> {
     let all = vec![parent, fork_child.clone(), fork];
     let result = success(plan(&fork_child, vec![all.clone()], all[..2].to_vec()))?;
     assert_eq!(result["parent"], 3);
+    let text = result["render"].as_str().unwrap();
+    assert!(text.contains("@ #2 contributor/widgets:next [ready] (current)"));
+    assert!(text.contains("○ #3 topic [ready]"));
+    assert!(text.ends_with("◆ acme/widgets:main (base)\n"));
+    assert!(!text.contains(" -> "));
     for (field, value) in [
         ("ref", json!("Topic")),
         ("repo", json!({"full_name": "Acme/widgets"})),
@@ -567,8 +917,14 @@ fn selected_neighbor_is_revalidated_after_prompting() -> Result<()> {
 
 #[test]
 fn displayed_metadata_cannot_emit_terminal_controls() -> Result<()> {
-    let mut current = pr(1, "topic", "main", 10, 1);
-    current["title"] = "Hello\u{1b}[2J\nforged\r\t\u{7}\u{9b}31m\u{202e}bad".into();
+    let mut current = pr(1, "topic\u{202e}evil", "main\u{2066}spoof", 10, 1);
+    current["title"] = concat!(
+        "Hello\u{1b}[2J\nforged\r\t\u{7}\u{9b}31m\u{202e}bad",
+        "\u{1b}]8;;https://evil.example\u{7}link\u{1b}]8;;\u{7}",
+        "\u{061c}\u{200e}\u{200f}\u{2028}\u{2029}\u{202a}\u{202b}\u{202c}\u{202d}",
+        "\u{2066}\u{2067}\u{2068}\u{2069} café 日本語 🦀",
+    )
+    .into();
     let result = success(plan(
         &current,
         vec![vec![current.clone()]],
@@ -576,10 +932,19 @@ fn displayed_metadata_cannot_emit_terminal_controls() -> Result<()> {
     ))?;
     let text = result["render"].as_str().unwrap();
     assert!(
-        !text
-            .chars()
-            .any(|c| (c.is_control() && c != '\n') || c == '\u{202e}')
+        !text.chars().any(|c| {
+            (c.is_control() && c != '\n')
+                || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
     );
     assert!(text.contains("Hello\\u{1b}[2J\\nforged\\r\\t\\u{7}\\u{9b}31m\\u{202e}bad"));
+    assert!(text.contains("topic\\u{202e}evil"));
+    assert!(text.contains("◆ main\\u{2066}spoof (base)"));
+    assert!(text.contains("\\u{1b}]8;;https://evil.example\\u{7}link"));
+    assert!(text.contains("café 日本語 🦀"));
+    assert_eq!(rendered_lines(&result).len(), 4);
+    for line in result["lines"].as_array().unwrap() {
+        assert!(!line["text"].as_str().unwrap().chars().any(char::is_control));
+    }
     Ok(())
 }

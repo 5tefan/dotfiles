@@ -27,9 +27,10 @@
   {
     "context": "Editor",
     "bindings": {
-      "ctrl-shift-c": ["task::Spawn", { "task_name": "PR: add comment" }],
-      "ctrl-shift-a": ["task::Spawn", { "task_name": "PR: approve" }],
-      "ctrl-shift-q": ["task::Spawn", { "task_name": "PR: request changes" }],
+      "ctrl-shift-x": [
+        "task::Spawn",
+        { "task_name": "PR: finish review", "reveal_target": "center" },
+      ],
     },
   },
   {

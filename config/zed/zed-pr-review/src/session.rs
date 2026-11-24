@@ -17,6 +17,7 @@ use std::process::Command;
 const VERSION: u32 = 1;
 const STATE_PATH: &str = "scratch/zed-pr-review";
 const CLEANUP_FILE: &str = "cleanup.json";
+const CANCELLED_FILE: &str = "cancelled.json";
 
 #[derive(Debug)]
 pub struct Session {
@@ -27,6 +28,7 @@ pub struct Session {
     manifest: Manifest,
     manifest_sha256: String,
     cleanup: Option<Cleanup>,
+    cancelled: Option<Cancelled>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -80,6 +82,20 @@ struct Cleanup {
     review_id: u64,
     review_state: String,
     review_url: String,
+}
+
+// Unlike Cleanup, this marker records only a local decision. Its draft digest
+// permits retries to reuse the archive published before any cancellation marker.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Cancelled {
+    version: u32,
+    manifest_sha256: String,
+    draft_sha256: String,
+    // Manifest hashes include the immutable session directory, so reopening the
+    // same PR revision cannot join an earlier cancellation by accident.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sessions: Option<BTreeSet<String>>,
 }
 
 impl Session {
@@ -209,9 +225,18 @@ impl Session {
             current.manifest_sha256 == self.manifest_sha256,
             "Session manifest changed; prepare a new diff instead of reusing these snapshots"
         );
+        current.require_not_cancelled()?;
         ensure!(
             current.cleanup.is_none(),
             "Review snapshots were cleaned after submission; reopen the PR to prepare a new diff"
+        );
+        Ok(())
+    }
+
+    fn require_not_cancelled(&self) -> Result<()> {
+        ensure!(
+            self.cancelled.is_none(),
+            "This local review was cancelled; reopen the PR for a new review, or use cancel to retry local cleanup"
         );
         Ok(())
     }
@@ -220,7 +245,7 @@ impl Session {
 /// Return None only for a file outside the review state. Files in review state
 /// must belong to exactly one immutable session and be registered on its RHS.
 pub fn load_for_file(root: &Path, state_base: &Path, file: &Path) -> Result<Option<Session>> {
-    load_for_snapshot(root, state_base, file, false)
+    load_for_snapshot(root, state_base, file, false, false)
 }
 
 /// Load immutable context from either side, including removed snapshots after
@@ -228,7 +253,87 @@ pub fn load_for_file(root: &Path, state_base: &Path, file: &Path) -> Result<Opti
 /// RHS-only. The caller must still check the current PR revision and require jj @
 /// to be its pinned head or an unchanged single-parent child.
 pub fn load_for_navigation(root: &Path, state_base: &Path, file: &Path) -> Result<Option<Session>> {
-    load_for_snapshot(root, state_base, file, true)
+    load_for_snapshot(root, state_base, file, true, false)
+}
+
+/// Load only the exact registered head/base context, even after cancellation
+/// removed its snapshots. This does not authorize comments, submission, or
+/// navigation: those paths must use the ordinary loaders and Session::validate.
+/// Recheck under workspace and Store locks before calling cancel_review: a
+/// cancelled tab may retry only while its original session set and draft remain.
+pub fn load_for_cancel(root: &Path, state_base: &Path, file: &Path) -> Result<Option<Session>> {
+    let Some(session) = load_for_snapshot(root, state_base, file, true, true)? else {
+        return Ok(None);
+    };
+    let store = session.directory.parent().context("Session has no store")?;
+    let sessions = load_store_sessions(&session.root, state_base, store)?;
+    if let Some(marker) = &session.cancelled {
+        check_cancellation_context(&session.root, store, marker, &sessions)?;
+    } else {
+        // A crash can leave some of the original sessions unmarked. They may
+        // retry that cancellation, but must not expand it to a fresh session.
+        for marker in sessions
+            .iter()
+            .filter_map(|session| session.cancelled.as_ref())
+        {
+            if marker
+                .sessions
+                .as_ref()
+                .is_some_and(|set| set.contains(&session.manifest_sha256))
+            {
+                check_cancellation_context(&session.root, store, marker, &sessions)?;
+            }
+        }
+    }
+    Ok(Some(session))
+}
+
+fn check_cancellation_context(
+    root: &Path,
+    store: &Path,
+    marker: &Cancelled,
+    sessions: &[Session],
+) -> Result<()> {
+    let original_sessions = match &marker.sessions {
+        Some(original) => *original == session_hashes(sessions),
+        // Older markers lack an exact scope. Never infer that an unmarked
+        // session belongs to their interrupted cancellation.
+        None => sessions.iter().all(|session| session.cancelled.is_some()),
+    };
+    ensure!(
+        original_sessions,
+        "This tab belongs to an earlier cancelled review; its session set changed. Use the current review tab instead; no local state was changed"
+    );
+    let path = store.join("draft.json");
+    if exists_without_following(&path)? {
+        check_path(root, &path, false)?;
+        let draft: Draft =
+            serde_json::from_slice(&fs::read(&path)?).context("Invalid persisted draft")?;
+        ensure!(
+            digest(&serde_json::to_vec(&draft)?) == marker.draft_sha256,
+            "The draft changed after this review was cancelled; this old tab cannot abandon it. Use the current review tab instead"
+        );
+    }
+    Ok(())
+}
+
+fn load_store_sessions(root: &Path, state_base: &Path, store: &Path) -> Result<Vec<Session>> {
+    check_path(root, store, true)?;
+    let mut sessions = Vec::new();
+    for entry in fs::read_dir(store)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with("diff-") {
+            sessions.push(load_directory(root, state_base, &entry.path())?);
+        }
+    }
+    Ok(sessions)
+}
+
+fn session_hashes(sessions: &[Session]) -> BTreeSet<String> {
+    sessions
+        .iter()
+        .map(|session| session.manifest_sha256.clone())
+        .collect()
 }
 
 fn load_for_snapshot(
@@ -236,6 +341,7 @@ fn load_for_snapshot(
     state_base: &Path,
     file: &Path,
     allow_base: bool,
+    allow_cancelled: bool,
 ) -> Result<Option<Session>> {
     let root = workspace_root(root)?;
     check_state_base(&root, state_base)?;
@@ -283,15 +389,28 @@ fn load_for_snapshot(
         }),
         "Selected file is not an exact registered diff snapshot"
     );
+    if !allow_cancelled {
+        session.require_not_cancelled()?;
+    }
     if !allow_base {
         session.selection_path(file)?;
-    } else if session.cleanup.is_none() {
+    } else if session.cleanup.is_none() && session.cancelled.is_none() {
         check_path(&root, file, false)?;
     }
     Ok(Some(session))
 }
 
 pub fn load_active(root: &Path, state_base: &Path) -> Result<Option<Session>> {
+    let session = load_active_for_cleanup(root, state_base)?;
+    if let Some(session) = &session {
+        session.require_not_cancelled()?;
+    }
+    Ok(session)
+}
+
+// Cancellation must inspect a pointer left by an interrupted cancellation, but
+// public callers must never navigate from that pointer to another review.
+fn load_active_for_cleanup(root: &Path, state_base: &Path) -> Result<Option<Session>> {
     let root = workspace_root(root)?;
     check_state_base(&root, state_base)?;
     let path = state_base.join("active.json");
@@ -316,6 +435,119 @@ pub fn load_active(root: &Path, state_base: &Path) -> Result<Option<Session>> {
         "Active session manifest changed; prepare a new diff"
     );
     Ok(Some(session))
+}
+
+/// Archive and clear a local draft, then remove only validated head/base
+/// snapshots for this PR and reviewer. The caller must hold workspace and Store
+/// locks and obtain confirmation. No GitHub, Git, or jj operation is performed.
+/// Returns the number of sessions marked or cleaned; completed retries return 0.
+/// An absent draft is allowed for reviews without comments and interrupted
+/// cancellation. Uncertain or submitted drafts must use recovery, not cancellation.
+/// For an action from a selected tab, the caller must recheck load_for_cancel
+/// under those locks; a Draft alone cannot distinguish old and current tabs.
+pub fn cancel_review(root: &Path, store: &Store, draft: &Draft) -> Result<usize> {
+    let root = workspace_root(root)?;
+    let state_base = root.join(STATE_PATH);
+    ensure!(
+        exact_path(&store.directory, &state_base.join(draft_key(&draft.pr))),
+        "Cancellation requires the exact local store for this PR and reviewer"
+    );
+    check_state_base(&root, &state_base)?;
+    check_path(&root, &store.directory, true)?;
+    check_cancellable(draft)?;
+    let draft_path = store.directory.join("draft.json");
+    if exists_without_following(&draft_path)? {
+        check_path(&root, &draft_path, false)?;
+    }
+    let saved = store.load()?;
+    if let Some(saved) = &saved {
+        check_cancellable(saved)?;
+        ensure!(
+            serde_json::to_value(saved)? == serde_json::to_value(draft)?,
+            "Persisted draft does not match the cancelled draft; all local state was kept"
+        );
+    }
+
+    // Resolve every candidate and the pointer before publishing markers,
+    // archiving, clearing the draft, or deleting even one snapshot.
+    let sessions = load_store_sessions(&root, &state_base, &store.directory)?;
+    let scope = session_hashes(&sessions);
+    let active = load_active_for_cleanup(&root, &state_base)?;
+    let remove_active = active.as_ref().is_some_and(|session| {
+        session
+            .directory
+            .parent()
+            .is_some_and(|parent| exact_path(parent, &store.directory))
+    });
+    let draft_sha256 = digest(&serde_json::to_vec(draft)?);
+    let unmarked = sessions.iter().any(|session| session.cancelled.is_none());
+    if (saved.is_some() || unmarked)
+        && !sessions.iter().any(|session| {
+            session
+                .cancelled
+                .as_ref()
+                .is_some_and(|marker| marker.draft_sha256 == draft_sha256)
+        })
+    {
+        store.archive(draft)?;
+        // Store::archive syncs the file; also persist its directory entry before
+        // publishing a marker that permits clearing the only working draft.
+        #[cfg(unix)]
+        File::open(&store.directory)?.sync_all()?;
+    }
+    // Publish all markers before clearing the draft. An interruption in this
+    // loop still has the saved draft, and a retry can recognize its archive.
+    let mut changed = BTreeSet::new();
+    for session in &sessions {
+        if session.cancelled.is_none() {
+            write_cancelled(session, store, &draft_sha256, &scope)?;
+            changed.insert(session.directory.clone());
+        }
+    }
+    store.clear()?;
+    for session in &sessions {
+        if remove_snapshots(session)? {
+            changed.insert(session.directory.clone());
+        }
+    }
+    if remove_active {
+        fs::remove_file(state_base.join("active.json"))?;
+        #[cfg(unix)]
+        File::open(&state_base)?.sync_all()?;
+    }
+    Ok(changed.len())
+}
+
+fn check_cancellable(draft: &Draft) -> Result<()> {
+    ensure!(draft.version == 1, "Unsupported draft version");
+    ensure!(
+        draft.attempt.is_none() && draft.retry_history.is_empty(),
+        "A submission may already have reached GitHub; run recover before cancelling this local review"
+    );
+    ensure!(
+        draft.submitted.is_none(),
+        "This draft was submitted; use recover and existing submitted cleanup to preserve its receipt, not cancel"
+    );
+    Ok(())
+}
+
+fn write_cancelled(
+    session: &Session,
+    store: &Store,
+    draft_sha256: &str,
+    sessions: &BTreeSet<String>,
+) -> Result<()> {
+    write_marker(
+        session,
+        store,
+        CANCELLED_FILE,
+        &Cancelled {
+            version: VERSION,
+            manifest_sha256: session.manifest_sha256.clone(),
+            draft_sha256: draft_sha256.to_owned(),
+            sessions: Some(sessions.clone()),
+        },
+    )
 }
 
 /// Remove only validated local snapshots after a successful, persisted review.
@@ -369,68 +601,74 @@ pub fn cleanup_submitted(root: &Path, store: &Store, draft: &Draft) -> Result<us
     for session in sessions {
         // The current persisted review authorizes cleanup for this PR/reviewer.
         // Keep earlier markers unchanged, even when resuming partial cleanup.
-        let mut changed = session.cleanup.is_none();
+        let mut changed = session.cleanup.is_none() && session.cancelled.is_none();
         if changed {
             write_cleanup(&session, store, receipt)?;
         }
-        let mut directories = BTreeSet::from([PathBuf::from("base"), PathBuf::from("head")]);
-        for snapshot in session
-            .manifest
-            .files
-            .iter()
-            .flat_map(|file| file.base.iter().chain(file.head.iter()))
-        {
-            let path = session.directory.join(&snapshot.path);
-            if exists_without_following(&path)? {
-                check_path(&root, &path, false)?;
-                fs::remove_file(&path)
-                    .with_context(|| format!("Cannot remove snapshot {}", path.display()))?;
-                #[cfg(unix)]
-                File::open(path.parent().context("Snapshot has no parent")?)?.sync_all()?;
-                changed = true;
-            }
-            let mut parent = Path::new(&snapshot.path).parent();
-            while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
-                directories.insert(path.to_path_buf());
-                parent = path.parent();
-            }
-        }
-        // Children sort after their parents. Remove only empty registered
-        // directories, never recursively and never the diff directory itself.
-        for relative in directories.iter().rev() {
-            let path = session.directory.join(relative);
-            if exists_without_following(&path)? {
-                check_path(&root, &path, true)?;
-                fs::remove_dir(&path).with_context(|| {
-                    format!("Cannot remove snapshot directory {}", path.display())
-                })?;
-                #[cfg(unix)]
-                File::open(path.parent().context("Snapshot directory has no parent")?)?
-                    .sync_all()?;
-                changed = true;
-            }
-        }
+        changed |= remove_snapshots(&session)?;
         cleaned += usize::from(changed);
     }
     Ok(cleaned)
+}
+
+// All sessions and any active pointer must be validated before calling this.
+// Missing files are authorized only by an existing cleanup/cancellation marker.
+fn remove_snapshots(session: &Session) -> Result<bool> {
+    let root = &session.root;
+    let mut changed = false;
+    let mut directories = BTreeSet::from([PathBuf::from("base"), PathBuf::from("head")]);
+    for snapshot in session
+        .manifest
+        .files
+        .iter()
+        .flat_map(|file| file.base.iter().chain(file.head.iter()))
+    {
+        let path = session.directory.join(&snapshot.path);
+        if exists_without_following(&path)? {
+            check_path(root, &path, false)?;
+            fs::remove_file(&path)
+                .with_context(|| format!("Cannot remove snapshot {}", path.display()))?;
+            #[cfg(unix)]
+            File::open(path.parent().context("Snapshot has no parent")?)?.sync_all()?;
+            changed = true;
+        }
+        let mut parent = Path::new(&snapshot.path).parent();
+        while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            directories.insert(path.to_path_buf());
+            parent = path.parent();
+        }
+    }
+    // Children sort after their parents. Remove only empty registered
+    // directories, never recursively and never the diff directory itself.
+    for relative in directories.iter().rev() {
+        let path = session.directory.join(relative);
+        if exists_without_following(&path)? {
+            check_path(root, &path, true)?;
+            fs::remove_dir(&path)
+                .with_context(|| format!("Cannot remove snapshot directory {}", path.display()))?;
+            #[cfg(unix)]
+            File::open(path.parent().context("Snapshot directory has no parent")?)?.sync_all()?;
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 fn check_receipt(id: u64, state: &str) -> Result<()> {
     // Recovery verifies the original accepted review even if GitHub has since
     // dismissed it. Cleanup still requires the matching receipt on disk.
     ensure!(
-        id > 0 && matches!(state, "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED"),
-        "Snapshot cleanup requires a valid approval, request-changes, or recovered dismissed receipt"
+        id > 0
+            && matches!(
+                state,
+                "COMMENTED" | "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED"
+            ),
+        "Snapshot cleanup requires a valid comment, approval, request-changes, or recovered dismissed receipt"
     );
     Ok(())
 }
 
 fn write_cleanup(session: &Session, store: &Store, receipt: &Receipt) -> Result<()> {
-    let path = session.directory.join(CLEANUP_FILE);
-    ensure!(
-        !exists_without_following(&path)?,
-        "Snapshot cleanup marker already exists; reload the session before cleanup"
-    );
     let cleanup = Cleanup {
         version: VERSION,
         manifest_sha256: session.manifest_sha256.clone(),
@@ -438,10 +676,24 @@ fn write_cleanup(session: &Session, store: &Store, receipt: &Receipt) -> Result<
         review_state: receipt.state.clone(),
         review_url: receipt.url.clone(),
     };
+    write_marker(session, store, CLEANUP_FILE, &cleanup)
+}
+
+fn write_marker(
+    session: &Session,
+    store: &Store,
+    name: &str,
+    marker: &impl Serialize,
+) -> Result<()> {
+    let path = session.directory.join(name);
+    ensure!(
+        !exists_without_following(&path)?,
+        "Snapshot cleanup/cancellation marker already exists; reload the session before cleanup"
+    );
     // A crash before publication must not leave an unregistered temporary file
     // inside the immutable session and prevent a later cleanup attempt.
     let mut temporary = tempfile::NamedTempFile::new_in(&store.directory)?;
-    serde_json::to_writer_pretty(&mut temporary, &cleanup)?;
+    serde_json::to_writer_pretty(&mut temporary, marker)?;
     temporary.write_all(b"\n")?;
     let mut permissions = temporary.as_file().metadata()?.permissions();
     permissions.set_readonly(true);
@@ -641,6 +893,35 @@ fn load_directory(root: &Path, state_base: &Path, directory: &Path) -> Result<Se
     } else {
         None
     };
+    let cancelled_path = directory.join(CANCELLED_FILE);
+    let cancelled = if exists_without_following(&cancelled_path)? {
+        check_path(root, &cancelled_path, false)?;
+        let cancelled: Cancelled = serde_json::from_slice(&fs::read(&cancelled_path)?)
+            .context("Invalid local review cancellation marker")?;
+        ensure!(
+            cancelled.version == VERSION,
+            "Unsupported cancellation marker version"
+        );
+        check_digest(&cancelled.manifest_sha256)?;
+        check_digest(&cancelled.draft_sha256)?;
+        if let Some(sessions) = &cancelled.sessions {
+            ensure!(
+                sessions.contains(&manifest_sha256),
+                "Cancellation scope does not contain its immutable session manifest"
+            );
+            for sha256 in sessions {
+                check_digest(sha256)?;
+            }
+        }
+        ensure!(
+            cancelled.manifest_sha256 == manifest_sha256,
+            "Cancellation marker does not match the immutable session manifest"
+        );
+        Some(cancelled)
+    } else {
+        None
+    };
+    let removed = cleanup.is_some() || cancelled.is_some();
     let mut actual_files = BTreeSet::new();
     let mut actual_dirs = BTreeSet::new();
     inventory(
@@ -653,6 +934,9 @@ fn load_directory(root: &Path, state_base: &Path, directory: &Path) -> Result<Se
     let mut expected_files = BTreeSet::from(["manifest.json".to_owned()]);
     if cleanup.is_some() {
         expected_files.insert(CLEANUP_FILE.to_owned());
+    }
+    if cancelled.is_some() {
+        expected_files.insert(CANCELLED_FILE.to_owned());
     }
     let mut expected_dirs = BTreeSet::from(["base".to_owned(), "head".to_owned()]);
     let mut filenames = BTreeSet::new();
@@ -696,7 +980,7 @@ fn load_directory(root: &Path, state_base: &Path, directory: &Path) -> Result<Se
                     );
                     parent = path.parent();
                 }
-                if cleanup.is_some() && !actual_files.contains(&snapshot.path) {
+                if removed && !actual_files.contains(&snapshot.path) {
                     complete = false;
                     continue;
                 }
@@ -720,7 +1004,7 @@ fn load_directory(root: &Path, state_base: &Path, directory: &Path) -> Result<Se
         expected_files.is_disjoint(&expected_dirs),
         "Manifest registers a path as both a file and a directory"
     );
-    let valid_inventory = if cleanup.is_some() {
+    let valid_inventory = if removed {
         actual_files.is_subset(&expected_files) && actual_dirs.is_subset(&expected_dirs)
     } else {
         expected_files == actual_files && expected_dirs == actual_dirs
@@ -737,6 +1021,7 @@ fn load_directory(root: &Path, state_base: &Path, directory: &Path) -> Result<Se
         manifest,
         manifest_sha256,
         cleanup,
+        cancelled,
     })
 }
 
@@ -1029,9 +1314,875 @@ mod tests {
         );
     }
 
+    fn archives(store: &Store) -> Vec<PathBuf> {
+        fs::read_dir(&store.directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("archive-")
+            })
+            .collect()
+    }
+
+    fn assert_cancelled<T: std::fmt::Debug>(result: Result<T>) {
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("cancelled") && error.contains("reopen"),
+            "{error}"
+        );
+    }
+
+    fn mark_cancelled(f: &Fixture, session: &Session, draft: &Draft) {
+        f.store.archive(draft).unwrap();
+        write_cancelled(
+            session,
+            &f.store,
+            &digest(&serde_json::to_vec(draft).unwrap()),
+            &session_hashes(&load_store_sessions(&f.root, &f.state, &f.store.directory).unwrap()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cancellation_archives_comments_or_empty_drafts_and_keeps_unrelated_metadata() {
+        for comments in [false, true] {
+            for saved in [false, true] {
+                let f = Fixture::new();
+                let session = f.session();
+                session.activate(&f.state).unwrap();
+                let mut draft = Draft::new(pr());
+                if comments {
+                    draft.comments.push(crate::model::Comment {
+                        path: "src/example.rs".into(),
+                        start_line: 1,
+                        line: 1,
+                        column: 1,
+                        selected_text: "new".into(),
+                        body: "Keep this archived comment".into(),
+                    });
+                }
+                if saved {
+                    f.store.save(&draft).unwrap();
+                }
+                let retained = [
+                    f.store.directory.join("receipt.json"),
+                    f.store.directory.join("comments.md"),
+                    f.store.directory.join("message.txt"),
+                    f.state.join("last-checkout.json"),
+                    f.state.join("bookmarks.json"),
+                ];
+                for path in &retained {
+                    fs::write(path, b"untouched local metadata").unwrap();
+                }
+                let manifest = fs::read(session.directory.join("manifest.json")).unwrap();
+                assert_eq!(cancel_review(&f.root, &f.store, &draft).unwrap(), 1);
+                assert_eq!(cancel_review(&f.root, &f.store, &draft).unwrap(), 0);
+                assert!(f.store.load().unwrap().is_none());
+                assert!(!f.state.join("active.json").exists());
+                assert!(!session.head_root().exists());
+                assert!(!session.directory.join("base").exists());
+                assert!(!session.directory.join(CLEANUP_FILE).exists());
+                assert_eq!(fs::read_dir(&session.directory).unwrap().count(), 2);
+                assert_eq!(
+                    fs::read(session.directory.join("manifest.json")).unwrap(),
+                    manifest
+                );
+                let archived = archives(&f.store);
+                assert_eq!(archived.len(), 1);
+                let archived: Draft =
+                    serde_json::from_slice(&fs::read(&archived[0]).unwrap()).unwrap();
+                assert_eq!(
+                    serde_json::to_value(archived).unwrap(),
+                    serde_json::to_value(&draft).unwrap()
+                );
+                for path in retained {
+                    assert_eq!(fs::read(path).unwrap(), b"untouched local metadata");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_covers_revisions_without_an_active_pointer_and_preserves_other_stores() {
+        for active_other in [false, true] {
+            let f = Fixture::new();
+            let first = f.session();
+            let mut newer = pr();
+            newer.head_sha = "d".repeat(40);
+            let second = f.with_files(&newer, &[changed("src/example.rs", "modified", None)]);
+            let mut other_sessions = Vec::new();
+            let mut other_drafts = Vec::new();
+            for reviewer in [false, true] {
+                let mut other = pr();
+                if reviewer {
+                    other.reviewer = "other-reviewer".into();
+                } else {
+                    other.number += 1;
+                }
+                let store = Store::open(&f.state, &other).unwrap();
+                store.save(&Draft::new(other.clone())).unwrap();
+                let path = store.directory.join("draft.json");
+                other_drafts.push((path.clone(), fs::read(path).unwrap()));
+                other_sessions.push(
+                    create_session(
+                        &f.root,
+                        &store,
+                        &other,
+                        &"c".repeat(40),
+                        &[changed("src/example.rs", "modified", None)],
+                        |_, _| Ok(b"other\n".to_vec()),
+                    )
+                    .unwrap(),
+                );
+            }
+            if active_other {
+                other_sessions[0].activate(&f.state).unwrap();
+            }
+            let active = fs::read(f.state.join("active.json")).ok();
+            let draft = Draft::new(newer);
+            f.store.save(&draft).unwrap();
+            assert_eq!(cancel_review(&f.root, &f.store, &draft).unwrap(), 2);
+            for session in [&first, &second] {
+                assert!(!session.head_root().exists());
+                assert_cancelled(session.validate());
+            }
+            assert_eq!(fs::read(f.state.join("active.json")).ok(), active);
+            for session in other_sessions {
+                session.validate().unwrap();
+            }
+            for (path, bytes) in other_drafts {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_retries_partial_marker_publication_and_draft_clear() {
+        for clear_draft in [false, true] {
+            let f = Fixture::new();
+            let first = f.session();
+            let second = f.session();
+            first.activate(&f.state).unwrap();
+            let draft = Draft::new(pr());
+            f.store.save(&draft).unwrap();
+            mark_cancelled(&f, &first, &draft);
+            let marker = fs::read(first.directory.join(CANCELLED_FILE)).unwrap();
+            if clear_draft {
+                write_cancelled(
+                    &second,
+                    &f.store,
+                    &digest(&serde_json::to_vec(&draft).unwrap()),
+                    &session_hashes(
+                        &load_store_sessions(&f.root, &f.state, &f.store.directory).unwrap(),
+                    ),
+                )
+                .unwrap();
+                f.store.clear().unwrap();
+            }
+            assert_cancelled(load_active(&f.root, &f.state));
+            for session in [&first, &second] {
+                for side in ["head", "base"] {
+                    let path = session.directory.join(side).join("src/example.rs");
+                    assert_eq!(
+                        load_for_cancel(&f.root, &f.state, &path)
+                            .unwrap()
+                            .unwrap()
+                            .directory,
+                        session.directory
+                    );
+                }
+            }
+            assert_eq!(cancel_review(&f.root, &f.store, &draft).unwrap(), 2);
+            assert_eq!(cancel_review(&f.root, &f.store, &draft).unwrap(), 0);
+            assert_eq!(archives(&f.store).len(), 1);
+            assert_eq!(
+                fs::read(first.directory.join(CANCELLED_FILE)).unwrap(),
+                marker
+            );
+            assert!(f.store.load().unwrap().is_none());
+            assert!(!f.state.join("active.json").exists());
+        }
+    }
+
+    #[test]
+    fn cancellation_resumes_at_every_snapshot_deletion_boundary() {
+        for removed in 0..=6 {
+            let f = Fixture::new();
+            let session = f.session();
+            session.activate(&f.state).unwrap();
+            let mut draft = Draft::new(pr());
+            draft.comments.push(crate::model::Comment {
+                path: "src/example.rs".into(),
+                start_line: 1,
+                line: 1,
+                column: 1,
+                selected_text: "new".into(),
+                body: "archived".into(),
+            });
+            f.store.save(&draft).unwrap();
+            mark_cancelled(&f, &session, &draft);
+            f.store.clear().unwrap();
+            let marker = fs::read(session.directory.join(CANCELLED_FILE)).unwrap();
+            let paths = [
+                "base/src/example.rs",
+                "head/src/example.rs",
+                "base/src",
+                "head/src",
+                "base",
+                "head",
+            ];
+            for (index, relative) in paths[..removed].iter().enumerate() {
+                let path = session.directory.join(relative);
+                if index < 2 {
+                    fs::remove_file(path).unwrap();
+                } else {
+                    fs::remove_dir(path).unwrap();
+                }
+            }
+            for side in ["head", "base"] {
+                let path = session.directory.join(side).join("src/example.rs");
+                let loaded = load_for_cancel(&f.root, &f.state, &path).unwrap().unwrap();
+                assert_eq!(loaded.directory, session.directory);
+                assert_eq!(loaded.pr, session.pr);
+                assert_cancelled(loaded.validate());
+                assert_cancelled(load_for_navigation(&f.root, &f.state, &path));
+            }
+            // A CLI retry reconstructs an empty draft once draft.json is gone.
+            let retry = Draft::new(pr());
+            assert_eq!(
+                cancel_review(&f.root, &f.store, &retry).unwrap(),
+                usize::from(removed < 6)
+            );
+            assert_eq!(cancel_review(&f.root, &f.store, &retry).unwrap(), 0);
+            assert_eq!(archives(&f.store).len(), 1);
+            assert_eq!(
+                fs::read(session.directory.join(CANCELLED_FILE)).unwrap(),
+                marker
+            );
+            assert!(!f.state.join("active.json").exists());
+        }
+    }
+
+    #[test]
+    fn cancelled_tabs_never_rebind_but_new_reviews_can_open_and_submit() {
+        let f = Fixture::new();
+        let old = f.session();
+        old.activate(&f.state).unwrap();
+        cancel_review(&f.root, &f.store, &Draft::new(pr())).unwrap();
+        let marker = fs::read(old.directory.join(CANCELLED_FILE)).unwrap();
+        let new = f.session();
+        new.activate(&f.state).unwrap();
+        new.validate().unwrap();
+        assert_eq!(
+            new.selection_path(&new.head_root().join("src/example.rs"))
+                .unwrap(),
+            "src/example.rs"
+        );
+        assert_eq!(
+            load_active(&f.root, &f.state).unwrap().unwrap().directory,
+            new.directory
+        );
+        assert_cancelled(old.validate());
+        assert_cancelled(old.open());
+        assert_cancelled(old.activate(&f.state));
+        assert_cancelled(old.selection_path(&old.head_root().join("src/example.rs")));
+        assert_cancelled(load_for_file(
+            &f.root,
+            &f.state,
+            &old.head_root().join("src/example.rs"),
+        ));
+        for side in ["head", "base"] {
+            let path = old.directory.join(side).join("src/example.rs");
+            assert_cancelled(load_for_navigation(&f.root, &f.state, &path));
+            assert!(load_for_cancel(&f.root, &f.state, &path).is_err());
+        }
+        let draft = f.submitted("COMMENTED");
+        assert_eq!(cleanup_submitted(&f.root, &f.store, &draft).unwrap(), 1);
+        assert_eq!(cleanup_submitted(&f.root, &f.store, &draft).unwrap(), 0);
+        assert_eq!(
+            fs::read(old.directory.join(CANCELLED_FILE)).unwrap(),
+            marker
+        );
+        assert!(!old.directory.join(CLEANUP_FILE).exists());
+        let cleanup: Cleanup =
+            serde_json::from_slice(&fs::read(new.directory.join(CLEANUP_FILE)).unwrap()).unwrap();
+        assert_eq!(cleanup.review_state, "COMMENTED");
+    }
+
+    // Mirror the CLI: load exact selected context, then load the current draft.
+    fn cancel_from_file(f: &Fixture, path: &Path) -> Result<usize> {
+        let session = load_for_cancel(&f.root, &f.state, path)?.context("Not a review session")?;
+        let draft = f.store.load()?.unwrap_or_else(|| Draft::new(session.pr));
+        cancel_review(&f.root, &f.store, &draft)
+    }
+
+    #[test]
+    fn old_cancelled_tabs_cannot_abandon_a_new_review_of_the_same_revision() {
+        for saved in [false, true] {
+            for activated in [false, true] {
+                let f = Fixture::new();
+                let old = f.session();
+                cancel_from_file(&f, &old.head_root().join("src/example.rs")).unwrap();
+                let new = f.session();
+                assert!(old.pr.same_revision(&new.pr));
+                if activated {
+                    new.activate(&f.state).unwrap();
+                }
+                if saved {
+                    f.store.save(&Draft::new(pr())).unwrap();
+                }
+                // Even an absent or byte-identical empty draft must not let an
+                // old tab reach the newly opened session.
+                let draft = fs::read(f.store.directory.join("draft.json")).ok();
+                let active = fs::read(f.state.join("active.json")).ok();
+                let archive_count = archives(&f.store).len();
+                let marker = fs::read(old.directory.join(CANCELLED_FILE)).unwrap();
+                for side in ["head", "base"] {
+                    let error =
+                        cancel_from_file(&f, &old.directory.join(side).join("src/example.rs"))
+                            .unwrap_err()
+                            .to_string();
+                    assert!(error.contains("earlier cancelled review"), "{error}");
+                }
+                new.validate().unwrap();
+                assert!(!new.directory.join(CANCELLED_FILE).exists());
+                assert_eq!(archives(&f.store).len(), archive_count);
+                assert_eq!(fs::read(f.store.directory.join("draft.json")).ok(), draft);
+                assert_eq!(fs::read(f.state.join("active.json")).ok(), active);
+                assert_eq!(
+                    fs::read(old.directory.join(CANCELLED_FILE)).unwrap(),
+                    marker
+                );
+                // Explicit cancellation from the new review still works, and
+                // its own tab can retry without changing the older marker.
+                let path = new.head_root().join("src/example.rs");
+                assert_eq!(cancel_from_file(&f, &path).unwrap(), 1);
+                assert_eq!(cancel_from_file(&f, &path).unwrap(), 0);
+                assert_eq!(
+                    fs::read(old.directory.join(CANCELLED_FILE)).unwrap(),
+                    marker
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_cancellation_cannot_expand_to_fresh_sessions_from_marked_or_unmarked_tabs() {
+        for removed in [false, true] {
+            let f = Fixture::new();
+            let first = f.session();
+            let second = f.session();
+            let draft = Draft::new(pr());
+            f.store.save(&draft).unwrap();
+            mark_cancelled(&f, &first, &draft);
+            if removed {
+                fs::remove_file(first.head_root().join("src/example.rs")).unwrap();
+            }
+            // Both original tabs can retry while only the original sessions exist.
+            for session in [&first, &second] {
+                assert!(
+                    load_for_cancel(
+                        &f.root,
+                        &f.state,
+                        &session.head_root().join("src/example.rs")
+                    )
+                    .unwrap()
+                    .is_some()
+                );
+            }
+            let fresh = f.session();
+            fresh.activate(&f.state).unwrap();
+            let active = fs::read(f.state.join("active.json")).unwrap();
+            let saved = fs::read(f.store.directory.join("draft.json")).unwrap();
+            for session in [&first, &second] {
+                assert!(cancel_from_file(&f, &session.head_root().join("src/example.rs")).is_err());
+            }
+            second.validate().unwrap();
+            fresh.validate().unwrap();
+            assert_eq!(fs::read(f.state.join("active.json")).unwrap(), active);
+            assert_eq!(
+                fs::read(f.store.directory.join("draft.json")).unwrap(),
+                saved
+            );
+            assert_eq!(archives(&f.store).len(), 1);
+            assert!(!second.directory.join(CANCELLED_FILE).exists());
+            assert!(!fresh.directory.join(CANCELLED_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn cancelled_context_cannot_clear_a_replacement_draft_without_new_snapshots() {
+        let f = Fixture::new();
+        let session = f.session();
+        let path = session.head_root().join("src/example.rs");
+        cancel_from_file(&f, &path).unwrap();
+        let mut draft = Draft::new(pr());
+        draft.comments.push(crate::model::Comment {
+            path: "src/example.rs".into(),
+            start_line: 1,
+            line: 1,
+            column: 1,
+            selected_text: "new".into(),
+            body: "Keep the replacement draft".into(),
+        });
+        f.store.save(&draft).unwrap();
+        let saved = fs::read(f.store.directory.join("draft.json")).unwrap();
+        let error = cancel_from_file(&f, &path).unwrap_err().to_string();
+        assert!(error.contains("draft changed"), "{error}");
+        assert_eq!(
+            fs::read(f.store.directory.join("draft.json")).unwrap(),
+            saved
+        );
+        assert_eq!(archives(&f.store).len(), 1);
+    }
+
+    #[test]
+    fn legacy_cancelled_markers_cannot_authorize_unmarked_sessions() {
+        let f = Fixture::new();
+        let old = f.session();
+        let path = old.head_root().join("src/example.rs");
+        cancel_from_file(&f, &path).unwrap();
+        let marker_path = old.directory.join(CANCELLED_FILE);
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        marker.as_object_mut().unwrap().remove("sessions");
+        replace(&marker_path, &serde_json::to_vec(&marker).unwrap());
+        assert_eq!(cancel_from_file(&f, &path).unwrap(), 0);
+        let new = f.session();
+        assert!(cancel_from_file(&f, &path).is_err());
+        new.validate().unwrap();
+        assert!(
+            load_for_cancel(&f.root, &f.state, &new.head_root().join("src/example.rs"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn cancellation_scope_requires_valid_manifest_hashes_and_its_own_session() {
+        for scope in [
+            serde_json::json!([]),
+            serde_json::json!(["invalid"]),
+            serde_json::json!(["0".repeat(64)]),
+        ] {
+            let f = Fixture::new();
+            let session = f.session();
+            mark_cancelled(&f, &session, &Draft::new(pr()));
+            let path = session.directory.join(CANCELLED_FILE);
+            let mut marker: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            marker["sessions"] = scope;
+            replace(&path, &serde_json::to_vec(&marker).unwrap());
+            assert!(cancel_from_file(&f, &session.head_root().join("src/example.rs")).is_err());
+            assert!(cancel_review(&f.root, &f.store, &Draft::new(pr())).is_err());
+            assert!(session.head_root().join("src/example.rs").exists());
+        }
+    }
+
+    #[test]
+    fn submitted_cleanup_resumes_partial_cancellation_without_creating_a_receipt_for_it() {
+        let f = Fixture::new();
+        let old = f.session();
+        mark_cancelled(&f, &old, &Draft::new(pr()));
+        fs::remove_file(old.head_root().join("src/example.rs")).unwrap();
+        let marker = fs::read(old.directory.join(CANCELLED_FILE)).unwrap();
+        let new = f.session();
+        let draft = f.submitted("COMMENTED");
+        assert_eq!(cleanup_submitted(&f.root, &f.store, &draft).unwrap(), 2);
+        assert_eq!(cleanup_submitted(&f.root, &f.store, &draft).unwrap(), 0);
+        assert!(!new.head_root().exists());
+        assert!(!old.head_root().exists());
+        assert!(!old.directory.join(CLEANUP_FILE).exists());
+        assert_eq!(
+            fs::read(old.directory.join(CANCELLED_FILE)).unwrap(),
+            marker
+        );
+    }
+
+    #[test]
+    fn cancellation_rejects_uncertain_submitted_or_mismatched_drafts_before_any_write() {
+        for case in [
+            "attempt",
+            "history",
+            "submitted",
+            "version",
+            "disk attempt",
+            "disk history",
+            "disk submitted",
+            "disk comments",
+            "disk revision",
+            "disk identity",
+        ] {
+            let f = Fixture::new();
+            let session = f.session();
+            session.activate(&f.state).unwrap();
+            let mut draft = Draft::new(pr());
+            let mut saved = draft.clone();
+            let attempt = crate::store::Attempt {
+                payload: serde_json::json!({"event": "COMMENT"}),
+                previous_review_ids: vec![],
+            };
+            let receipt = Receipt {
+                id: 123,
+                state: "COMMENTED".into(),
+                url: "receipt".into(),
+            };
+            match case {
+                "attempt" => draft.attempt = Some(attempt),
+                "history" => draft.retry_history.push(attempt),
+                "submitted" => draft.submitted = Some(receipt),
+                "version" => draft.version += 1,
+                "disk attempt" => saved.attempt = Some(attempt),
+                "disk history" => saved.retry_history.push(attempt),
+                "disk submitted" => saved.submitted = Some(receipt),
+                "disk comments" => saved.comments.push(crate::model::Comment {
+                    path: "src/example.rs".into(),
+                    start_line: 1,
+                    line: 1,
+                    column: 1,
+                    selected_text: "new".into(),
+                    body: "newer draft".into(),
+                }),
+                "disk revision" => saved.pr.head_sha = "d".repeat(40),
+                _ => saved.pr.number += 1,
+            }
+            f.store.save(&saved).unwrap();
+            let bytes = fs::read(f.store.directory.join("draft.json")).unwrap();
+            let error = cancel_review(&f.root, &f.store, &draft)
+                .unwrap_err()
+                .to_string();
+            if case.contains("attempt") || case.contains("history") || case.contains("submitted") {
+                assert!(error.contains("recover"), "{case}: {error}");
+            }
+            session.validate().unwrap();
+            assert!(archives(&f.store).is_empty(), "{case}");
+            assert!(!session.directory.join(CANCELLED_FILE).exists(), "{case}");
+            assert_eq!(
+                fs::read(f.store.directory.join("draft.json")).unwrap(),
+                bytes
+            );
+            assert!(f.state.join("active.json").exists());
+        }
+    }
+
+    #[test]
+    fn cancellation_validates_every_candidate_and_active_pointer_before_archiving() {
+        for case in [
+            "content",
+            "extra file",
+            "extra directory",
+            "missing",
+            "traversal",
+            "mapping",
+            "identity",
+            "invalid directory",
+            "active json",
+            "active version",
+            "active digest",
+            "active root",
+            "active directory",
+        ] {
+            let f = Fixture::new();
+            let first = f.session();
+            let second = f.session();
+            first.activate(&f.state).unwrap();
+            let draft = Draft::new(pr());
+            f.store.save(&draft).unwrap();
+            match case {
+                "content" => replace(&second.head_root().join("src/example.rs"), b"user edits"),
+                "extra file" => fs::write(second.directory.join("notes.txt"), b"notes").unwrap(),
+                "extra directory" => fs::create_dir(second.head_root().join("extra")).unwrap(),
+                "missing" => fs::remove_file(second.head_root().join("src/example.rs")).unwrap(),
+                "traversal" => {
+                    change_manifest(&second, |m| m.files[0].filename = "../outside".into())
+                }
+                "mapping" => change_manifest(&second, |m| {
+                    m.files[0].head.as_mut().unwrap().path = "head/other.rs".into()
+                }),
+                "identity" => change_manifest(&second, |m| m.pr.number += 1),
+                "invalid directory" => {
+                    fs::write(f.store.directory.join("diff-invalid"), b"notes").unwrap()
+                }
+                "active json" => fs::write(f.state.join("active.json"), b"not JSON").unwrap(),
+                _ => {
+                    let path = f.state.join("active.json");
+                    let mut active: Active =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    match case {
+                        "active version" => active.version += 1,
+                        "active digest" => active.manifest_sha256 = "0".repeat(64),
+                        "active root" => active.root = f.root.join("other"),
+                        _ => active.directory = f.store.directory.join("../outside"),
+                    }
+                    fs::write(path, serde_json::to_vec(&active).unwrap()).unwrap();
+                }
+            }
+            let active_bytes = fs::read(f.state.join("active.json")).unwrap();
+            let draft_bytes = fs::read(f.store.directory.join("draft.json")).unwrap();
+            assert!(cancel_review(&f.root, &f.store, &draft).is_err(), "{case}");
+            first.validate().unwrap();
+            assert!(second.directory.join("base/src/example.rs").exists());
+            assert!(!second.directory.join(CANCELLED_FILE).exists());
+            assert!(archives(&f.store).is_empty(), "{case}");
+            assert_eq!(fs::read(f.state.join("active.json")).unwrap(), active_bytes);
+            assert_eq!(
+                fs::read(f.store.directory.join("draft.json")).unwrap(),
+                draft_bytes
+            );
+            if case == "content" {
+                assert_eq!(
+                    fs::read(second.head_root().join("src/example.rs")).unwrap(),
+                    b"user edits"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_markers_never_relax_content_path_or_inventory_guards() {
+        for case in [
+            "version",
+            "digest",
+            "draft digest",
+            "unknown",
+            "manifest",
+            "content",
+            "extra",
+            "directory",
+            "mapping",
+        ] {
+            let f = Fixture::new();
+            let session = f.session();
+            let draft = Draft::new(pr());
+            mark_cancelled(&f, &session, &draft);
+            fs::remove_file(session.directory.join("base/src/example.rs")).unwrap();
+            let path = session.directory.join(CANCELLED_FILE);
+            let mut marker: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            match case {
+                "version" => marker["version"] = 99.into(),
+                "digest" => marker["manifest_sha256"] = "0".repeat(64).into(),
+                "draft digest" => marker["draft_sha256"] = "invalid".into(),
+                "unknown" => marker["review_id"] = 123.into(),
+                "manifest" => change_manifest(&session, |m| m.pr.title.push_str("changed")),
+                "content" => replace(&session.head_root().join("src/example.rs"), b"user edits"),
+                "extra" => fs::write(session.directory.join("notes"), b"notes").unwrap(),
+                "directory" => fs::create_dir(session.directory.join("extra")).unwrap(),
+                _ => {
+                    change_manifest(&session, |m| {
+                        m.files[0].head.as_mut().unwrap().path = "../outside".into()
+                    });
+                    marker["manifest_sha256"] =
+                        digest(&fs::read(session.directory.join("manifest.json")).unwrap()).into();
+                }
+            }
+            replace(&path, &serde_json::to_vec(&marker).unwrap());
+            assert!(cancel_review(&f.root, &f.store, &draft).is_err(), "{case}");
+            assert!(
+                load_for_cancel(
+                    &f.root,
+                    &f.state,
+                    &session.head_root().join("src/example.rs")
+                )
+                .is_err(),
+                "{case}"
+            );
+            assert!(session.head_root().join("src/example.rs").exists());
+            assert_eq!(archives(&f.store).len(), 1);
+            let submitted = f.submitted("COMMENTED");
+            assert!(
+                cleanup_submitted(&f.root, &f.store, &submitted).is_err(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_loader_requires_exact_registered_head_or_base_paths() {
+        let f = Fixture::new();
+        let session = f.session();
+        for cancelled in [false, true] {
+            if cancelled {
+                cancel_review(&f.root, &f.store, &Draft::new(pr())).unwrap();
+            }
+            for side in ["head", "base"] {
+                assert!(
+                    load_for_cancel(
+                        &f.root,
+                        &f.state,
+                        &session.directory.join(side).join("src/example.rs")
+                    )
+                    .unwrap()
+                    .is_some()
+                );
+            }
+            for suffix in [
+                "head/src/../src/example.rs",
+                "head/src/./example.rs",
+                "head/src//example.rs",
+                "head/src/example.rs/",
+                "head/src/EXAMPLE.rs",
+                "head/src/unknown.rs",
+                "base/src/unknown.rs",
+                "head",
+                "manifest.json",
+                CANCELLED_FILE,
+            ] {
+                let path = PathBuf::from(format!("{}/{suffix}", session.directory.display()));
+                assert!(
+                    load_for_cancel(&f.root, &f.state, &path).is_err(),
+                    "{suffix}"
+                );
+            }
+            assert!(
+                load_for_cancel(&f.root, &f.state, &f.root.join("ordinary.rs"))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_handles_empty_sessions_and_preserves_older_submission_receipts() {
+        let f = Fixture::new();
+        let old = f.with_files(&pr(), &[]);
+        let submitted = f.submitted("APPROVED");
+        cleanup_submitted(&f.root, &f.store, &submitted).unwrap();
+        let receipt = fs::read(old.directory.join(CLEANUP_FILE)).unwrap();
+        let archive = f.store.archive(&submitted).unwrap();
+        let archived = fs::read(&archive).unwrap();
+        f.store.clear().unwrap();
+        let new = f.with_files(&pr(), &[]);
+        let draft = Draft::new(pr());
+        assert_eq!(cancel_review(&f.root, &f.store, &draft).unwrap(), 2);
+        assert_eq!(cancel_review(&f.root, &f.store, &draft).unwrap(), 0);
+        assert_eq!(fs::read(old.directory.join(CLEANUP_FILE)).unwrap(), receipt);
+        assert_eq!(fs::read(archive).unwrap(), archived);
+        assert_cancelled(old.validate());
+        assert_cancelled(new.validate());
+    }
+
+    #[test]
+    fn cancellation_rejects_external_or_inexact_stores() {
+        let f = Fixture::new();
+        let session = f.session();
+        let external = tempfile::tempdir().unwrap();
+        let mut store = Store::open(external.path(), &pr()).unwrap();
+        fs::write(store.directory.join("draft.json"), b"user data").unwrap();
+        assert!(cancel_review(&f.root, &store, &Draft::new(pr())).is_err());
+        assert_eq!(
+            fs::read(store.directory.join("draft.json")).unwrap(),
+            b"user data"
+        );
+        store.directory = f.store.directory.join(".");
+        assert!(cancel_review(&f.root, &store, &Draft::new(pr())).is_err());
+        session.validate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_rejects_symlinks_hardlinks_and_aliased_ancestors() {
+        use std::os::unix::fs::symlink;
+        for marked in [false, true] {
+            for target in [
+                "snapshot", "manifest", "head", "session", "key", "state", "scratch", "draft",
+                "active", "marker",
+            ] {
+                if target == "marker" && !marked {
+                    continue;
+                }
+                let f = Fixture::new();
+                let session = f.session();
+                session.activate(&f.state).unwrap();
+                let draft = Draft::new(pr());
+                f.store.save(&draft).unwrap();
+                if marked {
+                    mark_cancelled(&f, &session, &draft);
+                }
+                let path = match target {
+                    "snapshot" => session.head_root().join("src/example.rs"),
+                    "manifest" => session.directory.join("manifest.json"),
+                    "head" => session.head_root(),
+                    "session" => session.directory.clone(),
+                    "key" => f.store.directory.clone(),
+                    "state" => f.state.clone(),
+                    "scratch" => f.root.join("scratch"),
+                    "draft" => f.store.directory.join("draft.json"),
+                    "active" => f.state.join("active.json"),
+                    _ => session.directory.join(CANCELLED_FILE),
+                };
+                let moved = f.root.join("user-data");
+                fs::rename(&path, &moved).unwrap();
+                symlink(&moved, &path).unwrap();
+                assert!(
+                    cancel_review(&f.root, &f.store, &draft).is_err(),
+                    "{target}, marked={marked}"
+                );
+                assert!(moved.exists());
+                assert!(session.directory.join("base/src/example.rs").exists());
+            }
+            for target in [
+                "head/src/example.rs",
+                "manifest.json",
+                CANCELLED_FILE,
+                "draft",
+                "active",
+            ] {
+                if target == CANCELLED_FILE && !marked {
+                    continue;
+                }
+                let f = Fixture::new();
+                let session = f.session();
+                session.activate(&f.state).unwrap();
+                let draft = Draft::new(pr());
+                f.store.save(&draft).unwrap();
+                if marked {
+                    mark_cancelled(&f, &session, &draft);
+                }
+                let path = match target {
+                    "draft" => f.store.directory.join("draft.json"),
+                    "active" => f.state.join("active.json"),
+                    _ => session.directory.join(target),
+                };
+                let link = f.root.join("hardlink");
+                fs::hard_link(&path, &link).unwrap();
+                let bytes = fs::read(&link).unwrap();
+                assert!(
+                    cancel_review(&f.root, &f.store, &draft).is_err(),
+                    "{target}, marked={marked}"
+                );
+                assert_eq!(fs::read(&link).unwrap(), bytes);
+                assert!(session.head_root().join("src/example.rs").exists());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_alias_paths_never_fall_back() {
+        use std::os::unix::fs::symlink;
+        let f = Fixture::new();
+        let session = f.session();
+        cancel_review(&f.root, &f.store, &Draft::new(pr())).unwrap();
+        let alias = f.root.join("alias");
+        symlink(&session.directory, &alias).unwrap();
+        let dangling = f.root.join("dangling");
+        symlink(session.head_root(), &dangling).unwrap();
+        for path in [
+            alias.join("head/src/example.rs"),
+            dangling.join("src/example.rs"),
+        ] {
+            assert!(load_for_cancel(&f.root, &f.state, &path).is_err());
+            assert!(load_for_navigation(&f.root, &f.state, &path).is_err());
+        }
+    }
+
     #[test]
     fn cleanup_approval_and_request_changes_keep_comments_receipts_and_metadata() {
-        for state in ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"] {
+        for state in ["COMMENTED", "APPROVED", "CHANGES_REQUESTED", "DISMISSED"] {
             let f = Fixture::new();
             let session = f.session();
             session.activate(&f.state).unwrap();
@@ -1098,7 +2249,7 @@ mod tests {
             "uncertain",
             "zero id",
             "pending",
-            "commented",
+            "commented disk mismatch",
             "dismissed disk mismatch",
             "missing disk draft",
             "disk no receipt",
@@ -1123,7 +2274,9 @@ mod tests {
                 "uncertain" => draft.attempt = Some(attempt),
                 "zero id" => draft.submitted.as_mut().unwrap().id = 0,
                 "pending" => draft.submitted.as_mut().unwrap().state = "PENDING".into(),
-                "commented" => draft.submitted.as_mut().unwrap().state = "COMMENTED".into(),
+                "commented disk mismatch" => {
+                    draft.submitted.as_mut().unwrap().state = "COMMENTED".into()
+                }
                 "dismissed disk mismatch" => {
                     draft.submitted.as_mut().unwrap().state = "DISMISSED".into()
                 }

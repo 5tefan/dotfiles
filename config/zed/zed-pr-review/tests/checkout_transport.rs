@@ -299,6 +299,112 @@ fn local_transport_colocated_and_noncolocated() -> Result<()> {
     Ok(())
 }
 
+fn base_tip_scenarios(scenarios: &[&str], shallow: bool) -> Result<()> {
+    for colocate in [false, true] {
+        for scenario in scenarios {
+            let f = Fixture::new(colocate)?;
+            let actual = match *scenario {
+                "rewind" => f.common.clone(),
+                "divergent" => f.commit("divergent base\n", Some(&f.common))?,
+                _ => {
+                    let mut tip = f.base.clone();
+                    for n in 1..15 {
+                        tip = f.commit(&format!("newer base {n}\n"), Some(&tip))?;
+                    }
+                    // Using this tip as the review pin would make the merge base the
+                    // PR head and empty the review diff. Keep the original base pin.
+                    let tip = f.git(&[
+                        "commit-tree",
+                        &format!("{tip}^{{tree}}"),
+                        "-p",
+                        &tip,
+                        "-p",
+                        &f.head,
+                        "-m",
+                        "Merge PR head into the newer base",
+                    ])?;
+                    assert_eq!(
+                        f.git(&[
+                            "rev-list",
+                            "--first-parent",
+                            "--count",
+                            &format!("{}..{tip}", f.base),
+                        ])?,
+                        "15"
+                    );
+                    tip
+                }
+            };
+            f.git(&["update-ref", "refs/heads/main", &actual])?;
+            fs::write(f.root.join("actual-base"), &actual)?;
+            if *scenario == "unavailable" {
+                // A real commit exists on the server, but no fetched ref reaches it.
+                let missing = f.commit("unavailable pinned base\n", Some(&f.base))?;
+                let mut control: Value =
+                    serde_json::from_slice(&fs::read(f.root.join("control.json"))?)?;
+                control["base"]["sha"] = json!(missing);
+                fs::write(f.root.join("control.json"), serde_json::to_vec(&control)?)?;
+            }
+            let child_scenario = if ["api-race", "ref-race"].contains(scenario)
+                || scenario.starts_with("pending-")
+            {
+                assert!(!shallow);
+                (*scenario).to_owned()
+            } else {
+                format!(
+                    "base-tip-{scenario}{}",
+                    if shallow { "-shallow" } else { "" }
+                )
+            };
+            f.run(&child_scenario).with_context(|| {
+                format!("colocate={colocate}, shallow={shallow}, scenario={scenario}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn base_tip_fast_forward_colocated_and_noncolocated() -> Result<()> {
+    base_tip_scenarios(&["fast-forward"], false)
+}
+
+#[test]
+fn base_tip_fast_forward_shallow_colocated_and_noncolocated() -> Result<()> {
+    base_tip_scenarios(&["fast-forward"], true)
+}
+
+#[test]
+fn base_tip_refusals_colocated_and_noncolocated() -> Result<()> {
+    base_tip_scenarios(&["rewind", "divergent", "unavailable"], false)
+}
+
+#[test]
+fn base_tip_refusals_shallow_colocated_and_noncolocated() -> Result<()> {
+    base_tip_scenarios(&["rewind", "divergent", "unavailable"], true)
+}
+
+#[test]
+fn base_tip_pending_private_ref_colocated_and_noncolocated() -> Result<()> {
+    for shallow in [false, true] {
+        base_tip_scenarios(&["unrelated-ref"], shallow)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn base_tip_existing_guards_colocated_and_noncolocated() -> Result<()> {
+    base_tip_scenarios(
+        &[
+            "api-race",
+            "ref-race",
+            "pending-before-fallback-update",
+            "pending-first-fallback-update",
+        ],
+        false,
+    )
+}
+
 #[test]
 fn immutable_heads_colocated_and_noncolocated() -> Result<()> {
     tracking_scenarios(&[
@@ -1635,6 +1741,280 @@ fn pending_import_checkout(client: &Client, fixture: &Path, scenario: &str) -> R
     Ok(())
 }
 
+fn base_tip_checkout(
+    client: &Client,
+    pr: zed_pr_review::model::PullRequest,
+    fixture: &Path,
+    scenario: &str,
+) -> Result<()> {
+    let shallow = scenario.ends_with("-shallow");
+    let scenario = scenario.strip_prefix("base-tip-").unwrap();
+    let scenario = scenario.strip_suffix("-shallow").unwrap_or(scenario);
+    let root = &client.root;
+    let actual = fs::read_to_string(fixture.join("actual-base"))?;
+    let pinned = pr.clone();
+    assert_ne!(actual, pr.base_sha);
+    let local_fetch = |args: &[&str]| {
+        output(
+            Command::new(std::env::var_os("ZPR_REAL_GIT").unwrap())
+                .arg("--no-pager")
+                .arg("--git-dir")
+                .arg(&client.git_dir)
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "fetch",
+                    "--no-write-fetch-head",
+                ])
+                .args(args),
+            b"",
+        )
+    };
+    let url = format!("file://{}", fixture.join("base.git").display());
+    if ["rewind", "divergent"].contains(&scenario) {
+        // Make the pinned object available so these fail on ancestry, not absence.
+        local_fetch(&[
+            &url,
+            "refs/heads/feature/topic:refs/zed-pr-review-fixture/pinned-base",
+        ])?;
+        assert_eq!(git(client, &["cat-file", "-t", &pr.base_sha])?, "commit");
+    }
+    if shallow {
+        local_fetch(&[
+            "--depth=1",
+            &url,
+            "refs/pull/42/head:refs/zed-pr-review-fixture/head",
+            "refs/heads/main:refs/zed-pr-review-fixture/base",
+        ])?;
+        assert_eq!(
+            git(client, &["rev-parse", "--is-shallow-repository"])?,
+            "true"
+        );
+    }
+    if !["rewind", "divergent"].contains(&scenario) {
+        assert!(git(client, &["cat-file", "-t", &pr.base_sha]).is_err());
+    }
+    fs::write(root.join("file.txt"), "local content before fetch\n")?;
+    jj(root, &["status"])?;
+    let recorded = client.checkout_commit()?;
+    let user_ref = "refs/heads/user-kept";
+    git(client, &["update-ref", user_ref, &recorded])?;
+    jj(root, &["--ignore-working-copy", "git", "import"])?;
+    let imported_refs = || {
+        jj(
+            root,
+            &[
+                "--ignore-working-copy",
+                "bookmark",
+                "list",
+                "--all-remotes",
+                "-T",
+                r#"if(remote == "git", name ++ "\t" ++ if(normal_target, normal_target.commit_id()) ++ "\n")"#,
+            ],
+        )
+    };
+    let imported_before = imported_refs()?;
+    fs::write(root.join("file.txt"), "unsnapshotted tracked changes\n")?;
+    fs::write(root.join("keep.txt"), "unsnapshotted local changes\n")?;
+    // Even another ref under our private prefix must not gain blanket permission.
+    let unrelated_ref = "refs/heads/zed-pr-review/unrelated/kept";
+    if scenario == "unrelated-ref" {
+        fs::write(
+            fixture.join("pending-ref.json"),
+            serde_json::to_vec(&json!({
+                "stage": "first", "reference": unrelated_ref,
+                "target": pr.head_sha, "git_dir": client.git_dir,
+            }))?,
+        )?;
+    }
+    let calls_before = fs::read_to_string(fixture.join("jj-calls.jsonl"))?
+        .lines()
+        .count();
+    let result = client.fetch_pr(&pr);
+    assert_eq!(
+        client.checkout_commit()?,
+        recorded,
+        "fetch must not snapshot @"
+    );
+    assert_eq!(
+        client.blob(&recorded, "file.txt")?,
+        b"local content before fetch\n"
+    );
+    assert_eq!(
+        fs::read(root.join("file.txt"))?,
+        b"unsnapshotted tracked changes\n"
+    );
+    assert_eq!(
+        fs::read(root.join("keep.txt"))?,
+        b"unsnapshotted local changes\n"
+    );
+    assert_eq!(git(client, &["rev-parse", user_ref])?, recorded);
+    assert_eq!(pr, pinned);
+    assert_eq!(
+        client.read_pr(42)?,
+        pinned,
+        "fetch must not replace the API pins"
+    );
+    let calls = fs::read_to_string(fixture.join("git-calls.jsonl"))?;
+    let fetches: Vec<Vec<String>> = calls
+        .lines()
+        .map(|line| serde_json::from_str::<Vec<String>>(line).unwrap())
+        .filter(|args| args.iter().any(|arg| arg == "fetch"))
+        .collect();
+    assert_eq!(fetches.len(), 1, "only the hardened PR fetch is allowed");
+    assert_eq!(fetches[0].iter().any(|arg| arg == "--unshallow"), shallow);
+    if scenario != "fast-forward" {
+        let error = format!("{:#}", result.unwrap_err());
+        if scenario == "unrelated-ref" {
+            assert!(
+                error.contains("pending Git changes") && error.contains(unrelated_ref),
+                "{error}"
+            );
+            assert!(fixture.join("injected-ref.json").exists());
+            assert_eq!(
+                git(client, &["rev-parse", unrelated_ref])?,
+                pr.head_sha,
+                "do not roll back an unrelated pending ref"
+            );
+        } else {
+            assert!(error.to_ascii_lowercase().contains("base"), "{error}");
+            assert!(
+                !error.contains("pending Git changes"),
+                "must fail before import: {error}"
+            );
+            if scenario == "unavailable" {
+                assert!(git(client, &["cat-file", "-t", &pr.base_sha]).is_err());
+            } else {
+                assert_eq!(git(client, &["cat-file", "-t", &pr.base_sha])?, "commit");
+            }
+        }
+        assert_eq!(
+            imported_refs()?,
+            imported_before,
+            "no refs may be imported on refusal"
+        );
+        let jj_calls = fs::read_to_string(fixture.join("jj-calls.jsonl"))?;
+        for call in jj_calls.lines().skip(calls_before) {
+            let args: Vec<String> = serde_json::from_str(call)?;
+            assert!(
+                !args.windows(2).any(|args| args == ["git", "import"]),
+                "{args:?}"
+            );
+        }
+        return Ok(());
+    }
+    result?;
+    assert_eq!(
+        git(client, &["rev-parse", "--is-shallow-repository"])?,
+        "false"
+    );
+    assert_eq!(client.merge_base(&pr)?, std::env::var("ZPR_COMMON")?);
+    assert_eq!(
+        git(client, &["merge-base", &pr.head_sha, &actual])?,
+        pr.head_sha,
+        "using the newer tip would silently change the review diff"
+    );
+    assert_eq!(client.blob(&pr.base_sha, "file.txt")?, b"base diverged\n");
+    assert_eq!(client.blob(&pr.head_sha, "file.txt")?, b"fork head\n");
+    assert_eq!(
+        jj(
+            root,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "-r",
+                &format!("all() & {actual}"),
+                "--no-graph",
+                "-T",
+                "commit_id"
+            ]
+        )?,
+        actual,
+        "the actual fetched base must be imported into jj"
+    );
+    let refs = git(
+        client,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)",
+            "refs/heads/zed-pr-review/",
+        ],
+    )?;
+    assert_eq!(refs.lines().count(), 2);
+    let imported = imported_refs()?;
+    for suffix in ["head", "base"] {
+        let (reference, sha) = refs
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .find(|(reference, _)| reference.ends_with(&format!("/{suffix}")))
+            .context("Missing fetched ref")?;
+        assert_eq!(
+            sha,
+            if suffix == "head" {
+                &pr.head_sha
+            } else {
+                &actual
+            }
+        );
+        let name = reference.strip_prefix("refs/heads/").unwrap();
+        assert!(
+            imported
+                .lines()
+                .any(|line| line == format!("{name}\t{sha}")),
+            "the import must authorize the exact fetched ref and SHA: {imported}"
+        );
+    }
+    client.fetch_pr(&pr)?;
+    let refs_again = git(
+        client,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)",
+            "refs/heads/zed-pr-review/",
+        ],
+    )?;
+    assert_eq!(refs_again.lines().count(), 4);
+    for original in refs.lines() {
+        assert!(refs_again.lines().any(|line| line == original));
+    }
+    assert_eq!(client.checkout_commit()?, recorded);
+    assert_eq!(
+        fs::read(root.join("file.txt"))?,
+        b"unsnapshotted tracked changes\n"
+    );
+    assert_eq!(
+        fs::read(root.join("keep.txt"))?,
+        b"unsnapshotted local changes\n"
+    );
+    assert_eq!(client.read_pr(42)?, pinned);
+    assert_eq!(client.merge_base(&pr)?, std::env::var("ZPR_COMMON")?);
+    assert!(!client.git_dir.join("FETCH_HEAD").exists());
+    let previous = client.checkout_pr(&pr)?;
+    assert_review_checkout(client, &pr.head_sha, false)?;
+    client.ensure_checkout(&pr)?;
+    assert_eq!(fs::read(root.join("file.txt"))?, b"fork head\n");
+    assert!(!root.join("keep.txt").exists());
+    assert_ne!(previous, recorded);
+    assert_eq!(
+        client.blob(&previous, "file.txt")?,
+        b"unsnapshotted tracked changes\n"
+    );
+    assert_eq!(
+        client.blob(&previous, "keep.txt")?,
+        b"unsnapshotted local changes\n"
+    );
+    jj(root, &["edit", &previous])?;
+    assert_eq!(
+        fs::read(root.join("file.txt"))?,
+        b"unsnapshotted tracked changes\n"
+    );
+    assert_eq!(
+        fs::read(root.join("keep.txt"))?,
+        b"unsnapshotted local changes\n"
+    );
+    Ok(())
+}
+
 #[test]
 fn checkout_child() -> Result<()> {
     let Ok(scenario) = std::env::var("ZPR_SCENARIO") else {
@@ -1646,6 +2026,9 @@ fn checkout_child() -> Result<()> {
     assert_eq!(workspace_root(&directory)?, directory);
     assert_ne!(client.checkout_commit()?, pr.head_sha);
     assert_eq!(pr.head_repo, "contributor/fork");
+    if scenario.starts_with("base-tip-") {
+        return base_tip_checkout(&client, pr, &fixture, &scenario);
+    }
     if scenario.starts_with("pending-") {
         return pending_import_checkout(&client, &fixture, &scenario);
     }
@@ -1766,7 +2149,19 @@ fn checkout_child() -> Result<()> {
         "fetch must not change working-copy files"
     );
     if ["api-race", "ref-race", "url-rewrite"].contains(&scenario.as_str()) {
-        assert!(fetched.is_err());
+        let error = format!("{:#}", fetched.unwrap_err());
+        match scenario.as_str() {
+            "api-race" => assert!(
+                error.contains("base branch changed during fetch"),
+                "{error}"
+            ),
+            "ref-race" => assert!(
+                error.contains("head") && error.contains("moved during fetch"),
+                "{error}"
+            ),
+            "url-rewrite" => assert!(error.contains("URL rewriting"), "{error}"),
+            _ => unreachable!(),
+        }
         return Ok(());
     }
 
@@ -1893,14 +2288,47 @@ fn checkout_child() -> Result<()> {
             ),
         )?;
     }
+    let bookmark_names = || -> Result<std::collections::BTreeSet<String>> {
+        Ok(jj(
+            &directory,
+            &[
+                "--ignore-working-copy",
+                "bookmark",
+                "list",
+                "-T",
+                "name ++ \"\\n\"",
+            ],
+        )?
+        .lines()
+        .map(str::to_owned)
+        .collect())
+    };
+    let bookmarks_before = bookmark_names()?;
     let result = client.checkout_pr(&checkout_pr);
+    assert_eq!(
+        bookmark_names()?,
+        bookmarks_before,
+        "Checkout must not create recovery bookmarks, even on failure"
+    );
     assert_eq!(
         git(&client, &["cat-file", "commit", &pr.head_sha])?,
         target_before
     );
     if scenario == "immutable-late-edit" {
         let error = format!("{:#}", result.unwrap_err());
-        assert!(error.contains("Previous work is preserved"), "{error}");
+        assert!(
+            error.contains("Previous work was snapshotted as"),
+            "{error}"
+        );
+        let previous = error
+            .split("Return with: jj edit ")
+            .nth(1)
+            .and_then(|text| text.split_whitespace().next())
+            .context("Missing recovery SHA")?;
+        assert_eq!(
+            client.blob(previous, "keep.txt")?,
+            b"unsnapshotted local changes\n"
+        );
         assert!(!client.checkout_matches(&pr)?);
         assert!(client.ensure_checkout(&pr).is_err());
         assert_eq!(
@@ -1939,22 +2367,21 @@ fn checkout_child() -> Result<()> {
         fs::read_to_string(directory.join("file.txt"))?,
         "fork head\n"
     );
-    let pins = jj(
-        &directory,
-        &[
-            "--ignore-working-copy",
-            "bookmark",
-            "list",
-            "-r",
-            &previous,
-            "-T",
-            "name ++ \"\\n\"",
-        ],
-    )?;
-    assert!(
-        pins.lines()
-            .any(|p| p.starts_with("zed-pr-review/previous-")),
-        "{pins}"
+    assert_eq!(
+        jj(
+            &directory,
+            &[
+                "--ignore-working-copy",
+                "log",
+                "-r",
+                &previous,
+                "--no-graph",
+                "-T",
+                "commit_id"
+            ]
+        )?,
+        previous,
+        "The recovery SHA must resolve without a bookmark"
     );
     if scenario != "empty" {
         assert_ne!(previous, recorded);
@@ -1967,6 +2394,16 @@ fn checkout_child() -> Result<()> {
     }
     let resolved = Client::discover(&directory, Some("42"), Some("upstream/project"))?;
     assert_eq!(resolved.1.head_sha, pr.head_sha);
+    // Exercise the printed return command, including an empty, undescribed
+    // revision that jj can abandon when moving away without a bookmark.
+    jj(&directory, &["edit", &previous])?;
+    assert_eq!(client.checkout_commit()?, previous);
+    if scenario != "empty" {
+        assert_eq!(
+            fs::read(directory.join("keep.txt"))?,
+            b"unsnapshotted local changes\n"
+        );
+    }
     let calls = fs::read_to_string(fixture.join("git-calls.jsonl"))?;
     for call in calls.lines() {
         let args: Vec<String> = serde_json::from_str(call)?;

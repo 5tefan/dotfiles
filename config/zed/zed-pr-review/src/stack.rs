@@ -6,6 +6,8 @@
 use crate::github::Client;
 use crate::model::PullRequest;
 use anyhow::{Context, Result, ensure};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -43,6 +45,14 @@ pub struct Stack {
     entries: BTreeMap<u64, StackEntry>,
     parents: BTreeMap<u64, u64>,
     children: BTreeMap<u64, Vec<u64>>,
+}
+
+/// Owned, escaped lines shared by the live viewer and one-shot output.
+#[derive(Clone, Debug)]
+pub struct RenderedStack {
+    pub lines: Vec<Line<'static>>,
+    /// Zero-based index of the current PR's node/metadata line, not its title.
+    pub current_row: usize,
 }
 
 impl Stack {
@@ -142,49 +152,127 @@ impl Stack {
         Ok(())
     }
 
-    /// Parent-first tree, with deterministic sibling ordering and escaped metadata.
-    pub fn render(&self) -> String {
-        let mut text = String::new();
-        let mut pending = vec![(self.root, 0)];
-        while let Some((number, depth)) = pending.pop() {
+    /// Children-first graph with PR-number ordering between sibling subtrees.
+    /// Linear stacks use one column; extra lanes hold edges to pending parents.
+    pub fn render_log(&self) -> RenderedStack {
+        let mut rendered = RenderedStack {
+            lines: Vec::new(),
+            current_row: 0,
+        };
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let current_style = Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD);
+        let branch_style = Style::default().fg(Color::Cyan);
+        let root = &self.entries[&self.root];
+        let mut lanes = Vec::new();
+        // Iterative postorder avoids recursion and depth-dependent indentation.
+        // With one parent per node, the active node is always in the rightmost
+        // lane. Other lanes are edges from earlier subtrees to pending ancestors.
+        let mut pending = vec![(self.root, false)];
+        while let Some((number, visited)) = pending.pop() {
+            if !visited {
+                pending.push((number, true));
+                pending.extend(
+                    self.child_numbers(number)
+                        .iter()
+                        .rev()
+                        .map(|&child| (child, false)),
+                );
+                continue;
+            }
+            if lanes.last() != Some(&number) {
+                lanes.push(number);
+            }
+            let column = lanes.len() - 1;
             let entry = &self.entries[&number];
             let pr = &entry.pr;
-            let marker = if number == self.current { "*" } else { "-" };
-            let state = if entry.draft { "draft" } else { "ready" };
-            writeln!(
-                text,
-                "{}{} #{} {} [{}; {}]{}",
-                "  ".repeat(depth),
-                marker,
-                number,
-                escaped(&pr.title),
-                escaped(&entry.state),
-                state,
-                if number == self.current {
-                    " (current)"
+            let is_current = number == self.current;
+            if is_current {
+                rendered.current_row = rendered.lines.len();
+            }
+            let mut metadata = vec![
+                Span::styled("│ ".repeat(column), dim),
+                Span::styled(
+                    if is_current { "@" } else { "○" },
+                    if is_current { current_style } else { dim },
+                ),
+                Span::raw(" "),
+                Span::styled(format!("#{number}"), Style::default().fg(Color::Magenta)),
+                Span::raw(" "),
+                Span::styled(
+                    branch_label(&pr.head_repo, &pr.head_ref, pr.head_repo != root.base_repo),
+                    branch_style,
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    if entry.draft { "[draft]" } else { "[ready]" },
+                    Style::default().fg(if entry.draft {
+                        Color::Yellow
+                    } else {
+                        Color::Green
+                    }),
+                ),
+            ];
+            if is_current {
+                metadata.push(Span::styled(" (current)", current_style));
+            }
+            rendered.lines.push(Line::from(metadata));
+            let connector = "│ ".repeat(lanes.len());
+            rendered.lines.push(Line::from(vec![
+                Span::styled(connector.clone(), dim),
+                Span::raw(escaped(&pr.title)),
+            ]));
+            rendered.lines.push(Line::from(vec![
+                Span::styled(connector, dim),
+                Span::styled(escaped(&pr.url), dim),
+            ]));
+            if let Some(&parent) = self.parents.get(&number) {
+                if column > 0 && lanes[column - 1] == parent {
+                    // Join only the two edges that share this parent. Earlier
+                    // lanes pass through unchanged, including at nested forks.
+                    rendered
+                        .lines
+                        .push(Line::styled(format!("{}├─╯", "│ ".repeat(column - 1)), dim));
+                    lanes.pop();
                 } else {
-                    ""
+                    lanes[column] = parent;
                 }
-            )
-            .unwrap();
-            writeln!(
-                text,
-                "{}  {}:{} -> {}:{}\n{}  {}",
-                "  ".repeat(depth),
-                escaped(&pr.head_repo),
-                escaped(&pr.head_ref),
-                escaped(&entry.base_repo),
-                escaped(&entry.base_ref),
-                "  ".repeat(depth),
-                escaped(&pr.url)
-            )
-            .unwrap();
-            pending.extend(
-                self.child_numbers(number)
-                    .iter()
-                    .rev()
-                    .map(|&child| (child, depth + 1)),
-            );
+            }
+        }
+        let cross_repo = self
+            .entries
+            .values()
+            .any(|entry| entry.pr.head_repo != root.base_repo);
+        rendered.lines.push(Line::from(vec![
+            Span::styled("◆ ", dim),
+            Span::styled(
+                branch_label(&root.base_repo, &root.base_ref, cross_repo),
+                branch_style,
+            ),
+            Span::styled(" (base)", dim),
+        ]));
+        rendered
+    }
+
+    /// The same graph as `render_log`, without terminal escape sequences.
+    pub fn render(&self) -> String {
+        let mut text = String::new();
+        for line in self.render_log().lines {
+            writeln!(text, "{line}").unwrap();
+        }
+        text
+    }
+
+    /// ANSI output for a one-shot TTY display. Use `render` for redirected output.
+    pub fn render_colored(&self) -> String {
+        let mut text = String::new();
+        for line in self.render_log().lines {
+            for span in line.spans {
+                write_log_style(&mut text, line.style.patch(span.style));
+                text.push_str(&span.content);
+            }
+            text.push_str("\x1b[0m\n");
         }
         text
     }
@@ -296,6 +384,59 @@ impl Stack {
             children,
         })
     }
+}
+
+fn branch_label(repo: &str, branch: &str, qualified: bool) -> String {
+    if qualified {
+        format!("{}:{}", escaped(repo), escaped(branch))
+    } else {
+        escaped(branch)
+    }
+}
+
+// The log uses foreground colors, bold and dim only. Reset before each span
+// and at each line end so styles cannot leak into titles or the caller's output.
+fn write_log_style(text: &mut String, style: Style) {
+    text.push_str("\x1b[0");
+    if style.add_modifier.contains(Modifier::BOLD) {
+        text.push_str(";1");
+    }
+    if style.add_modifier.contains(Modifier::DIM) {
+        text.push_str(";2");
+    }
+    if let Some(color) = style.fg {
+        let code = match color {
+            Color::Reset => 39,
+            Color::Black => 30,
+            Color::Red => 31,
+            Color::Green => 32,
+            Color::Yellow => 33,
+            Color::Blue => 34,
+            Color::Magenta => 35,
+            Color::Cyan => 36,
+            Color::Gray => 37,
+            Color::DarkGray => 90,
+            Color::LightRed => 91,
+            Color::LightGreen => 92,
+            Color::LightYellow => 93,
+            Color::LightBlue => 94,
+            Color::LightMagenta => 95,
+            Color::LightCyan => 96,
+            Color::White => 97,
+            Color::Indexed(index) => {
+                write!(text, ";38;5;{index}").unwrap();
+                39
+            }
+            Color::Rgb(r, g, b) => {
+                write!(text, ";38;2;{r};{g};{b}").unwrap();
+                39
+            }
+        };
+        if !matches!(color, Color::Indexed(_) | Color::Rgb(..)) {
+            write!(text, ";{code}").unwrap();
+        }
+    }
+    text.push('m');
 }
 
 struct DeletedHead {

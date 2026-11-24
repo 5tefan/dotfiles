@@ -9,6 +9,7 @@ use zed_pr_review::github::{Client, checkout_sha, workspace_git_dir, workspace_r
 use zed_pr_review::message::{review_summary, review_template};
 use zed_pr_review::model::{Comment, PullRequest};
 use zed_pr_review::ready;
+use zed_pr_review::review_menu::{self, ReviewAction};
 use zed_pr_review::selection::{Selection, make_comment, validate_comment};
 use zed_pr_review::session::{self, Session};
 use zed_pr_review::stack::Stack;
@@ -48,7 +49,7 @@ enum Action {
     Open,
     /// Show the GitHub stack in a review diff; otherwise run jj l.
     Stack {
-        /// Open the clickable live jj log; PR stacks and non-terminal output are one-shot reads.
+        /// Keep the PR stack or local jj log open and refresh it; non-terminal output is one-shot.
         #[arg(long)]
         watch: bool,
     },
@@ -62,6 +63,15 @@ enum Action {
         #[arg(long)]
         reviewer: Option<String>,
     },
+    /// Choose how to finish: abandon locally, comment, approve, or request changes.
+    Finish,
+    /// Abandon the local review draft and snapshots without contacting GitHub.
+    Cancel {
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Submit a comment-only review with every saved inline comment.
+    SubmitComment,
     /// Save a comment for one selected RIGHT-side excerpt. Read the body until EOF.
     Comment,
     /// Edit a nonblank summary, then approve with every saved inline comment.
@@ -103,6 +113,9 @@ fn run(cli: Cli) -> Result<()> {
         None
     };
     let directory = context_directory(&cli);
+    if matches!(cli.command, Action::Finish | Action::Cancel { .. }) {
+        return finish_review(&cli, &directory);
+    }
     if matches!(cli.command, Action::Stack { .. } | Action::Sb | Action::Sf) {
         return navigate(&cli, &directory);
     }
@@ -140,7 +153,7 @@ fn run(cli: Cli) -> Result<()> {
     }
     let requires_session = matches!(
         cli.command,
-        Action::Comment | Action::Approve | Action::RequestChanges
+        Action::Comment | Action::SubmitComment | Action::Approve | Action::RequestChanges
     );
     let mut review_session = None;
     let mut workspace_lock = None;
@@ -210,11 +223,19 @@ fn run(cli: Cli) -> Result<()> {
     println!("Draft: {}", store.directory.display());
     let finish_review = matches!(
         cli.command,
-        Action::Approve | Action::RequestChanges | Action::Recover { .. }
+        Action::SubmitComment | Action::Approve | Action::RequestChanges | Action::Recover { .. }
     );
     match cli.command {
-        Action::Open | Action::Ready { .. } | Action::Stack { .. } | Action::Sb | Action::Sf => {
-            unreachable!("checkout, navigation, and ready return before opening a draft")
+        Action::Open
+        | Action::Ready { .. }
+        | Action::Stack { .. }
+        | Action::Sb
+        | Action::Sf
+        | Action::Finish
+        | Action::Cancel { .. } => {
+            unreachable!(
+                "checkout, navigation, ready, and the finish menu return before opening a draft"
+            )
         }
         Action::Comment => {
             draft.editable()?;
@@ -267,6 +288,14 @@ fn run(cli: Cli) -> Result<()> {
                 draft.comments.len()
             );
         }
+        Action::SubmitComment => submit(
+            &client,
+            &store,
+            &mut draft,
+            &current,
+            "COMMENT",
+            cli.editor.as_deref(),
+        )?,
         Action::Approve => submit(
             &client,
             &store,
@@ -344,6 +373,99 @@ fn run(cli: Cli) -> Result<()> {
     }
     drop(workspace_lock);
     Ok(())
+}
+
+fn finish_review(cli: &Cli, directory: &Path) -> Result<()> {
+    ensure!(
+        cli.draft_dir.is_none() && cli.pr.is_none() && cli.repo.is_none(),
+        "Finish or cancel from the selected full PR diff; --draft-dir, --pr, and --repo cannot select a different review"
+    );
+    let root = workspace_root(directory)?;
+    let state = chosen_state(cli, &root)?;
+    let selected = cancellation_session(&root, &state)?;
+    let git_dir = workspace_git_dir(&root)?;
+    let state = prepare_directory(&root, &git_dir, &state, None)?;
+    let _workspace = Store::at(&state.join("workspace"))?;
+    let locked = cancellation_session(&root, &state)?;
+    ensure!(
+        locked.directory == selected.directory && locked.pr.same_revision(&selected.pr),
+        "Review context changed before opening the menu; retry from its diff"
+    );
+    let store = Store::open(&state, &locked.pr)?;
+    let mut draft = store
+        .load()?
+        .unwrap_or_else(|| Draft::new(locked.pr.clone()));
+    let choice = match cli.command {
+        Action::Finish => review_menu::choose(
+            &format!("#{} — {}", locked.pr.number, locked.pr.title),
+            draft.comments.len(),
+        )?,
+        Action::Cancel { yes } => {
+            if yes
+                || confirm(
+                    "Abandon this local review and clean its snapshots? GitHub and the checkout stay unchanged. Type yes: ",
+                )?
+            {
+                Some(ReviewAction::Cancel)
+            } else {
+                None
+            }
+        }
+        _ => unreachable!("only finish and cancel use the review menu"),
+    };
+    let Some(choice) = choice else {
+        println!("Cancelled. Review draft and snapshots kept.");
+        return Ok(());
+    };
+    let still_selected = cancellation_session(&root, &state)?;
+    ensure!(
+        still_selected.directory == locked.directory && still_selected.pr.same_revision(&locked.pr),
+        "Review context changed while choosing; no action was taken"
+    );
+    if choice == ReviewAction::Cancel {
+        let count = session::cancel_review(&root, &store, &draft)?;
+        println!(
+            "Review abandoned locally. Cleaned {count} sessions; the draft was archived in {}. Nothing was submitted to GitHub, and the checkout is unchanged.",
+            store.directory.display()
+        );
+        return Ok(());
+    }
+
+    // Cancel works offline even after a checkout or remote PR changes. Every
+    // submission still requires a live diff and the normal pinned revision checks.
+    still_selected.validate()?;
+    let (client, current) = discover_session(cli, &root, Some(&still_selected), None)?;
+    client.ensure_checkout(&current)?;
+    prepare_directory(&root, &git_dir, &state, Some(&current.head_sha))?;
+    let event = match choice {
+        ReviewAction::Comment => "COMMENT",
+        ReviewAction::Approve => "APPROVE",
+        ReviewAction::RequestChanges => "REQUEST_CHANGES",
+        ReviewAction::Cancel => unreachable!(),
+    };
+    submit(
+        &client,
+        &store,
+        &mut draft,
+        &current,
+        event,
+        cli.editor.as_deref(),
+    )?;
+    if draft.submitted.is_some() {
+        cleanup_after_review(&client, &store, &draft, true);
+    }
+    Ok(())
+}
+
+fn cancellation_session(root: &Path, state: &Path) -> Result<Session> {
+    ensure!(
+        state == root.join("scratch/zed-pr-review"),
+        "Finishing or cancelling requires a full PR diff in REPO_ROOT/scratch/zed-pr-review"
+    );
+    let file = std::env::var_os("ZED_FILE").filter(|file| !file.is_empty())
+        .context("Not inside a review session. Open a PR with Ctrl-Shift-G and finish from its full diff")?;
+    session::load_for_cancel(root, state, Path::new(&file))?
+        .context("Not inside a review session. Finish from a file in the full PR diff, not an ordinary source file")
 }
 
 fn cleanup_after_review(client: &Client, store: &Store, draft: &Draft, workspace_locked: bool) {
@@ -438,7 +560,7 @@ fn submit(
     }
     draft.check_revision(current)?;
     ensure!(
-        !draft.pr.author.eq_ignore_ascii_case(&draft.pr.reviewer),
+        event == "COMMENT" || !draft.pr.author.eq_ignore_ascii_case(&draft.pr.reviewer),
         "GitHub does not allow approving or requesting changes on your own PR"
     );
     ensure!(
@@ -553,11 +675,12 @@ fn verify_receipt(value: &Value, pr: &PullRequest, payload: &Value) -> Result<Re
 
 fn review_matches(value: &Value, pr: &PullRequest, payload: &Value) -> bool {
     let state = match payload["event"].as_str() {
+        Some("COMMENT") => "COMMENTED",
         Some("APPROVE") => "APPROVED",
         Some("REQUEST_CHANGES") => "CHANGES_REQUESTED",
         _ => return false,
     };
-    (value["state"] == state || value["state"] == "DISMISSED")
+    (value["state"] == state || (state != "COMMENTED" && value["state"] == "DISMISSED"))
         && value["commit_id"] == pr.head_sha
         && value["body"] == payload["body"]
         && value["user"]["login"]
@@ -691,7 +814,7 @@ fn recover(client: &Client, store: &Store, draft: &mut Draft, retry: bool) -> Re
         }
         store.save(draft)?;
         println!(
-            "Retry enabled; no review sent. Previous attempt saved at {}. Run approve or request-changes again when ready.",
+            "Retry enabled; no review sent. Previous attempt saved at {}. Run submit-comment, approve, or request-changes again when ready.",
             archive.display()
         );
     } else {
@@ -927,12 +1050,47 @@ fn navigate(cli: &Cli, directory: &Path) -> Result<()> {
     );
     let git_dir = workspace_git_dir(&root)?;
     let state = prepare_directory(&root, &git_dir, &state, None)?;
+    if watch_terminal(&cli.command) {
+        let pr = cli.pr.clone();
+        let repo = cli.repo.clone();
+        let mut origin_validated = false;
+        return zed_pr_review::stack_view::run(move || {
+            // Validate the originating diff first. After that, the read-only
+            // viewer may follow a new active review, but never rebinds old diffs.
+            let active = if origin_validated && pr.is_none() {
+                session::load_active(&root, &state)?
+            } else {
+                None
+            };
+            let pinned = active.as_ref().unwrap_or(&selected);
+            let spec = pr.as_deref().unwrap_or(&pinned.pr.url);
+            let (client, current) = Client::discover(&root, Some(spec), repo.as_deref())?;
+            ensure!(
+                pinned.pr.same_revision(&current),
+                "This review session is stale. Open the PR again to refresh its pins"
+            );
+            client.ensure_checkout(&current)?;
+            // Navigation may change @ during discovery. Once the origin passed
+            // its checks, the next read can follow that newly active review.
+            origin_validated = true;
+            let stack = Stack::discover(&client, &current)?;
+            client.ensure_checkout(&current)?;
+            Ok(stack)
+        });
+    }
     let _workspace = Store::at(&state.join("workspace"))?;
     let (client, current) = discover_session(cli, &root, Some(&selected), None)?;
     let stack = Stack::discover(&client, &current)?;
     client.ensure_checkout(&current)?;
     println!("PR stack — {}/{}\n", current.host, current.repo);
-    print!("{}", stack.render());
+    print!(
+        "{}",
+        if io::stdout().is_terminal() {
+            stack.render_colored()
+        } else {
+            stack.render()
+        }
+    );
     if matches!(cli.command, Action::Stack { .. }) {
         println!(
             "Ctrl-Shift-J: parent PR. Ctrl-Shift-K: child PR. Ctrl-Shift-L: refresh this list."
@@ -991,11 +1149,14 @@ fn navigate(cli: &Cli, directory: &Path) -> Result<()> {
     checkout_review(&client, &target, &state, Some(&stack))
 }
 
-fn navigate_local(root: &Path, action: &Action) -> Result<()> {
-    if matches!(action, Action::Stack { watch: true })
+fn watch_terminal(action: &Action) -> bool {
+    matches!(action, Action::Stack { watch: true })
         && io::stdin().is_terminal()
         && io::stdout().is_terminal()
-    {
+}
+
+fn navigate_local(root: &Path, action: &Action) -> Result<()> {
+    if watch_terminal(action) {
         return zed_pr_review::log_view::run(root);
     }
     let _workspace = if matches!(action, Action::Sb | Action::Sf)
@@ -1072,6 +1233,9 @@ fn checkout_review(
         stack.verify_adjacent(client, pr)?;
     }
     let previous_commit = client.checkout_pr(pr)?;
+    // Report recovery before any later validation or state write can fail.
+    println!("Previous work is preserved. Return with: jj edit {previous_commit}");
+    println!("If that revision is immutable, use: jj new {previous_commit}");
     prepare_directory(&client.root, &client.git_dir, state, Some(&pr.head_sha))?;
     store.write_json(
         "last-checkout.json",
@@ -1085,8 +1249,6 @@ fn checkout_review(
         "PR changed after checkout. Previous work is preserved; open the PR again"
     );
     session.activate(state)?;
-    println!("Previous work is preserved. Return with: jj edit {previous_commit}");
-    println!("If that revision is immutable, use: jj new {previous_commit}");
     session.open().context("Checkout succeeded, but the diff could not be opened. Run the PR: full diff task; do not repeat checkout just to reopen the view")
 }
 
