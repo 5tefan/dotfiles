@@ -12,7 +12,7 @@
 add_newline = false
 
 # p10k left: dir, vcs, prompt_char
-format = '$directory$git_branch$git_commit$git_state$git_status$character'
+format = '$directory$vcs$character'
 
 # p10k right: status, command_execution_time, background_jobs, direnv,
 # tool versions, kubecontext, terraform, clouds, context
@@ -38,6 +38,22 @@ style = '31'
 before_repo_root_style = 'bold 39'
 repo_root_style = 'bold 39'
 read_only = ' ro'
+
+[vcs]
+order = ['jj', 'git']
+git_modules = '$git_branch$git_commit$git_state$git_status'
+jj_modules = '${custom.jj}'
+
+[custom.jj]
+when = true
+shell = ['sh']
+use_stdin = true
+format = '[$output](76) '
+command = '''
+jj --ignore-working-copy --no-pager --color never log \
+  -r @ -n 1 --no-graph \
+  -T 'separate(" ", change_id.shortest(7), bookmarks, if(conflict, "conflict"), if(divergent, "divergent"), if(hidden, "hidden"))'
+'''
 
 # vcs: no branch icon, branch fg 76, ":remote" only when it differs from the
 # local branch (default fg).
