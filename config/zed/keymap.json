@@ -27,6 +27,7 @@
   {
     "context": "Editor",
     "bindings": {
+      "ctrl-shift-c": ["task::Spawn", { "task_name": "PR: add comment" }],
       "ctrl-shift-x": [
         "task::Spawn",
         { "task_name": "PR: finish review", "reveal_target": "center" },

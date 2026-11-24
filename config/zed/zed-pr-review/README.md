@@ -3,8 +3,7 @@
 A Rust CLI for reviewing GitHub pull requests from Zed and a jj workspace.
 Press **Ctrl-Shift-G** to open a PR: the CLI fetches it, preserves your local work,
 checks out the PR's files, and opens the full comparison. Select right-side text
-and run **`PR: add comment`** from the task picker to save an inline comment in a
-private local draft. Press **Ctrl-Shift-X** from the full diff to finish: abandon
+and press **Ctrl-Shift-C** to save an inline comment in a private local draft. Press **Ctrl-Shift-X** from the full diff to finish: abandon
 locally, submit a comment-only review, approve, or request changes. Each submission
 sends the summary and all saved inline comments in one GitHub review. The `ready`
 command also marks the checked-out PR ready for review and can request a reviewer.
@@ -74,7 +73,7 @@ and remote revision.
 | Task                  | Shortcut     | Purpose                                                                |
 | --------------------- | ------------ | ---------------------------------------------------------------------- |
 | `PR: open for review` | Ctrl-Shift-G | Fetch and check out a PR, then open its full comparison.               |
-| `PR: add comment`     | None         | Read an inline comment in a terminal and save it locally.              |
+| `PR: add comment`     | Ctrl-Shift-C | Read an inline comment in a terminal and save it locally.              |
 | `PR: finish review`   | Ctrl-Shift-X | Choose local abandonment, a comment-only review, approval, or changes. |
 | `PR: list comments`   | None         | Show the draft, its comments, and recovery status.                     |
 | `PR: full diff`       | None         | Rebuild the full comparison for the checked-out PR.                    |
@@ -82,12 +81,12 @@ and remote revision.
 | `jj sb`               | Ctrl-Shift-J | Open the parent PR in review mode; otherwise run `jj sb`.              |
 | `jj sf`               | Ctrl-Shift-K | Open a child PR in review mode; otherwise run `jj sf`.                 |
 
-Ctrl-Shift-G is global. Ctrl-Shift-X has `Editor` context, not terminal context,
-and opens the finish dialog in the center pane. Use Zed's `task: spawn` picker
-for any named task. The old Ctrl-Shift-C/A/Q mappings are removed. `PR: add comment`
-remains available through the picker or CLI `comment`, with no shortcut. The
-finish task replaces the old approve/request-changes tasks; CLI `approve` and
-`request-changes` remain available. Ctrl-Shift-G and Ctrl-Shift-J/K/L are unchanged.
+Ctrl-Shift-G is global. Ctrl-Shift-C and Ctrl-Shift-X have `Editor` context,
+not terminal context. Ctrl-Shift-C adds an inline comment; Ctrl-Shift-X opens
+the finish dialog in the center pane. Use Zed's `task: spawn` picker for any
+named task. The old Ctrl-Shift-A/Q mappings are removed. The finish task replaces
+the old approve/request-changes tasks; CLI `approve` and `request-changes` remain
+available. Ctrl-Shift-G and Ctrl-Shift-J/K/L are unchanged.
 
 Every `PR:` task runs with `cwd: $ZED_WORKTREE_ROOT`, `reveal: always`,
 `allow_concurrent_runs: false`, and `use_new_terminal: true`. The finish task uses
@@ -368,8 +367,8 @@ has no effect; `--draft-dir` is rejected.
 2. Select one continuous, nonblank range on the **RIGHT (head) side**, within one
    excerpt and one GitHub diff hunk. Added lines and right-side context are
    supported; deleted-side comments are not.
-3. Run `PR: add comment` from Zed's `task: spawn` picker. It has no shortcut.
-   Check the PR, path, and line range shown in the terminal.
+3. Press **Ctrl-Shift-C**, or run `PR: add comment` from Zed's `task: spawn`
+   picker. Check the PR, path, and line range shown in the terminal.
 4. Type a multiline comment. Press Enter, then **Ctrl-D on an empty line** to
    finish stdin. A nonblank body is saved locally; nothing is published. A blank
    body cancels. Ctrl-C cancels the current input and keeps earlier comments.
