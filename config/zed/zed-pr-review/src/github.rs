@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -1179,17 +1179,18 @@ impl Client {
                 ]),
             "list previously ignored local paths",
         )?;
-        for path in ignored
+        let paths = ignored
             .split(|byte| *byte == 0)
             .filter(|path| !path.is_empty())
-        {
-            let path = std::str::from_utf8(path)
-                .context("Ignored paths must be UTF-8 for safe checkout")?
-                .trim_end_matches('/');
-            validate_path(path)?;
-            self.check_ignored_path(&check, Path::new(path))?;
-        }
-        Ok(())
+            .map(|path| {
+                let path = std::str::from_utf8(path)
+                    .context("Ignored paths must be UTF-8 for safe checkout")?
+                    .trim_end_matches('/');
+                validate_path(path)?;
+                Ok(PathBuf::from(path))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.check_ignored_paths(&check, paths)
     }
 
     fn check_external_ignores(
@@ -1270,71 +1271,121 @@ impl Client {
         command
     }
 
-    fn path_is_ignored(&self, work_tree: &Path, check: &IgnoreCheck, path: &str) -> Result<bool> {
+    fn ignored_paths(
+        &self,
+        work_tree: &Path,
+        check: &IgnoreCheck,
+        paths: &[String],
+    ) -> Result<HashSet<String>> {
+        if paths.is_empty() {
+            return Ok(HashSet::new());
+        }
+        // A file avoids pipe deadlocks when both the input and Git's output exceed
+        // the pipe buffer. NUL delimiters preserve spaces and newlines in filenames.
+        let mut input = tempfile::tempfile_in(&self.git_dir)?;
+        for path in paths {
+            input.write_all(path.as_bytes())?;
+            input.write_all(b"\0")?;
+        }
+        input.rewind()?;
         let output = self
             .ignore_command(work_tree, check)
-            .args(["check-ignore", "--no-index", "--quiet", "--", path])
-            .stdin(Stdio::null())
+            .args(["check-ignore", "--no-index", "-z", "--stdin"])
+            .stdin(input)
             .output()
-            .context("Cannot check a local ignore rule")?;
-        match output.status.code() {
-            Some(0) => Ok(true),
-            Some(1) => Ok(false),
-            _ => bail!("Cannot check local ignore rules safely"),
-        }
+            .context("Cannot check local ignore rules")?;
+        ensure!(
+            matches!(output.status.code(), Some(0 | 1)),
+            "Cannot check local ignore rules safely"
+        );
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                Ok(std::str::from_utf8(path)
+                    .context("Git returned a non-UTF-8 ignored path")?
+                    .to_owned())
+            })
+            .collect()
     }
 
-    fn check_ignored_path(&self, check: &IgnoreCheck, path: &Path) -> Result<()> {
-        if check.tracked.contains(path) {
-            return Ok(());
-        }
-        // Untracked .gitignore files survive the switch. In particular, review state
-        // has its own '*' rule even when the target no longer ignores scratch/.
-        for ancestor in path.ancestors().skip(1) {
-            let ignore = ancestor.join(".gitignore");
-            if check.tracked.contains(&ignore) || check.target.contains(&ignore) {
-                continue;
-            }
-            match fs::symlink_metadata(self.root.join(&ignore)) {
-                Ok(metadata) if metadata.is_file() => {
-                    let destination = check.work_tree.join(&ignore);
-                    fs::create_dir_all(destination.parent().unwrap())?;
-                    fs::write(destination, fs::read(self.root.join(ignore))?)?;
+    fn check_ignored_paths(&self, check: &IgnoreCheck, mut pending: Vec<PathBuf>) -> Result<()> {
+        let mut checked_ancestors = HashSet::new();
+        while !pending.is_empty() {
+            let mut candidates = Vec::new();
+            for path in pending {
+                if check.tracked.contains(&path) {
+                    continue;
                 }
-                Ok(metadata) if metadata.is_symlink() => {} // Git does not follow these.
-                Ok(_) => {
-                    bail!("Non-regular local .gitignore files are not supported for safe checkout")
+                // Untracked .gitignore files survive the switch. Copy each once, before
+                // querying the batch, including review state's retained '*' rule.
+                for ancestor in path.ancestors().skip(1) {
+                    if !checked_ancestors.insert(ancestor.to_path_buf()) {
+                        continue;
+                    }
+                    let ignore = ancestor.join(".gitignore");
+                    if check.tracked.contains(&ignore) || check.target.contains(&ignore) {
+                        continue;
+                    }
+                    match fs::symlink_metadata(self.root.join(&ignore)) {
+                        Ok(metadata) if metadata.is_file() => {
+                            let destination = check.work_tree.join(&ignore);
+                            fs::create_dir_all(destination.parent().unwrap())?;
+                            fs::write(destination, fs::read(self.root.join(ignore))?)?;
+                        }
+                        Ok(metadata) if metadata.is_symlink() => {} // Git does not follow these.
+                        Ok(_) => bail!(
+                            "Non-regular local .gitignore files are not supported for safe checkout"
+                        ),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(error).context("Cannot inspect a retained ignore file");
+                        }
+                    }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("Cannot inspect a retained ignore file"),
+                let metadata = fs::symlink_metadata(self.root.join(&path))
+                    .context("An ignored local path changed while checking checkout safety")?;
+                let path_text = path
+                    .to_str()
+                    .context("Ignored paths must be UTF-8 for safe checkout")?;
+                validate_path(path_text)?;
+                let query = if metadata.is_dir() {
+                    format!("{path_text}/")
+                } else {
+                    path_text.to_owned()
+                };
+                candidates.push((path, query, metadata.is_dir()));
             }
-        }
-        let metadata = fs::symlink_metadata(self.root.join(path))
-            .context("An ignored local path changed while checking checkout safety")?;
-        let path_text = path
-            .to_str()
-            .context("Ignored paths must be UTF-8 for safe checkout")?;
-        validate_path(path_text)?;
-        let query = if metadata.is_dir() {
-            format!("{path_text}/")
-        } else {
-            path_text.to_owned()
-        };
-        if self.path_is_ignored(&check.work_tree, check, &query)? {
-            return Ok(());
-        }
-        if metadata.is_dir() {
-            // Only descend when the entire directory is not still excluded. This keeps
-            // node_modules/build fast, and lets retained nested ignores protect state.
-            for entry in fs::read_dir(self.root.join(path))? {
-                self.check_ignored_path(check, &path.join(entry?.file_name()))?;
+            let queries: Vec<_> = candidates
+                .iter()
+                .map(|(_, query, _)| query.clone())
+                .collect();
+            let ignored = self.ignored_paths(&check.work_tree, check, &queries)?;
+            pending = Vec::new();
+            let mut exposed = Vec::new();
+            for (path, query, directory) in candidates {
+                if ignored.contains(&query) {
+                    continue;
+                }
+                if directory {
+                    // Descend only when the target does not ignore the entire directory.
+                    // Process all siblings together rather than spawning Git per path.
+                    for entry in fs::read_dir(self.root.join(&path))? {
+                        pending.push(path.join(entry?.file_name()));
+                    }
+                } else {
+                    exposed.push(query);
+                }
             }
-        } else {
-            ensure!(
-                !self.path_is_ignored(&self.root, check, &query)?,
-                "Local path would no longer be ignored at the PR head: {}; keep it ignored or move it outside the workspace before opening the PR",
-                path.display()
-            );
+            let previously_ignored = self.ignored_paths(&self.root, check, &exposed)?;
+            for path in exposed {
+                ensure!(
+                    !previously_ignored.contains(&path),
+                    "Local path would no longer be ignored at the PR head: {}; keep it ignored or move it outside the workspace before opening the PR",
+                    path
+                );
+            }
         }
         Ok(())
     }

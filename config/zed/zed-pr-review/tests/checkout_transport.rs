@@ -440,6 +440,16 @@ fn ignored_files_colocated_and_noncolocated() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn ignored_sibling_directories_use_bounded_batches() -> Result<()> {
+    tracking_scenarios(&["ignore-batched-directories"])
+}
+
+#[test]
+fn ignored_sibling_leaves_use_bounded_batches() -> Result<()> {
+    tracking_scenarios(&["ignore-batched-leaves"])
+}
+
 fn tracking_scenarios(scenarios: &[&str]) -> Result<()> {
     for colocate in [false, true] {
         for scenario in scenarios {
@@ -645,11 +655,14 @@ fn ignored_checkout(
     // Construct the target before any private files exist. Only ignore files are added.
     jj(root, &["new", &pr.head_sha, "-m", "Target ignore rules"])?;
     let nested = scenario.starts_with("ignore-nested-");
+    let batched = scenario.starts_with("ignore-batched-");
     let target_rules = match scenario {
         "ignore-kept" | "ignore-late-file" => ".env\n",
         "ignore-negated" => ".env\n!.env\n",
         "ignore-node-modules" => ".env\nnode_modules/\n",
         "ignore-node-modules-contents" => ".env\nnode_modules/*\n",
+        "ignore-batched-directories" => ".env\ncache/*/\n",
+        "ignore-batched-leaves" => ".env\n*.pyc\n",
         _ => "",
     };
     if !target_rules.is_empty() {
@@ -676,7 +689,9 @@ fn ignored_checkout(
     }
     fs::write(
         root.join(".gitignore"),
-        if nested || scenario.ends_with("excludes") || scenario == "ignore-core-changed" {
+        if batched {
+            ".env\nscratch/\nnode_modules/\ncache/\n"
+        } else if nested || scenario.ends_with("excludes") || scenario == "ignore-core-changed" {
             "scratch/\nnode_modules/\n"
         } else {
             ".env\nscratch/\nnode_modules/\n"
@@ -723,6 +738,18 @@ fn ignored_checkout(
     let secret = format!("private fixture token for {scenario}\n");
     fs::write(root.join(secret_path), &secret)?;
     let mut private_files = vec![(secret_path.to_owned(), secret)];
+    let mut batched_paths = Vec::new();
+    let batched_contents = "private batched cache contents\n";
+    if batched {
+        for index in 0..128 {
+            let path = format!("cache/package {index}\nname/private data\n.pyc");
+            fs::create_dir_all(root.join(&path).parent().unwrap())?;
+            fs::write(root.join(&path), batched_contents)?;
+            batched_paths.push(path);
+        }
+        // All siblings share these bytes; one object-store check covers them all.
+        private_files.push((batched_paths[0].clone(), batched_contents.into()));
+    }
     if scenario.starts_with("ignore-node-modules") {
         fs::create_dir_all(root.join("node_modules/package"))?;
         fs::write(
@@ -775,7 +802,38 @@ fn ignored_checkout(
         scenario,
         "ignore-removed" | "ignore-negated" | "ignore-nested-removed" | "ignore-core-changed"
     );
+    let git_log = fixture.join("git-calls.jsonl");
+    let log_start = if batched {
+        Some(fs::read_to_string(&git_log)?.len())
+    } else {
+        None
+    };
     let result = client.checkout_pr(&pr);
+    if let Some(start) = log_start {
+        // Count only checkout queries, not setup or the object-store checks below.
+        let log = fs::read_to_string(&git_log)?;
+        let calls = log[start..]
+            .lines()
+            .map(serde_json::from_str::<Vec<String>>)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let queries: Vec<_> = calls
+            .iter()
+            .filter(|args| args.iter().any(|arg| arg == "check-ignore"))
+            .collect();
+        assert!(
+            !queries.is_empty() && queries.len() < 10,
+            "{scenario}: expected bounded batches for 128 siblings, got {} queries: {queries:?}",
+            queries.len()
+        );
+        for args in queries {
+            for flag in ["--no-index", "-z", "--stdin"] {
+                assert!(
+                    args.iter().any(|arg| arg == flag),
+                    "missing {flag}: {args:?}"
+                );
+            }
+        }
+    }
     if rejected {
         assert!(result.is_err(), "must refuse newly exposed private files");
         assert_eq!(
@@ -828,6 +886,13 @@ fn ignored_checkout(
         client.blob(&previous, "keep.txt")?,
         b"original local work\n"
     );
+    for path in batched_paths {
+        assert_eq!(
+            fs::read_to_string(root.join(&path))?,
+            batched_contents,
+            "{path:?}"
+        );
+    }
     for (path, contents) in private_files {
         assert_eq!(
             fs::read_to_string(root.join(&path))?,
