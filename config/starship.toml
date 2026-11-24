@@ -1,353 +1,225 @@
+# Ported from p10k (p10k.zsh, lean one-line style, transparent background).
+# Layout matches p10k:
+#   left:  dir, vcs, prompt_char
+#   right: status, duration, jobs, direnv, tool versions, k8s, terraform,
+#          gcloud, user@host
+# Icons are short text labels (pre-existing choice); colors are p10k's
+# 256-color values.
+
 "$schema" = 'https://starship.rs/config-schema.json'
+
+# p10k: POWERLEVEL9K_PROMPT_ADD_NEWLINE=false
+add_newline = false
+
+# p10k left: dir, vcs, prompt_char
+format = '$directory$git_branch$git_commit$git_state$git_status$character'
+
+# p10k right: status, command_execution_time, background_jobs, direnv,
+# tool versions, kubecontext, terraform, clouds, context
+right_format = '$status$cmd_duration$jobs$direnv$python$conda$nodejs$golang$rust$dotnet$dart$ruby$lua$java$perl$erlang$elixir$php$haskell$julia$scala$nix_shell$kubernetes$terraform$gcloud$username$hostname'
 
 continuation_prompt = "[.](bright-black) "
 
+# prompt_char: ❯ insert, ❮ command, V visual, ▶ overwrite; fg 76 on success,
+# fg 196 on error. (zsh only honors vimcmd_symbol; the rest are for fish.)
 [character]
-success_symbol = "[>](bold green)"
-error_symbol = "[x](bold red)"
-vimcmd_symbol = "[<](bold green)"
-vimcmd_visual_symbol = "[<](bold yellow)"
-vimcmd_replace_symbol = "[<](bold purple)"
-vimcmd_replace_one_symbol = "[<](bold purple)"
+success_symbol = '[❯](76)'
+error_symbol = '[❯](196)'
+vimcmd_symbol = '[❮](76)'
+vimcmd_visual_symbol = '[V](76)'
+vimcmd_replace_symbol = '[▶](76)'
+vimcmd_replace_one_symbol = '[▶](76)'
 
+# dir: fg 31, anchor segments (home, repo root) bold 39, lock if not writable.
+# p10k shortens to unique prefixes in fg 103; starship only truncates by
+# level, so long paths look different.
+[directory]
+style = '31'
+before_repo_root_style = 'bold 39'
+repo_root_style = 'bold 39'
+read_only = ' ro'
+
+# vcs: no branch icon, branch fg 76, ":remote" only when it differs from the
+# local branch (default fg).
+[git_branch]
+symbol = ''
+format = '[$branch(:$remote_branch)](76) '
+truncation_length = 32
+truncation_symbol = '…'
+
+# p10k shows "#tag" when detached on a tag, else "@hash8". starship can't
+# hide the hash when a tag is present, so detached on a tag shows "hash#tag".
+[git_commit]
+format = '[$hash$tag]($style) '
+style = '76'
+only_detached = true
+tag_disabled = false
+tag_symbol = '#'
+commit_hash_length = 8
+
+# p10k: bare action word (merge, rebase, …), fg 196.
+[git_state]
+format = '[$state]($style) '
+style = '196'
+
+# p10k counts: ~N conflicted 196, *N stash 76, +N staged 178, !N unstaged 178,
+# ?N untracked 39, ⇣/⇡ 76. Staged deletions and renames fold into +N, so
+# their symbols are empty.
+[git_status]
+# p10k order: ahead/behind, stash, conflicts, staged, unstaged, untracked.
+format = '$ahead_behind$stashed$conflicted$staged$modified$untracked'
+conflicted = '[~$count](196) '
+stashed = '[*$count](76) '
+modified = '[!$count](178) '
+staged = '[+$count](178) '
+untracked = '[?$count](39) '
+ahead = '[⇡$count](76) '
+behind = '[⇣$count](76) '
+diverged = '[⇣$behind_count⇡$ahead_count](76) '
+up_to_date = ''
+deleted = ''
+renamed = ''
+typechanged = ''
+
+# status: p10k hides it on success and on plain errors (the prompt char
+# covers those) and shows it only for signals and pipe failures, fg 160.
+# starship can't hide plain errors, so this shows the code or signal name
+# whenever the last command failed.
+[status]
+symbol = 'x '
+format = '[$symbol$common]($style) '
+style = '160'
+not_executable_symbol = 'noexec'
+not_found_symbol = 'notfound'
+sigint_symbol = 'sigint'
+signal_symbol = 'sig'
+
+# command_execution_time: threshold 0, 2 decimals, fg 101, no "took" prefix.
 [cmd_duration]
 min_time = 0
 show_milliseconds = true
+format = '[$duration]($style) '
+style = '101'
 
-[git_commit]
-tag_symbol = " tag "
+# background_jobs: symbol only, no count, fg 70.
+[jobs]
+style = '70'
+number_threshold = 999999
 
-[git_status]
-ahead = ">"
-behind = "<"
-diverged = "<>"
-renamed = "r"
-deleted = "x"
+# direnv: fg 178. Disabled by default in starship.
+[direnv]
+disabled = false
+style = '178'
 
-[aws]
-disabled = true
-symbol = "aws "
-
-[azure]
-symbol = "az "
-
-[battery]
-full_symbol = "full "
-charging_symbol = "charging "
-discharging_symbol = "discharging "
-unknown_symbol = "unknown "
-empty_symbol = "empty "
-
-[buf]
-symbol = "buf "
-
-[bun]
-symbol = "bun "
-
-[c]
-symbol = "C "
-
-[cpp]
-symbol = "C++ "
-
-[cobol]
-symbol = "cobol "
+# Tool versions: colors from p10k asdf/virtualenv/rbenv/luaenv/jenv/plenv/
+# phpenv/scalaenv/haskell_stack segments.
+[python]
+symbol = 'py '
+style = '37'
 
 [conda]
-symbol = "conda "
-
-[container]
-symbol = "container "
-
-[crystal]
-symbol = "cr "
-
-[cmake]
-symbol = "cmake "
-
-[daml]
-symbol = "daml "
-
-[dart]
-symbol = "dart "
-
-[deno]
-symbol = "deno "
-
-[dotnet]
-format = "via [$symbol($version )(target $tfm )]($style)"
-symbol = ".NET "
-
-[directory]
-read_only = " ro"
-
-[docker_context]
-symbol = "docker "
-
-[elixir]
-symbol = "exs "
-
-[elm]
-symbol = "elm "
-
-[erlang]
-symbol = "erl "
-
-[fennel]
-symbol = "fnl "
-
-[fortran]
-symbol = "fortran "
-
-[fossil_branch]
-symbol = "fossil "
-truncation_symbol = "..."
-
-[gcloud]
-symbol = "gcp "
-
-[git_branch]
-symbol = "git "
-truncation_symbol = "..."
-
-[gleam]
-symbol = "gleam "
-
-[golang]
-symbol = "go "
-
-[gradle]
-symbol = "gradle "
-
-[guix_shell]
-symbol = "guix "
-
-[haskell]
-symbol = "haskell "
-
-[haxe]
-symbol = "hx "
-
-[helm]
-symbol = "helm "
-
-[hg_branch]
-symbol = "hg "
-truncation_symbol = "..."
-
-[hostname]
-ssh_symbol = "ssh "
-
-[java]
-symbol = "java "
-
-[jj_bookmark]
-symbol = "jj "
-truncation_symbol = "..."
-
-[jj_status]
-description_empty = "e"
-immutable = "i"
-deleted = "x"
-renamed = "r"
-
-[jobs]
-symbol = "*"
-
-[julia]
-symbol = "jl "
-
-[kotlin]
-symbol = "kt "
-
-[kubernetes]
-symbol = "kubernetes "
-
-[lua]
-symbol = "lua "
-
-[maven]
-symbol = "maven "
+symbol = 'conda '
+style = '37'
 
 [nodejs]
-symbol = "nodejs "
+symbol = 'nodejs '
+style = '70'
 
-[memory_usage]
-symbol = "memory "
-
-[meson]
-symbol = "meson "
-truncation_symbol = "..."
-
-[mojo]
-symbol = "mojo "
-
-[nats]
-symbol = "nats "
-
-[netns]
-symbol = "netns "
-
-[nim]
-symbol = "nim "
-
-[nix_shell]
-symbol = "nix "
-
-[ocaml]
-symbol = "ml "
-
-[odin]
-symbol = "odin "
-
-[opa]
-symbol = "opa "
-
-[openstack]
-symbol = "openstack "
-
-[os.symbols]
-AIX = "aix "
-Alpaquita = "alq "
-AlmaLinux = "alma "
-Alpine = "alp "
-ALTLinux = "alt "
-Amazon = "amz "
-Android = "andr "
-AOSC = "aosc "
-Arch = "rch "
-Artix = "atx "
-Bazzite = "bazz "
-Bluefin = "blfn "
-CachyOS = "cach "
-CentOS = "cent "
-Debian = "deb "
-DragonFly = "dfbsd "
-Elementary = "elem "
-Emscripten = "emsc "
-EndeavourOS = "ndev "
-Fedora = "fed "
-FreeBSD = "fbsd "
-Garuda = "garu "
-Gentoo = "gent "
-HardenedBSD = "hbsd "
-Hurd = "hurd "
-Illumos = "lum "
-Ios = "ios "
-InstantOS = "inst "
-Kali = "kali "
-KDENeon = "kde "
-Linux = "lnx "
-Mabox = "mbox "
-Macos = "mac "
-Manjaro = "mjo "
-Mariner = "mrn "
-MidnightBSD = "mid "
-Mint = "mint "
-NetBSD = "nbsd "
-NixOS = "nix "
-Nobara = "nbra "
-OpenBSD = "obsd "
-OpenCloudOS = "ocos "
-openEuler = "oeul "
-openSUSE = "osuse "
-OracleLinux = "orac "
-PikaOS = "pika "
-Pop = "pop "
-Raspbian = "rasp "
-Redhat = "rhl "
-RedHatEnterprise = "rhel "
-RockyLinux = "rky "
-Redox = "redox "
-Solus = "sol "
-SUSE = "suse "
-Ubuntu = "ubnt "
-Ultramarine = "ultm "
-Unknown = "unk "
-Uos = "uos "
-Void = "void "
-Windows = "win "
-Zorin = "zorn "
-
-[package]
-symbol = "pkg "
-
-[perl]
-symbol = "pl "
-
-[php]
-symbol = "php "
-
-[pijul_channel]
-symbol = "pijul "
-truncation_symbol = "..."
-
-[pixi]
-symbol = "pixi "
-
-[pulumi]
-symbol = "pulumi "
-
-[purescript]
-symbol = "purs "
-
-[python]
-symbol = "py "
-
-[quarto]
-symbol = "quarto "
-
-[raku]
-symbol = "raku "
-
-[red]
-symbol = "red "
-
-[rlang]
-symbol = "r "
-
-[ruby]
-symbol = "rb "
+[golang]
+symbol = 'go '
+style = '37'
 
 [rust]
-symbol = "rs "
+symbol = 'rs '
+style = '37'
+
+[dotnet]
+symbol = '.NET '
+style = '134'
+format = "via [$symbol($version )(target $tfm )]($style) "
+
+# asdf flutter
+[dart]
+symbol = 'dart '
+style = '38'
+
+[ruby]
+symbol = 'rb '
+style = '168'
+
+[lua]
+symbol = 'lua '
+style = '32'
+
+[java]
+symbol = 'java '
+style = '32'
+
+[perl]
+symbol = 'pl '
+style = '67'
+
+[erlang]
+symbol = 'erl '
+style = '125'
+
+[elixir]
+symbol = 'exs '
+style = '129'
+
+[php]
+symbol = 'php '
+style = '99'
+
+[haskell]
+symbol = 'haskell '
+style = '172'
+
+[julia]
+symbol = 'jl '
+style = '70'
 
 [scala]
-symbol = "scala "
+symbol = 'scala '
+style = '160'
 
-[shlvl]
-symbol = "shlvl "
+[nix_shell]
+symbol = 'nix '
+style = '74'
 
-[spack]
-symbol = "spack "
+# kubecontext: fg 134. p10k shows it only while typing kubectl/helm/etc.;
+# starship shows it whenever a context is set.
+[kubernetes]
+symbol = 'kubernetes '
+style = '134'
 
-[solidity]
-symbol = "solidity "
-
-[status]
-symbol = "[x](bold red) "
-not_executable_symbol = "noexec"
-not_found_symbol = "notfound"
-sigint_symbol = "sigint"
-signal_symbol = "sig"
-
-[sudo]
-symbol = "sudo "
-
-[swift]
-symbol = "swift "
-
-[typst]
-symbol = "typst "
-
-[vagrant]
-symbol = "vagrant "
-
+# terraform: fg 38. p10k hides the "default" workspace; starship can't.
 [terraform]
-symbol = "terraform "
+symbol = 'terraform '
+style = '38'
 
-[xmake]
-symbol = "xmake "
+# gcloud: fg 32. p10k shows it only while typing gcloud/gcs.
+[gcloud]
+symbol = 'gcp '
+style = '32'
 
-[zig]
-symbol = "zig "
+# context: p10k shows user@host only when root (bold, fg 178) or in SSH
+# (fg 180). Local root shows "user@" with no host, since starship only
+# shows the hostname over SSH.
+[username]
+format = '[$user@]($style)'
+style_user = '180'
+style_root = 'bold 178'
+
+[hostname]
+ssh_only = true
+format = '[$hostname]($style) '
+style = '180'
+
+# Not ported from p10k (no starship equivalent): todo, timewarrior,
+# taskwarrior, nordvpn, ranger, nnn, vim_shell, midnight_commander,
+# aws_eb_env, google_app_cred, postgres.
+# p10k gates aws/azure on the typed command; starship has no such option, so
+# they stay out of the prompt rather than show all the time.
+# p10k hides git status in the home dir (VCS_DISABLED_WORKDIR_PATTERN='~');
+# starship has no equivalent.
