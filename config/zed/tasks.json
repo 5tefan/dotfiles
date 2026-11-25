@@ -100,6 +100,23 @@
     },
   },
   {
+    "label": "PR: push stack",
+    "command": "~/.config/zed/zed-pr-review/target/release/zed-pr-review push",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "save": "all",
+    "reveal": "always",
+    "hide": "never",
+    "allow_concurrent_runs": false,
+    "use_new_terminal": false,
+    "show_command": false,
+    "shell": {
+      "with_arguments": {
+        "program": "/bin/zsh",
+        "args": ["-f"],
+      },
+    },
+  },
+  {
     "label": "PR: open for review",
     "command": "~/.config/zed/zed-pr-review/target/release/zed-pr-review open",
     "cwd": "$ZED_WORKTREE_ROOT",

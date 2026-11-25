@@ -18,6 +18,7 @@
       "ctrl-shift-n": ["task::Spawn", { "task_name": "jj new" }],
       "ctrl-shift-m": ["task::Spawn", { "task_name": "jj squash" }],
       "ctrl-shift-r": ["task::Spawn", { "task_name": "jj revision ready" }],
+      "ctrl-shift-p": ["task::Spawn", { "task_name": "PR: push stack" }],
       "ctrl-shift-g": ["task::Spawn", { "task_name": "PR: open for review" }],
       "ctrl-shift-x": [
         "task::Spawn",

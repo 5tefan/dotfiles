@@ -35,6 +35,7 @@ The tasks in `../tasks.json` run `~/.config/zed/zed-pr-review/target/release/zed
 | `jj sb`               | Ctrl-Shift-J | Global  | Step down the stack (`jj sb`).                                                          |
 | `jj sf`               | Ctrl-Shift-K | Global  | Step up the stack (`jj sf`).                                                            |
 | `jj revision ready`   | Ctrl-Shift-R | Global  | Mark the checked-out PR ready for review and optionally request a reviewer.             |
+| `PR: push stack`      | Ctrl-Shift-P | Global  | Push the current `jj` bookmark stack to `origin` and create or retarget GitHub PRs.     |
 
 ## How the Review Stack Works
 
@@ -113,6 +114,7 @@ Subcommands:
 
 - `open` — build or refresh the local `jj` review stack and check out the PR
 - `close` — abandon all `review/pr-*` revisions, forget bookmarks, and return to previous `@`
+- `push [-r REVSET] [--dry-run] [--json] [-t/--update-title] [-o/--open] [-n/--force-new-pr] [--ready] [--allow-empty-description]` — push the current `jj` bookmark stack to `origin` and create or retarget GitHub PRs
 - `stack [--watch]` — run `jj l` (or the live interactive viewer with `--watch`)
 - `sb` / `sf` — run `jj sb` / `jj sf`
 - `comment` — save an inline comment from Zed's selection environment variables

@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use zed_pr_review::github::{Client, checkout_sha, workspace_git_dir, workspace_root};
 use zed_pr_review::message::{review_summary, review_template};
 use zed_pr_review::model::{Comment, PullRequest};
+use zed_pr_review::push::{self, PushOptions};
 use zed_pr_review::ready;
 use zed_pr_review::review_menu::{self, ReviewAction};
 use zed_pr_review::review_stack::{self, ReviewEntry};
@@ -64,6 +65,33 @@ enum Action {
         /// GitHub username or ORG/TEAM to request as reviewer
         #[arg(long)]
         reviewer: Option<String>,
+    },
+    /// Push the current jj bookmark stack to origin and create or retarget GitHub PRs
+    Push {
+        /// Override the default stack scope with an explicit jj revset
+        #[arg(short, long)]
+        revset: Option<String>,
+        /// Preview the push and PR plan without pushing or mutating GitHub
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit a machine-readable JSON summary of the pushed stack
+        #[arg(long)]
+        json: bool,
+        /// Update titles of existing PRs from the first line of jj descriptions
+        #[arg(short = 't', long)]
+        update_title: bool,
+        /// Open created/updated PR URLs in the browser
+        #[arg(short, long)]
+        open: bool,
+        /// Create new PRs instead of updating existing ones
+        #[arg(short = 'n', long)]
+        force_new_pr: bool,
+        /// Create new PRs as ready (or mark existing draft PRs ready)
+        #[arg(long)]
+        ready: bool,
+        /// Allow pushing bookmarks whose commit description is empty
+        #[arg(long)]
+        allow_empty_description: bool,
     },
     /// Finish or abandon the current PR review, or close the review stack
     Finish,
@@ -163,6 +191,36 @@ fn run(cli: Cli) -> Result<()> {
         println!("{} — {}", pr.url, printable(&pr.title));
         return ready::run(&client, &pr, reviewer.as_deref());
     }
+    if let Action::Push {
+        revset,
+        dry_run,
+        json,
+        update_title,
+        open,
+        force_new_pr,
+        ready,
+        allow_empty_description,
+    } = &cli.command
+    {
+        ensure!(
+            cli.draft_dir.is_none(),
+            "--draft-dir cannot be used with push"
+        );
+        ensure!(cli.pr.is_none(), "--pr cannot be used with push");
+        let client = Client::for_workspace(&directory, cli.repo.as_deref())?;
+        let opts = PushOptions {
+            revset: revset.clone(),
+            dry_run: *dry_run,
+            json: *json,
+            update_title: *update_title,
+            open: *open,
+            force_new_pr: *force_new_pr,
+            ready: *ready,
+            allow_empty_description: *allow_empty_description,
+        };
+        push::run(&client, &opts)?;
+        return Ok(());
+    }
 
     let mut workspace_lock = None;
     let mut active_review: Option<ReviewEntry> = None;
@@ -210,6 +268,7 @@ fn run(cli: Cli) -> Result<()> {
         | Action::Close
         | Action::Comment
         | Action::Ready { .. }
+        | Action::Push { .. }
         | Action::Stack { .. }
         | Action::Sb
         | Action::Sf

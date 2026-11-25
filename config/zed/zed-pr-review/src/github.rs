@@ -78,6 +78,27 @@ pub(crate) struct ReadyState {
     pub base_ref: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BranchPrState {
+    Open,
+    Closed,
+    Merged,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchPr {
+    pub number: u64,
+    pub node_id: String,
+    pub state: BranchPrState,
+    pub draft: bool,
+    pub title: String,
+    pub head_ref: String,
+    pub head_sha: String,
+    pub base_ref: String,
+    pub url: String,
+    pub author: String,
+}
+
 struct RecordedRevision {
     commit_id: String,
     empty_parent: Option<String>,
@@ -270,6 +291,16 @@ impl Client {
         Ok((client, pull))
     }
 
+    /// Resolve the repository and authenticated GitHub user for a workspace
+    /// without requiring an existing PR on `@`.
+    pub fn for_workspace(directory: &Path, repo: Option<&str>) -> Result<Self> {
+        let repo = repo.map(parse_repo_spec).transpose()?;
+        let target = explicit_target(None, repo.as_ref())?;
+        let mut client = Self::in_workspace(directory, target)?;
+        client.reviewer = client.authenticated_reviewer()?;
+        Ok(client)
+    }
+
     fn in_workspace(directory: &Path, target: Option<Target>) -> Result<Self> {
         let root = workspace_root(directory)?;
         let git_dir = command_path(
@@ -339,16 +370,99 @@ impl Client {
 
     pub(crate) fn mark_ready(&self, state: &ReadyState) -> Result<()> {
         self.check_identity(&state.pr)?;
+        self.mark_pr_ready(&state.node_id)
+    }
+
+    /// Mark a draft pull request ready for review via GitHub's GraphQL API.
+    pub fn mark_pr_ready(&self, node_id: &str) -> Result<()> {
+        self.validate_target()?;
+        ensure!(
+            !node_id.trim().is_empty(),
+            "PR response has an empty node_id"
+        );
         let response = self.post_json("graphql", &json!({
             "query": "mutation($id: ID!) { markPullRequestReadyForReview(input: {pullRequestId: $id}) { pullRequest { id isDraft } } }",
-            "variables": {"id": state.node_id},
+            "variables": {"id": node_id},
         }))?;
         let pr = &response["data"]["markPullRequestReadyForReview"]["pullRequest"];
         ensure!(
-            response.get("errors").is_none() && pr["id"] == state.node_id && pr["isDraft"] == false,
+            response.get("errors").is_none() && pr["id"] == node_id && pr["isDraft"] == false,
             "Unexpected mark-ready response; outcome is uncertain, check GitHub before retrying"
         );
         Ok(())
+    }
+
+    /// List all PRs (open, closed, merged) for a head branch in this repository.
+    pub fn list_prs_for_head(&self, head: &str) -> Result<Vec<BranchPr>> {
+        self.validate_target()?;
+        validate_bookmark(head)?;
+        let owner = self
+            .repo
+            .split_once('/')
+            .map(|(owner, _)| owner)
+            .context("Repository must be OWNER/REPO")?;
+        let head_filter = percent_encode_query_value(&format!("{owner}:{head}"));
+        let endpoint = format!(
+            "repos/{}/pulls?state=all&head={head_filter}&per_page=100",
+            self.repo
+        );
+        let items: Vec<Value> = self.get_pages(&endpoint)?;
+        items
+            .iter()
+            .map(|item| map_branch_pr(item, &self.target()))
+            .collect()
+    }
+
+    /// Create a new PR in this repository.
+    pub fn create_pr(
+        &self,
+        head: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+        draft: bool,
+    ) -> Result<BranchPr> {
+        self.validate_target()?;
+        validate_bookmark(head)?;
+        validate_bookmark(base)?;
+        let endpoint = format!("repos/{}/pulls", self.repo);
+        let payload = json!({
+            "head": head,
+            "base": base,
+            "title": title,
+            "body": body,
+            "draft": draft,
+        });
+        let response = self.send_json("POST", &endpoint, &payload)?;
+        map_branch_pr(&response, &self.target())
+    }
+
+    /// Update an existing PR's base, title, and/or state. Never touches `body`.
+    pub fn update_pr(
+        &self,
+        number: u64,
+        base: Option<&str>,
+        title: Option<&str>,
+        state: Option<&str>,
+    ) -> Result<BranchPr> {
+        let endpoint = self.pr_endpoint(number)?;
+        let mut map = serde_json::Map::new();
+        if let Some(base) = base {
+            validate_bookmark(base)?;
+            map.insert("base".to_owned(), Value::String(base.to_owned()));
+        }
+        if let Some(title) = title {
+            map.insert("title".to_owned(), Value::String(title.to_owned()));
+        }
+        if let Some(state) = state {
+            map.insert("state".to_owned(), Value::String(state.to_owned()));
+        }
+        ensure!(
+            !map.is_empty(),
+            "update_pr requires at least one field to update"
+        );
+        let response = self.send_json("PATCH", &endpoint, &Value::Object(map))?;
+        map_branch_pr(&response, &self.target())
     }
 
     pub(crate) fn request_reviewer(&self, pr: &PullRequest, reviewer: &str) -> Result<()> {
@@ -1750,8 +1864,12 @@ impl Client {
     }
 
     fn post_json(&self, endpoint: &str, payload: &Value) -> Result<Value> {
+        self.send_json("POST", endpoint, payload)
+    }
+
+    fn send_json(&self, method: &str, endpoint: &str, payload: &Value) -> Result<Value> {
         let body = serde_json::to_vec(payload).context("Cannot encode GitHub request")?;
-        let mut command = self.api_command("POST", endpoint)?;
+        let mut command = self.api_command(method, endpoint)?;
         command.args(["--input", "-"]).stdin(Stdio::piped());
         let mut child = command
             .spawn()
@@ -2294,6 +2412,68 @@ fn check_pr_url(url: &str, target: &Target, number: u64) -> Result<()> {
         "GitHub response does not match the requested PR identity"
     );
     Ok(())
+}
+
+fn percent_encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn map_branch_pr(value: &Value, target: &Target) -> Result<BranchPr> {
+    let number = value
+        .get("number")
+        .and_then(Value::as_u64)
+        .context("GitHub PR response is missing numeric field number")?;
+    ensure!(number > 0, "GitHub PR number must be positive");
+    let url = required_string(value, "html_url")?;
+    check_pr_url(url, target, number)?;
+    let state_str = required_string(value, "state")?;
+    let merged_at = value
+        .get("merged_at")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let state = if merged_at.is_some() {
+        BranchPrState::Merged
+    } else if state_str == "open" {
+        BranchPrState::Open
+    } else {
+        BranchPrState::Closed
+    };
+    let head_ref = required_string(&value["head"], "ref")?;
+    let head_sha = required_string(&value["head"], "sha")?;
+    validate_sha(head_sha)?;
+    let base_ref = required_string(&value["base"], "ref")?;
+    let title = required_string(value, "title")?;
+    let author = value
+        .get("user")
+        .and_then(|u| u.get("login"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let draft = value.get("draft").and_then(Value::as_bool).unwrap_or(false);
+    let node_id = value
+        .get("node_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    Ok(BranchPr {
+        number,
+        node_id,
+        state,
+        draft,
+        title: title.to_owned(),
+        head_ref: head_ref.to_owned(),
+        head_sha: head_sha.to_ascii_lowercase(),
+        base_ref: base_ref.to_owned(),
+        url: url.to_owned(),
+        author: author.to_owned(),
+    })
 }
 
 fn map_pr(value: &Value, target: &Target, number: u64, reviewer: &str) -> Result<PullRequest> {

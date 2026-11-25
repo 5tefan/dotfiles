@@ -148,6 +148,9 @@
               "pattern": "^(JJ_PAGER=cat\\s+)?jj\\s+(?:(?:--no-pager|--ignore-working-copy)\\s+)*(?:new|status|log|desc|describe|diff|edit|squash|split|resolve|file|op log|bookmark|absorb)\\b",
             },
             {
+              "pattern": "^jj\\s+--version$",
+            },
+            {
               "pattern": "^(bin/)?shamecube\\b",
             },
             {
