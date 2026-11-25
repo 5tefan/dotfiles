@@ -438,6 +438,47 @@ pub fn make_comment(
         column: selection.column,
         selected_text: normalize_line_endings(&selection.text)?.into_owned(),
         body,
+        agent: false,
+    };
+    validate_comment(&comment, content, files)?;
+    Ok(comment)
+}
+
+/// Build and validate an inline comment from explicit repo-relative path and 1-based
+/// RIGHT-side line numbers against the pinned PR head blob and cached diff patches.
+pub fn make_comment_from_lines(
+    path: &str,
+    start_line: u32,
+    line: u32,
+    content: &[u8],
+    files: &[ChangedFile],
+    body: String,
+    agent: bool,
+) -> Result<Comment> {
+    safe_path(path)?;
+    ensure!(
+        start_line > 0 && start_line <= line,
+        "line range must be one-based with start_line <= line"
+    );
+    let content_text = text_blob(content)?;
+    let normalized = normalize_line_endings(content_text)?;
+    let lines: Vec<&str> = normalized.lines().collect();
+    let start_idx = usize::try_from(start_line - 1).context("start_line exceeds usize")?;
+    let end_idx = usize::try_from(line - 1).context("line exceeds usize")?;
+    ensure!(
+        end_idx < lines.len(),
+        "line {line} is outside the file ({} lines)",
+        lines.len()
+    );
+    let selected_text = lines[start_idx..=end_idx].join("\n");
+    let comment = Comment {
+        path: path.to_owned(),
+        start_line,
+        line,
+        column: 1,
+        selected_text,
+        body,
+        agent,
     };
     validate_comment(&comment, content, files)?;
     Ok(comment)
@@ -479,6 +520,7 @@ mod tests {
             column: 3,
             selected_text: "α\nlast\n".into(),
             body: "Please explain this.".into(),
+            agent: false,
         }
     }
 
@@ -1133,5 +1175,61 @@ mod tests {
         assert!(make_comment(root.path(), &selection, CONTENT, &files, "body".into()).is_err());
         selection.text = " \n".into();
         assert!(make_comment(root.path(), &selection, CONTENT, &files, "body".into()).is_err());
+    }
+
+    #[test]
+    fn make_comment_from_lines_extracts_selected_text_and_validates_hunk() {
+        let files = [changed_file("src/example.rs", Some(PATCH))];
+        let comment = make_comment_from_lines(
+            "src/example.rs",
+            2,
+            3,
+            CONTENT,
+            &files,
+            "Check this logic.".into(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(comment.path, "src/example.rs");
+        assert_eq!(comment.start_line, 2);
+        assert_eq!(comment.line, 3);
+        assert_eq!(comment.column, 1);
+        assert_eq!(comment.selected_text, "éα\nlast");
+        assert_eq!(comment.body, "Check this logic.");
+        assert!(comment.agent);
+
+        // Out-of-hunk line is rejected.
+        let narrow_patch = "@@ -2,1 +2,2 @@\n-old\n+éα\n+last\n";
+        let narrow_files = [changed_file("src/example.rs", Some(narrow_patch))];
+        assert!(
+            make_comment_from_lines(
+                "src/example.rs",
+                1,
+                1,
+                CONTENT,
+                &narrow_files,
+                "note".into(),
+                false,
+            )
+            .is_err()
+        );
+        // Out-of-bounds line is rejected.
+        assert!(
+            make_comment_from_lines(
+                "src/example.rs",
+                1,
+                99,
+                CONTENT,
+                &files,
+                "note".into(),
+                false,
+            )
+            .is_err()
+        );
+        // Unsafe path is rejected.
+        assert!(
+            make_comment_from_lines("../example.rs", 2, 2, CONTENT, &files, "note".into(), false,)
+                .is_err()
+        );
     }
 }

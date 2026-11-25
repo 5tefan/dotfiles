@@ -28,6 +28,7 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use unicode_width::UnicodeWidthStr;
 
 use crate::ci_status::{self, CiBadge, CiRequest};
+use crate::feedback::{self, ThreadBadgeRequest};
 use crate::log_data::{self, Revision, RevisionSpan, Snapshot};
 
 const REFRESH: Duration = Duration::from_secs(1);
@@ -332,6 +333,7 @@ fn draw(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     view: &mut View,
     ci_badges: &HashMap<String, CiBadge>,
+    thread_badges: &HashMap<String, usize>,
     status: &str,
     editing: bool,
 ) -> Result<Rect> {
@@ -347,7 +349,7 @@ fn draw(
             Rect::new(area.x, area.y, area.width, area.height.min(1)));
         if let Some(snapshot) = &view.snapshot {
             let mut lines: Vec<_> = snapshot.lines.iter().skip(view.top).take(view.height).cloned().collect();
-            if !ci_badges.is_empty() {
+            if !ci_badges.is_empty() || !thread_badges.is_empty() {
                 let mut badged_rows = HashSet::new();
                 for span in &snapshot.revisions {
                     if span.row < view.top || span.row >= view.top + view.height {
@@ -356,11 +358,17 @@ fn draw(
                     if !badged_rows.insert(span.row) {
                         continue;
                     }
-                    if let Some(&badge) = ci_badges.get(&span.revision.commit_id)
-                        && let Some(line) = lines.get_mut(span.row - view.top)
-                    {
-                        line.spans.push(ratatui::text::Span::raw(" "));
-                        line.spans.push(log_data::format_ci_badge(badge));
+                    if let Some(line) = lines.get_mut(span.row - view.top) {
+                        if let Some(&badge) = ci_badges.get(&span.revision.commit_id) {
+                            line.spans.push(ratatui::text::Span::raw(" "));
+                            line.spans.push(log_data::format_ci_badge(badge));
+                        }
+                        if let Some(&count) = thread_badges.get(&span.revision.commit_id)
+                            && count > 0
+                        {
+                            line.spans.push(ratatui::text::Span::raw(" "));
+                            line.spans.push(log_data::format_thread_badge(count));
+                        }
                     }
                 }
             }
@@ -407,6 +415,8 @@ pub fn run(root: &Path) -> Result<()> {
     let (requests, replies) = worker(root)?;
     let mut ci_worker = ci_status::spawn_worker(root);
     let mut ci_badges: HashMap<String, CiBadge> = HashMap::new();
+    let mut thread_worker = feedback::spawn_badge_worker(root);
+    let mut thread_badges: HashMap<String, usize> = HashMap::new();
     let mut view = View::default();
     let mut click = Click::default();
     let mut pending = None;
@@ -440,6 +450,27 @@ pub fn run(root: &Path) -> Result<()> {
                 ci_worker = None;
             }
         }
+        if let Some(tb) = thread_worker.as_ref() {
+            let mut disconnected = false;
+            loop {
+                match tb.replies.try_recv() {
+                    Ok(badges) => {
+                        if badges != thread_badges {
+                            thread_badges = badges;
+                            dirty = true;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            if disconnected {
+                thread_worker = None;
+            }
+        }
         let reply = match replies.try_recv() {
             Ok(Reply::Edited(result)) => {
                 busy = false;
@@ -465,13 +496,18 @@ pub fn run(root: &Path) -> Result<()> {
             match loaded {
                 Ok(snapshot) => {
                     let linked = !snapshot.revisions.is_empty();
-                    if let Some(ci) = ci_worker.as_ref() {
+                    if ci_worker.is_some() || thread_worker.is_some() {
                         let commits: Vec<String> = snapshot
                             .revisions
                             .iter()
                             .map(|s| s.revision.commit_id.clone())
                             .collect();
-                        let _ = ci.requests.send(CiRequest::UpdateCommits(commits));
+                        if let Some(ci) = ci_worker.as_ref() {
+                            let _ = ci.requests.send(CiRequest::UpdateCommits(commits.clone()));
+                        }
+                        if let Some(tb) = thread_worker.as_ref() {
+                            let _ = tb.requests.send(ThreadBadgeRequest::UpdateCommits(commits));
+                        }
                     }
                     view.apply(snapshot);
                     if read_failed || status == "Loading jj l…" {
@@ -512,6 +548,7 @@ pub fn run(root: &Path) -> Result<()> {
                 &mut terminal,
                 &mut view,
                 &ci_badges,
+                &thread_badges,
                 &status,
                 editing || pending.is_some(),
             )?;

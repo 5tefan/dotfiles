@@ -153,6 +153,139 @@ enum PrDecision {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StackBookmark {
+    pub bookmark: String,
+    pub commit_id: String,
+    pub change_id: String,
+    pub description_first_line: String,
+    pub remote_target: Option<String>,
+}
+
+/// Discover the current jj stack's eligible local bookmarks in bottom-to-top
+/// topological order without rejecting empty descriptions.
+pub(crate) fn discover_stack_bookmarks(
+    root: &Path,
+    git_dir: &Path,
+    revset: Option<&str>,
+    ignore_wc: bool,
+) -> Result<Vec<StackBookmark>> {
+    let origin_bookmarks = read_origin_bookmarks(root, ignore_wc)?;
+    let trunk_bookmark = resolve_trunk_bookmark(root, git_dir, &origin_bookmarks)?;
+
+    let (all_commits, selected_ids) = if let Some(revset) = revset {
+        let selected_commits = read_commits(root, revset, ignore_wc)?;
+        ensure!(
+            !selected_commits.is_empty(),
+            "Revset `{revset}` did not match any revisions"
+        );
+        let selected_ids: HashSet<String> = selected_commits
+            .iter()
+            .map(|c| c.commit_id.clone())
+            .collect();
+        let graph_revset = format!("trunk()..({revset}) | ({revset})");
+        let graph_commits = read_commits(root, &graph_revset, true)?;
+        let mut by_id: HashMap<String, CommitInfo> = graph_commits
+            .into_iter()
+            .map(|c| (c.commit_id.clone(), c))
+            .collect();
+        for c in selected_commits {
+            by_id.entry(c.commit_id.clone()).or_insert(c);
+        }
+        (by_id, selected_ids)
+    } else {
+        let up_to_at: HashSet<String> = read_commits(root, "trunk()..@ & mutable()", ignore_wc)?
+            .into_iter()
+            .map(|c| c.commit_id)
+            .collect();
+        let descendants_of_at: HashSet<String> = read_commits(root, "(@:: ~ @) & mutable()", true)?
+            .into_iter()
+            .map(|c| c.commit_id)
+            .collect();
+        let connected = read_commits(root, "roots(trunk()..@):: & mutable()", true)?;
+        let by_id: HashMap<String, CommitInfo> = connected
+            .into_iter()
+            .map(|c| (c.commit_id.clone(), c))
+            .collect();
+        let selected_ids = select_default_commits(
+            &by_id,
+            &up_to_at,
+            &descendants_of_at,
+            &origin_bookmarks,
+            &trunk_bookmark,
+        );
+        (by_id, selected_ids)
+    };
+
+    let mut commit_bookmarks: HashMap<String, Vec<String>> = HashMap::new();
+    let mut commit_sort_key: HashMap<String, String> = HashMap::new();
+    for id in &selected_ids {
+        let Some(commit) = all_commits.get(id) else {
+            continue;
+        };
+        let mut names: Vec<String> = eligible_bookmarks(commit, &trunk_bookmark)
+            .into_iter()
+            .filter(|b| !b.conflict)
+            .map(|b| b.name.clone())
+            .collect();
+        names.sort();
+        if let Some(first) = names.first() {
+            commit_sort_key.insert(id.clone(), first.clone());
+            commit_bookmarks.insert(id.clone(), names);
+        }
+    }
+
+    if commit_sort_key.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ordered_ids = topo_sort_selected(&commit_sort_key, &all_commits)?;
+    let mut result = Vec::new();
+    for id in ordered_ids {
+        let commit = &all_commits[&id];
+        let first_line = commit
+            .description
+            .lines()
+            .next()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_owned();
+        if let Some(names) = commit_bookmarks.get(&id) {
+            for name in names {
+                let remote_target = origin_bookmarks
+                    .get(name)
+                    .filter(|r| !r.conflict && !r.target.is_empty())
+                    .map(|r| r.target.clone());
+                result.push(StackBookmark {
+                    bookmark: name.clone(),
+                    commit_id: commit.commit_id.clone(),
+                    change_id: commit.change_id.clone(),
+                    description_first_line: first_line.clone(),
+                    remote_target,
+                });
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Map local eligible bookmark names to their current local commit IDs,
+/// filtering to bookmarks that also exist on `origin`.
+pub(crate) fn local_pushed_bookmarks(root: &Path, git_dir: &Path) -> Result<Vec<(String, String)>> {
+    let origin_bookmarks = read_origin_bookmarks(root, true)?;
+    let trunk_bookmark = resolve_trunk_bookmark(root, git_dir, &origin_bookmarks)?;
+    let commits = read_commits(root, "bookmarks() & mutable()", true)?;
+    let mut result = Vec::new();
+    for commit in commits {
+        for bm in eligible_bookmarks(&commit, &trunk_bookmark) {
+            if !bm.conflict && origin_bookmarks.contains_key(&bm.name) {
+                result.push((bm.name.clone(), commit.commit_id.clone()));
+            }
+        }
+    }
+    Ok(result)
+}
+
 pub fn run(client: &Client, opts: &PushOptions) -> Result<PushReport> {
     let ignore_wc = opts.dry_run;
     ensure_not_review_stack(&client.root, ignore_wc)?;

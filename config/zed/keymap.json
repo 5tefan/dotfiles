@@ -20,6 +20,10 @@
       "ctrl-shift-r": ["task::Spawn", { "task_name": "jj revision ready" }],
       "ctrl-shift-p": ["task::Spawn", { "task_name": "PR: push stack" }],
       "ctrl-shift-g": ["task::Spawn", { "task_name": "PR: open for review" }],
+      "ctrl-shift-f": [
+        "task::Spawn",
+        { "task_name": "PR: feedback", "reveal_target": "center" },
+      ],
       "ctrl-shift-x": [
         "task::Spawn",
         { "task_name": "PR: finish review", "reveal_target": "center" },

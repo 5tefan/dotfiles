@@ -549,7 +549,7 @@ fn load_meta(state: &Path) -> Result<Option<ReviewStackMeta>> {
     }
 }
 
-fn load_entry(state: &Path, number: u64) -> Result<Option<ReviewEntry>> {
+pub fn load_entry(state: &Path, number: u64) -> Result<Option<ReviewEntry>> {
     let path = entry_path(state, number);
     match fs::read(&path) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
@@ -558,6 +558,74 @@ fn load_entry(state: &Path, number: u64) -> Result<Option<ReviewEntry>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("Cannot read {}", path.display())),
     }
+}
+
+/// Load all active review entries ordered bottom-to-top by stack parent relationships
+/// (`parent_commit_id` / `pr.base_sha`), breaking ties by PR number.
+pub fn load_ordered_entries(state: &Path) -> Vec<ReviewEntry> {
+    order_entries(load_all_entries(state))
+}
+
+fn order_entries(entries: Vec<ReviewEntry>) -> Vec<ReviewEntry> {
+    if entries.len() <= 1 {
+        return entries;
+    }
+    let by_number: BTreeMap<u64, ReviewEntry> = entries
+        .into_iter()
+        .map(|entry| (entry.pr.number, entry))
+        .collect();
+    let by_commit: HashMap<&str, u64> = by_number
+        .values()
+        .map(|entry| (entry.commit_id.as_str(), entry.pr.number))
+        .collect();
+    let by_head: HashMap<&str, u64> = by_number
+        .values()
+        .map(|entry| (entry.pr.head_sha.as_str(), entry.pr.number))
+        .collect();
+
+    let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut in_degree: HashMap<u64, usize> = by_number.keys().map(|&n| (n, 0)).collect();
+    for entry in by_number.values() {
+        let parent = by_commit
+            .get(entry.parent_commit_id.as_str())
+            .or_else(|| by_head.get(entry.pr.base_sha.as_str()))
+            .copied()
+            .filter(|&parent| parent != entry.pr.number);
+        if let Some(parent) = parent {
+            children.entry(parent).or_default().push(entry.pr.number);
+            *in_degree.entry(entry.pr.number).or_default() += 1;
+        }
+    }
+
+    let mut ready: BTreeSet<u64> = in_degree
+        .iter()
+        .filter(|&(_, &deg)| deg == 0)
+        .map(|(&n, _)| n)
+        .collect();
+    let mut ordered_numbers = Vec::with_capacity(by_number.len());
+    while let Some(number) = ready.pop_first() {
+        ordered_numbers.push(number);
+        if let Some(kids) = children.get(&number) {
+            for &kid in kids {
+                if let Some(deg) = in_degree.get_mut(&kid) {
+                    *deg = deg.saturating_sub(1);
+                    if *deg == 0 {
+                        ready.insert(kid);
+                    }
+                }
+            }
+        }
+    }
+    for &number in by_number.keys() {
+        if !ordered_numbers.contains(&number) {
+            ordered_numbers.push(number);
+        }
+    }
+
+    ordered_numbers
+        .into_iter()
+        .filter_map(|number| by_number.get(&number).cloned())
+        .collect()
 }
 
 fn load_all_entries(state: &Path) -> Vec<ReviewEntry> {
@@ -820,6 +888,7 @@ mod tests {
             column: 1,
             selected_text: "one".into(),
             body: "looks good".into(),
+            agent: false,
         });
         store101.save(&draft101)?;
 
@@ -849,5 +918,39 @@ mod tests {
         assert!(load_meta(&state)?.is_none());
 
         Ok(())
+    }
+
+    #[test]
+    fn order_entries_sorts_bottom_to_top_even_when_pr_numbers_decrease() {
+        let mut base = pr(200, "head200", "main000");
+        base.base_sha = "main000".into();
+        let mut child = pr(150, "head150", "head200");
+        child.base_sha = "head200".into();
+
+        let entries = vec![
+            ReviewEntry {
+                version: META_VERSION,
+                bookmark: bookmark_name(150),
+                change_id: "c150".into(),
+                commit_id: "rev150".into(),
+                parent_commit_id: "rev200".into(),
+                pr: child,
+                draft_key: "k150".into(),
+                files: vec![],
+            },
+            ReviewEntry {
+                version: META_VERSION,
+                bookmark: bookmark_name(200),
+                change_id: "c200".into(),
+                commit_id: "rev200".into(),
+                parent_commit_id: "main000".into(),
+                pr: base,
+                draft_key: "k200".into(),
+                files: vec![],
+            },
+        ];
+        let ordered = order_entries(entries);
+        let numbers: Vec<u64> = ordered.iter().map(|e| e.pr.number).collect();
+        assert_eq!(numbers, vec![200, 150]);
     }
 }

@@ -1,4 +1,6 @@
 pub mod ci_status;
+pub mod feedback;
+pub mod feedback_view;
 pub mod github;
 pub mod log_data;
 pub mod log_view;

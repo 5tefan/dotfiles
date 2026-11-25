@@ -270,6 +270,270 @@ fn draw(frame: &mut Frame, label: &str, pending_comments: usize, selected: Optio
     );
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FeedbackFinishAction {
+    Publish,
+    Discard,
+    Recover,
+}
+
+const FEEDBACK_CHOICES_NORMAL: [(FeedbackFinishAction, &str, &str); 2] = [
+    (
+        FeedbackFinishAction::Publish,
+        "1  Reply & publish feedback",
+        "Post staged replies and resolve marked threads on GitHub.",
+    ),
+    (
+        FeedbackFinishAction::Discard,
+        "2  Discard staged feedback",
+        "Archive and clear local feedback drafts; GitHub stays unchanged.",
+    ),
+];
+
+const FEEDBACK_CHOICES_WITH_RECOVER: [(FeedbackFinishAction, &str, &str); 3] = [
+    (
+        FeedbackFinishAction::Publish,
+        "1  Reply & publish feedback",
+        "Post staged replies and resolve marked threads on GitHub.",
+    ),
+    (
+        FeedbackFinishAction::Discard,
+        "2  Discard staged feedback",
+        "Archive and clear local feedback drafts; GitHub stays unchanged.",
+    ),
+    (
+        FeedbackFinishAction::Recover,
+        "3  Recover uncertain publish",
+        "Reconcile previous uncertain feedback publish attempts against GitHub.",
+    ),
+];
+
+/// Feedback-only finish menu for your own stack (`ctrl-shift-x`).
+/// Never shows Approve or Request changes.
+pub fn choose_feedback(
+    stack_label: &str,
+    staged_replies: usize,
+    staged_resolves: usize,
+    uncertain_attempts: usize,
+) -> Result<Option<FeedbackFinishAction>> {
+    let label = plain_status(stack_label);
+    let summary = feedback_summary_label(staged_replies, staged_resolves, uncertain_attempts);
+    let choices: &[(FeedbackFinishAction, &str, &str)] = if uncertain_attempts > 0 {
+        &FEEDBACK_CHOICES_WITH_RECOVER
+    } else {
+        &FEEDBACK_CHOICES_NORMAL
+    };
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        choose_feedback_terminal(&label, &summary, choices)
+    } else {
+        choose_feedback_plain(
+            &mut io::stdin().lock(),
+            &mut io::stdout().lock(),
+            &label,
+            &summary,
+            choices,
+        )
+    }
+}
+
+fn feedback_summary_label(
+    staged_replies: usize,
+    staged_resolves: usize,
+    uncertain_attempts: usize,
+) -> String {
+    let mut parts = vec![
+        format!(
+            "{staged_replies} staged repl{}",
+            if staged_replies == 1 { "y" } else { "ies" }
+        ),
+        format!(
+            "{staged_resolves} resolve{}",
+            if staged_resolves == 1 { "" } else { "s" }
+        ),
+    ];
+    if uncertain_attempts > 0 {
+        parts.push(format!("{uncertain_attempts} uncertain"));
+    }
+    parts.join(" · ")
+}
+
+fn choose_feedback_plain(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    label: &str,
+    summary: &str,
+    choices: &[(FeedbackFinishAction, &str, &str)],
+) -> Result<Option<FeedbackFinishAction>> {
+    writeln!(output, "Finish stack feedback — {label}")?;
+    writeln!(output, "{summary}\n")?;
+    for (_, title, description) in choices {
+        writeln!(output, "{title}\n   {description}")?;
+    }
+    let max = choices.len();
+    write!(
+        output,
+        "Choice [1–{max}] (blank/q cancels and keeps drafts): "
+    )?;
+    output.flush()?;
+    let mut line = String::new();
+    input
+        .read_line(&mut line)
+        .context("Cannot read the feedback choice; no action selected")?;
+    match line.trim() {
+        "" | "q" | "\u{1b}" | "\u{3}" => Ok(None),
+        "1" => Ok(Some(choices[0].0)),
+        "2" => Ok(Some(choices[1].0)),
+        "3" if choices.len() >= 3 => Ok(Some(choices[2].0)),
+        _ => bail!("Invalid choice: enter 1–{max} or leave blank; no action selected"),
+    }
+}
+
+fn choose_feedback_terminal(
+    label: &str,
+    summary: &str,
+    choices: &[(FeedbackFinishAction, &str, &str)],
+) -> Result<Option<FeedbackFinishAction>> {
+    let screen = Screen::enter().context("Cannot enter the feedback finish menu")?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let result = run_feedback_menu(&mut terminal, &screen, label, summary, choices);
+    let result = if screen.stopped.load(Ordering::Relaxed) {
+        Ok(None)
+    } else {
+        result
+    };
+    drop(terminal);
+    drop(screen);
+    result
+}
+
+fn run_feedback_menu(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    screen: &Screen,
+    label: &str,
+    summary: &str,
+    choices: &[(FeedbackFinishAction, &str, &str)],
+) -> Result<Option<FeedbackFinishAction>> {
+    terminal.clear()?;
+    let mut selected: Option<usize> = None;
+    let mut dirty = true;
+    loop {
+        if screen.stopped.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        if dirty {
+            terminal.draw(|frame| draw_feedback(frame, label, summary, choices, selected))?;
+            dirty = false;
+        }
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Resize(_, _) => dirty = true,
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
+                    KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        selected = Some(selected.map_or(choices.len() - 1, |i| {
+                            (i + choices.len() - 1) % choices.len()
+                        }));
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        selected = Some(selected.map_or(0, |i| (i + 1) % choices.len()));
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') if key.kind == KeyEventKind::Press => {
+                        return Ok(selected.map(|i| choices[i].0));
+                    }
+                    KeyCode::Char(ch)
+                        if key.kind == KeyEventKind::Press
+                            && !key.modifiers.intersects(
+                                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                            ) =>
+                    {
+                        if let Some(digit) = ch.to_digit(10) {
+                            let idx = digit as usize;
+                            if idx >= 1 && idx <= choices.len() {
+                                return Ok(Some(choices[idx - 1].0));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                dirty = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn draw_feedback(
+    frame: &mut Frame,
+    label: &str,
+    summary: &str,
+    choices: &[(FeedbackFinishAction, &str, &str)],
+    selected: Option<usize>,
+) {
+    let dialog = centered(frame.area());
+    frame.render_widget(Clear, dialog);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Finish stack feedback ")
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(dialog);
+    frame.render_widget(block, dialog);
+    let [heading, pending, _, list_area, help, dismissal] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(
+        Paragraph::new(label)
+            .alignment(Alignment::Center)
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        heading,
+    );
+    frame.render_widget(
+        Paragraph::new(summary).alignment(Alignment::Center),
+        pending,
+    );
+    let detailed = list_area.height >= 6 && list_area.width >= 50;
+    let items = choices.iter().map(|(_, title, description)| {
+        let mut lines = vec![Line::styled(
+            *title,
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        if detailed {
+            lines.push(Line::from(format!("   {description}")));
+        }
+        ListItem::new(lines)
+    });
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+        list_area,
+        &mut ListState::default().with_selected(selected),
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "1–{}: choose · j/k/↑/↓: select · Space/Enter: confirm",
+            choices.len()
+        ))
+        .alignment(Alignment::Center),
+        help,
+    );
+    frame.render_widget(
+        Paragraph::new("Esc / q / Ctrl-C: dismiss; keep drafts").alignment(Alignment::Center),
+        dismissal,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,5 +690,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn feedback_menu_excludes_approve_and_request_changes() {
+        let mut input = Cursor::new("1\n");
+        let mut output = Vec::new();
+        let choice = choose_feedback_plain(
+            &mut input,
+            &mut output,
+            "org/repo",
+            "2 staged replies · 1 resolve",
+            &FEEDBACK_CHOICES_NORMAL,
+        )
+        .unwrap();
+        assert_eq!(choice, Some(FeedbackFinishAction::Publish));
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("Reply & publish feedback"));
+        assert!(!rendered.contains("Approve"));
+        assert!(!rendered.contains("Request changes"));
     }
 }

@@ -3,18 +3,26 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
-use zed_pr_review::github::{Client, checkout_sha, workspace_git_dir, workspace_root};
+use zed_pr_review::feedback;
+use zed_pr_review::feedback_view::{self, ReviewContext};
+use zed_pr_review::github::{
+    Client, checkout_sha, parse_pr_number, workspace_git_dir, workspace_root,
+};
 use zed_pr_review::message::{review_summary, review_template};
 use zed_pr_review::model::{Comment, PullRequest};
 use zed_pr_review::push::{self, PushOptions};
 use zed_pr_review::ready;
-use zed_pr_review::review_menu::{self, ReviewAction};
+use zed_pr_review::review_menu::{self, FeedbackFinishAction, ReviewAction};
 use zed_pr_review::review_stack::{self, ReviewEntry};
-use zed_pr_review::selection::{Selection, make_comment, repo_path, validate_comment};
-use zed_pr_review::store::{Attempt, Draft, Receipt, Store, default_directory, prepare_directory};
+use zed_pr_review::selection::{
+    Selection, make_comment, make_comment_from_lines, repo_path, validate_comment,
+};
+use zed_pr_review::store::{
+    Attempt, Draft, Receipt, Store, default_directory, draft_key, prepare_directory,
+};
 
 #[derive(Parser)]
 #[command(
@@ -103,14 +111,49 @@ enum Action {
     },
     /// Submit a COMMENT-only review with any saved inline comments
     SubmitComment,
-    /// Save an inline comment from Zed's current selection locally
-    Comment,
+    /// Save an inline comment locally (from Zed's selection env vars or explicit CLI flags)
+    Comment {
+        /// File path relative to the repository root (enables non-interactive CLI mode)
+        #[arg(long)]
+        path: Option<String>,
+        /// 1-based starting RIGHT-side line number (defaults to --line)
+        #[arg(long)]
+        start_line: Option<u32>,
+        /// 1-based ending RIGHT-side line number
+        #[arg(long)]
+        line: Option<u32>,
+        /// Comment body text (use `-` to read from stdin)
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read comment body text from a file
+        #[arg(long, conflicts_with = "body")]
+        body_file: Option<PathBuf>,
+        /// Mark comment as agent-authored (rendered as blockquote + `\- an agent` when posted to GitHub)
+        #[arg(long)]
+        agent: bool,
+    },
+    /// Inspect the active local review stack offline
+    ReviewInfo {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print cached PR diff patches from the active local review stack offline
+    Diff {
+        /// Restrict output to one repo-relative file path
+        #[arg(long)]
+        file: Option<String>,
+    },
     /// Submit an APPROVE review with any saved inline comments
     Approve,
     /// Submit a REQUEST_CHANGES review with any saved inline comments
     RequestChanges,
     /// List locally saved comments for the current PR
-    List,
+    List {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Edit a saved comment (1-based index)
     Edit { index: usize },
     /// Remove a saved comment (1-based index)
@@ -127,6 +170,110 @@ enum Action {
         #[arg(long)]
         retry: bool,
     },
+    /// Inspect, reply to, and resolve GitHub review threads for your stack (or current review)
+    Feedback {
+        /// Override the default stack scope with an explicit jj revset
+        #[arg(short, long)]
+        revset: Option<String>,
+        /// Include resolved threads in addition to unresolved threads
+        #[arg(long)]
+        all: bool,
+        #[command(subcommand)]
+        command: Option<FeedbackAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum FeedbackAction {
+    /// Fetch review threads from GitHub and print a grouped summary
+    Fetch {
+        #[arg(short, long)]
+        revset: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// List review threads grouped by revision / bookmark
+    List {
+        #[arg(short, long)]
+        revset: Option<String>,
+        #[arg(long)]
+        all: bool,
+        /// Use the last fetched local index without querying GitHub
+        #[arg(long)]
+        cached: bool,
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show all comments and local draft state for a thread (1-based index)
+    Show {
+        index: usize,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Open the thread's file:line in Zed
+    Open {
+        index: usize,
+        /// Check out the thread's jj revision before opening
+        #[arg(long)]
+        checkout: bool,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Draft a local reply to a thread (by 1-based index or --thread ID)
+    Reply {
+        /// 1-based thread index (from `feedback list`, or scoped to --pr when given)
+        index: Option<usize>,
+        /// Target thread GraphQL node ID (optionally scoped with --pr)
+        #[arg(long, conflicts_with = "index")]
+        thread: Option<String>,
+        /// Reply body text (use `-` to read from stdin; if omitted, reads piped stdin or opens editor)
+        #[arg(long, conflicts_with = "body_file")]
+        body: Option<String>,
+        /// Read reply body text from a file
+        #[arg(long, conflicts_with = "body")]
+        body_file: Option<PathBuf>,
+        /// Mark reply as agent-authored (rendered as blockquote + `\- an agent` when published to GitHub)
+        #[arg(long)]
+        agent: bool,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Mark a thread to be resolved locally on next publish (1-based index)
+    Resolve {
+        index: usize,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Clear the local resolve flag on a thread (1-based index)
+    Unresolve {
+        index: usize,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Clear staged reply and resolve flag on a thread (1-based index)
+    Clear {
+        index: usize,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Batch-publish staged replies and resolutions to GitHub
+    Publish {
+        #[arg(short, long)]
+        revset: Option<String>,
+        /// Allow publishing even when local bookmarks differ from remote PR heads
+        #[arg(long)]
+        allow_unpushed: bool,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Reconcile uncertain feedback publish attempts against GitHub
+    Recover {
+        /// Explicitly allow retrying remaining actions after checking GitHub
+        #[arg(long)]
+        retry: bool,
+    },
 }
 
 fn main() {
@@ -137,18 +284,50 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let selection = if matches!(cli.command, Action::Comment) {
-        Some(Selection::from_env().context("Select one continuous, nonblank RIGHT-side excerpt in Zed; deleted-side and multiple selections are not supported")?)
-    } else {
-        None
-    };
     let directory = context_directory(&cli);
 
-    if matches!(cli.command, Action::Comment) {
-        return comment_local(&cli, &directory, selection.context("Missing selection")?);
+    if let Action::Comment {
+        path,
+        start_line,
+        line,
+        body,
+        body_file,
+        agent,
+    } = &cli.command
+    {
+        let explicit_mode = path.is_some()
+            || start_line.is_some()
+            || line.is_some()
+            || body.is_some()
+            || body_file.is_some();
+        if explicit_mode {
+            return comment_explicit(
+                &cli,
+                &directory,
+                path.as_deref(),
+                *start_line,
+                *line,
+                body.as_deref(),
+                body_file.as_deref(),
+                *agent,
+            );
+        }
+        let selection = Selection::from_env().context(
+            "Select one continuous, nonblank RIGHT-side excerpt in Zed; deleted-side and multiple selections are not supported",
+        )?;
+        return comment_local(&cli, &directory, selection, *agent);
+    }
+    if let Action::ReviewInfo { json } = &cli.command {
+        return review_info(&cli, &directory, *json);
+    }
+    if let Action::Diff { file } = &cli.command {
+        return diff_local(&cli, &directory, file.as_deref());
     }
     if matches!(cli.command, Action::Finish | Action::Cancel { .. }) {
         return finish_review(&cli, &directory);
+    }
+    if matches!(cli.command, Action::Feedback { .. }) {
+        return run_feedback(&cli, &directory);
     }
     if matches!(cli.command, Action::Stack { .. } | Action::Sb | Action::Sf) {
         ensure!(
@@ -222,13 +401,14 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    let list_json = matches!(cli.command, Action::List { json: true });
     let mut workspace_lock = None;
     let mut active_review: Option<ReviewEntry> = None;
     let (client, current, store, mut draft) = if let Some(path) = &cli.draft_dir {
         ensure!(
             matches!(
                 cli.command,
-                Action::List
+                Action::List { .. }
                     | Action::Edit { .. }
                     | Action::Remove { .. }
                     | Action::Discard { .. }
@@ -254,26 +434,46 @@ fn run(cli: Cli) -> Result<()> {
         let git_dir = workspace_git_dir(&root)?;
         let state_dir = prepare_directory(&root, &git_dir, &requested_state, None)?;
         workspace_lock = Some(Store::at(&state_dir.join("workspace"))?);
-        let (client, current, review_entry) = discover_current(&cli, &root, &state_dir)?;
+        let (client, current, review_entry) = if matches!(cli.command, Action::List { .. })
+            && let Some(entry) = resolve_active_review_entry(&cli, &root, &state_dir)?
+        {
+            let client = Client {
+                root: root.clone(),
+                git_dir: git_dir.clone(),
+                host: entry.pr.host.clone(),
+                repo: entry.pr.repo.clone(),
+                reviewer: entry.pr.reviewer.clone(),
+            };
+            client.check_explicit_pr(&entry.pr, cli.pr.as_deref(), cli.repo.as_deref())?;
+            let pr = entry.pr.clone();
+            (client, pr, Some(entry))
+        } else {
+            discover_current(&cli, &root, &state_dir)?
+        };
         active_review = review_entry;
         prepare_directory(&root, &git_dir, &state_dir, Some(&current.head_sha))?;
         let store = Store::open(&state_dir, &current)?;
         let draft = store.load()?.unwrap_or_else(|| Draft::new(current.clone()));
         (client, current, store, draft)
     };
-    println!("{} — {}", current.url, printable(&current.title));
-    println!("Draft: {}", store.directory.display());
+    if !list_json {
+        println!("{} — {}", current.url, printable(&current.title));
+        println!("Draft: {}", store.directory.display());
+    }
     match cli.command {
         Action::Open
         | Action::Close
-        | Action::Comment
+        | Action::Comment { .. }
+        | Action::ReviewInfo { .. }
+        | Action::Diff { .. }
         | Action::Ready { .. }
         | Action::Push { .. }
         | Action::Stack { .. }
         | Action::Sb
         | Action::Sf
         | Action::Finish
-        | Action::Cancel { .. } => {
+        | Action::Cancel { .. }
+        | Action::Feedback { .. } => {
             unreachable!("handled before opening a draft")
         }
         Action::SubmitComment => submit(
@@ -303,7 +503,7 @@ fn run(cli: Cli) -> Result<()> {
             "REQUEST_CHANGES",
             cli.editor.as_deref(),
         )?,
-        Action::List => list(&draft),
+        Action::List { json } => list(&draft, &store.directory, json)?,
         Action::Edit { index } => {
             draft.editable()?;
             let offset = comment_index(index, &draft.comments)?;
@@ -383,7 +583,317 @@ fn discover_current(
     Ok((client, pr, None))
 }
 
-fn comment_local(cli: &Cli, directory: &Path, selection: Selection) -> Result<()> {
+fn resolve_active_review_entry(
+    cli: &Cli,
+    root: &Path,
+    state: &Path,
+) -> Result<Option<ReviewEntry>> {
+    if let Some(pr_spec) = cli.pr.as_deref() {
+        let number = parse_pr_number(pr_spec)?;
+        return review_stack::load_entry(state, number);
+    }
+    Ok(review_stack::current_review(root, state)?.map(|(entry, _)| entry))
+}
+
+fn trim_blank_edges(raw: &str) -> String {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let Some(first) = lines.iter().position(|line| !line.trim().is_empty()) else {
+        return String::new();
+    };
+    let last = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .unwrap_or(first);
+    lines[first..=last].join("\n")
+}
+
+fn read_body_input(body: Option<&str>, body_file: Option<&Path>) -> Result<Option<String>> {
+    if let Some(text) = body {
+        if text == "-" {
+            return Ok(Some(read_stdin()?));
+        }
+        return Ok(Some(text.to_owned()));
+    }
+    if let Some(path) = body_file {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Cannot read body file {}", path.display()))?;
+        return Ok(Some(content));
+    }
+    if !io::stdin().is_terminal() {
+        return Ok(Some(read_stdin()?));
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn comment_explicit(
+    cli: &Cli,
+    directory: &Path,
+    path: Option<&str>,
+    start_line: Option<u32>,
+    line: Option<u32>,
+    body: Option<&str>,
+    body_file: Option<&Path>,
+    agent: bool,
+) -> Result<()> {
+    ensure!(
+        cli.draft_dir.is_none(),
+        "--draft-dir cannot be used to comment"
+    );
+    let path = path.context("Missing --path <REPO_RELATIVE_PATH>")?;
+    let line = line.context("Missing --line <LINE>")?;
+    let start_line = start_line.unwrap_or(line);
+    ensure!(
+        start_line > 0 && start_line <= line,
+        "Invalid line range: --start-line ({start_line}) must be between 1 and --line ({line})"
+    );
+    let raw_body = read_body_input(body, body_file)?
+        .context("Missing comment body; pass --body <TEXT>, --body-file <PATH>, or --body -")?;
+    let body_text = trim_blank_edges(&raw_body);
+    ensure!(!body_text.is_empty(), "Comment body must not be blank");
+
+    let root = workspace_root(directory)?;
+    let state = chosen_state(cli, &root)?;
+    let git_dir = workspace_git_dir(&root)?;
+    let state = prepare_directory(&root, &git_dir, &state, None)?;
+    let _workspace = Store::at(&state.join("workspace"))?;
+
+    let entry = if let Some(pr_spec) = cli.pr.as_deref() {
+        let number = parse_pr_number(pr_spec)?;
+        review_stack::load_entry(&state, number)?.with_context(|| {
+            format!(
+                "PR #{number} is not in the active review stack. Open it with Ctrl-Shift-G first."
+            )
+        })?
+    } else {
+        let (entry, current_rev) = review_stack::current_review(&root, &state)?.context(
+            "Not on a PR review revision. Pass --pr <NUMBER> or open a PR stack with Ctrl-Shift-G first.",
+        )?;
+        ensure!(
+            current_rev.commit_id == entry.commit_id,
+            "This review revision has local edits. Run `jj restore --from {}` so line numbers match GitHub",
+            entry.pr.head_sha
+        );
+        entry
+    };
+
+    let client = Client {
+        root: root.clone(),
+        git_dir,
+        host: entry.pr.host.clone(),
+        repo: entry.pr.repo.clone(),
+        reviewer: entry.pr.reviewer.clone(),
+    };
+    client.check_explicit_pr(&entry.pr, cli.pr.as_deref(), cli.repo.as_deref())?;
+
+    let store = Store::open(&state, &entry.pr)?;
+    let mut draft = store
+        .load()?
+        .unwrap_or_else(|| Draft::new(entry.pr.clone()));
+    draft.editable()?;
+    draft.check_revision(&entry.pr)?;
+
+    let blob = client.blob(&entry.pr.head_sha, path)?;
+    let comment = make_comment_from_lines(
+        path,
+        start_line,
+        line,
+        &blob,
+        &entry.files,
+        body_text,
+        agent,
+    )?;
+
+    let rendered = comment.api_value()["body"].clone();
+    if draft.comments.iter().any(|existing| {
+        existing.path == comment.path
+            && existing.start_line == comment.start_line
+            && existing.line == comment.line
+            && existing.api_value()["body"] == rendered
+    }) {
+        bail!(
+            "Duplicate comment already exists on PR #{} at {}:{}–{}",
+            entry.pr.number,
+            comment.path,
+            comment.start_line,
+            comment.line
+        );
+    }
+
+    draft.comments.push(comment);
+    store.save(&draft)?;
+    let index = draft.comments.len();
+    let range = if start_line == line {
+        format!("{}:{line}", printable(path))
+    } else {
+        format!("{}:{start_line}-{line}", printable(path))
+    };
+    println!(
+        "Saved comment #{index} on PR #{} ({range}){}. {index} pending; nothing published.",
+        entry.pr.number,
+        if agent { " [agent]" } else { "" }
+    );
+    Ok(())
+}
+
+fn review_info(cli: &Cli, directory: &Path, json_output: bool) -> Result<()> {
+    ensure!(
+        cli.draft_dir.is_none(),
+        "--draft-dir cannot be used with review-info"
+    );
+    let root = workspace_root(directory)?;
+    let state = chosen_state(cli, &root)?;
+    let entries = review_stack::load_ordered_entries(&state);
+    let current_change = review_stack::current_revision(&root)
+        .ok()
+        .map(|rev| rev.change_id);
+
+    let items: Vec<Value> = entries
+        .iter()
+        .map(|entry| {
+            let draft_path = state.join(&entry.draft_key).join("draft.json");
+            let draft = fs::read(&draft_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Draft>(&bytes).ok());
+            let draft_comment_count = draft.as_ref().map_or(0, |d| d.comments.len());
+            let submitted_state = draft
+                .as_ref()
+                .and_then(|d| d.submitted.as_ref().map(|r| r.state.clone()));
+            let has_uncertain_attempt = draft.as_ref().is_some_and(|d| d.attempt.is_some());
+            let is_current = current_change
+                .as_deref()
+                .is_some_and(|cid| cid == entry.change_id);
+            let files: Vec<Value> = entry
+                .files
+                .iter()
+                .map(|file| {
+                    json!({
+                        "filename": file.filename,
+                        "status": file.status,
+                        "previous_filename": file.previous_filename,
+                        "has_patch": file.patch.is_some(),
+                    })
+                })
+                .collect();
+            json!({
+                "number": entry.pr.number,
+                "title": entry.pr.title,
+                "url": entry.pr.url,
+                "bookmark": entry.bookmark,
+                "change_id": entry.change_id,
+                "commit_id": entry.commit_id,
+                "head_sha": entry.pr.head_sha,
+                "base_sha": entry.pr.base_sha,
+                "files": files,
+                "draft_comment_count": draft_comment_count,
+                "submitted_state": submitted_state,
+                "has_uncertain_attempt": has_uncertain_attempt,
+                "is_current": is_current,
+            })
+        })
+        .collect();
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&items)?);
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!(
+            "No active review stack. Open one with Ctrl-Shift-G or `zed-pr-review open --pr <N>`."
+        );
+        return Ok(());
+    }
+    for (entry, item) in entries.iter().zip(items.iter()) {
+        let marker = if item["is_current"].as_bool().unwrap_or(false) {
+            "* "
+        } else {
+            "  "
+        };
+        let count = item["draft_comment_count"].as_u64().unwrap_or(0);
+        println!(
+            "{marker}PR #{} ({}) — {} [{} file{}, {} draft comment{}]",
+            entry.pr.number,
+            entry.bookmark,
+            printable(&entry.pr.title),
+            entry.files.len(),
+            if entry.files.len() == 1 { "" } else { "s" },
+            count,
+            if count == 1 { "" } else { "s" },
+        );
+    }
+    Ok(())
+}
+
+fn diff_local(cli: &Cli, directory: &Path, file_filter: Option<&str>) -> Result<()> {
+    ensure!(
+        cli.draft_dir.is_none(),
+        "--draft-dir cannot be used with diff"
+    );
+    let root = workspace_root(directory)?;
+    let state = chosen_state(cli, &root)?;
+    let entry = if let Some(pr_spec) = cli.pr.as_deref() {
+        let number = parse_pr_number(pr_spec)?;
+        review_stack::load_entry(&state, number)?.with_context(|| {
+            format!(
+                "PR #{number} is not in the active review stack. Open it with Ctrl-Shift-G first."
+            )
+        })?
+    } else {
+        review_stack::current_review(&root, &state)?
+            .context(
+                "Not on a PR review revision. Pass --pr <NUMBER> or open a PR stack with Ctrl-Shift-G first.",
+            )?
+            .0
+    };
+
+    let files: Vec<_> = match file_filter {
+        Some(target) => {
+            let matched: Vec<_> = entry
+                .files
+                .iter()
+                .filter(|f| f.filename == target)
+                .collect();
+            ensure!(
+                !matched.is_empty(),
+                "File `{target}` is not in PR #{}'s changed files",
+                entry.pr.number
+            );
+            matched
+        }
+        None => entry.files.iter().collect(),
+    };
+
+    for (idx, file) in files.iter().enumerate() {
+        if idx > 0 {
+            println!();
+        }
+        let old_name = file.previous_filename.as_deref().unwrap_or(&file.filename);
+        println!("diff --git a/{old_name} b/{}", file.filename);
+        if file.status == "added" {
+            println!("--- /dev/null");
+            println!("+++ b/{}", file.filename);
+        } else if file.status == "removed" {
+            println!("--- a/{old_name}");
+            println!("+++ /dev/null");
+        } else {
+            println!("--- a/{old_name}");
+            println!("+++ b/{}", file.filename);
+        }
+        match file.patch.as_deref() {
+            Some(patch) => {
+                print!("{patch}");
+                if !patch.ends_with('\n') {
+                    println!();
+                }
+            }
+            None => println!("(no patch cached; binary or large diff)"),
+        }
+    }
+    Ok(())
+}
+
+fn comment_local(cli: &Cli, directory: &Path, selection: Selection, agent: bool) -> Result<()> {
     ensure!(
         cli.draft_dir.is_none(),
         "--draft-dir cannot be used to comment"
@@ -446,13 +956,14 @@ fn comment_local(cli: &Cli, directory: &Path, selection: Selection) -> Result<()
         after_rev.change_id == entry.change_id && after_rev.commit_id == entry.commit_id,
         "jj @ changed while writing the comment; nothing saved"
     );
-    let comment = make_comment(
+    let mut comment = make_comment(
         &root,
         &selection,
         &blob,
         &entry.files,
         body.trim().to_owned(),
     )?;
+    comment.agent = agent;
     draft.comments.push(comment);
     store.save(&draft)?;
     println!(
@@ -473,9 +984,14 @@ fn finish_review(cli: &Cli, directory: &Path) -> Result<()> {
     let state = prepare_directory(&root, &git_dir, &state, None)?;
     let _workspace = Store::at(&state.join("workspace"))?;
 
-    let (entry, current_rev) = review_stack::current_review(&root, &state)?.context(
-        "Not on a PR review revision. Check out a review/pr-* revision, or run `zed-pr-review close` to clean up the stack.",
-    )?;
+    let Some((entry, current_rev)) = review_stack::current_review(&root, &state)? else {
+        if matches!(cli.command, Action::Finish) {
+            return finish_stack_feedback(&root, &state);
+        }
+        anyhow::bail!(
+            "Not on a PR review revision. Check out a review/pr-* revision, or run `zed-pr-review close` to clean up the stack."
+        );
+    };
     let store = Store::open(&state, &entry.pr)?;
     let mut draft = store
         .load()?
@@ -563,7 +1079,424 @@ fn finish_review(cli: &Cli, directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn list(draft: &Draft) {
+fn finish_stack_feedback(root: &Path, state: &Path) -> Result<()> {
+    let client = Client::for_workspace(root, None)?;
+    let fb_dir = feedback::feedback_root(state);
+    let summary = feedback::summarize_staged(&fb_dir, &client.host, &client.repo);
+    if summary.staged_threads == 0 && summary.uncertain_attempts == 0 {
+        println!(
+            "No staged feedback replies or resolutions found. Open Ctrl-Shift-F (`zed-pr-review feedback`) to inspect and draft replies."
+        );
+        return Ok(());
+    }
+    let Some(choice) = review_menu::choose_feedback(
+        &client.repo,
+        summary.staged_replies,
+        summary.staged_resolves,
+        summary.uncertain_attempts,
+    )?
+    else {
+        println!("Cancelled. Staged feedback drafts kept.");
+        return Ok(());
+    };
+    match choice {
+        FeedbackFinishAction::Publish => {
+            feedback::publish_staged(&client, &fb_dir, None, false, false, confirm)?;
+        }
+        FeedbackFinishAction::Discard => {
+            if confirm(
+                "Archive and discard all staged feedback replies and resolve flags? GitHub stays unchanged. Type yes: ",
+            )? {
+                let cleared = feedback::discard_all_staged(&fb_dir)?;
+                println!("Discarded staged feedback for {cleared} thread(s).");
+            } else {
+                println!("Cancelled. Staged feedback drafts kept.");
+            }
+        }
+        FeedbackFinishAction::Recover => {
+            feedback::recover_attempts(&client, &fb_dir, false, confirm)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_feedback(cli: &Cli, directory: &Path) -> Result<()> {
+    ensure!(
+        cli.draft_dir.is_none(),
+        "--draft-dir cannot be used with feedback"
+    );
+    let root = workspace_root(directory)?;
+    let state = chosen_state(cli, &root)?;
+    let git_dir = workspace_git_dir(&root)?;
+    let state = prepare_directory(&root, &git_dir, &state, None)?;
+    let fb_dir = feedback::feedback_root(&state);
+
+    let Action::Feedback {
+        revset: top_revset,
+        all: top_all,
+        command,
+    } = &cli.command
+    else {
+        unreachable!();
+    };
+
+    match command {
+        None => {
+            // Dual-purpose Ctrl-Shift-F viewer: review stack mode vs own-stack mode.
+            if cli.pr.is_none()
+                && cli.repo.is_none()
+                && top_revset.is_none()
+                && let Some((entry, _)) = review_stack::current_review(&root, &state)?
+            {
+                let client = Client {
+                    root: root.clone(),
+                    git_dir,
+                    host: entry.pr.host.clone(),
+                    repo: entry.pr.repo.clone(),
+                    reviewer: entry.pr.reviewer.clone(),
+                };
+                let threads = client.fetch_review_threads(
+                    entry.pr.number,
+                    &entry.pr.head_ref,
+                    &entry.pr.head_sha,
+                )?;
+                let index = feedback::FeedbackIndex {
+                    version: 1,
+                    host: entry.pr.host.clone(),
+                    repo: entry.pr.repo.clone(),
+                    groups: vec![feedback::IndexedGroup {
+                        bookmark: entry.pr.head_ref.clone(),
+                        change_id: entry.change_id.clone(),
+                        commit_id: entry.commit_id.clone(),
+                        pr_number: entry.pr.number,
+                        pr_title: entry.pr.title.clone(),
+                        pr_url: entry.pr.url.clone(),
+                        head_sha: entry.pr.head_sha.clone(),
+                        threads,
+                    }],
+                };
+                let review_ctx = ReviewContext {
+                    draft_dir: state.join(draft_key(&entry.pr)),
+                    pr: entry.pr,
+                };
+                return feedback_view::run(
+                    &client,
+                    &fb_dir,
+                    index,
+                    Some(review_ctx),
+                    None,
+                    None,
+                    *top_all,
+                    |store, initial, kind| {
+                        edit_message(store, cli.editor.as_deref(), initial, kind)
+                    },
+                );
+            }
+
+            let client = Client::for_workspace(&root, cli.repo.as_deref())?;
+            let index =
+                feedback::fetch_stack_feedback(&client, cli.pr.as_deref(), top_revset.as_deref())?;
+            feedback::save_index(&fb_dir, &index)?;
+            feedback_view::run(
+                &client,
+                &fb_dir,
+                index,
+                None,
+                cli.pr.as_deref(),
+                top_revset.as_deref(),
+                *top_all,
+                |store, initial, kind| edit_message(store, cli.editor.as_deref(), initial, kind),
+            )
+        }
+        Some(FeedbackAction::Fetch { revset, all }) => {
+            let client = Client::for_workspace(&root, cli.repo.as_deref())?;
+            let effective_revset = revset.as_deref().or(top_revset.as_deref());
+            let index =
+                feedback::fetch_stack_feedback(&client, cli.pr.as_deref(), effective_revset)?;
+            feedback::save_index(&fb_dir, &index)?;
+            feedback_view::print_plain_summary(&index, &fb_dir, *all || *top_all);
+            Ok(())
+        }
+        Some(FeedbackAction::List {
+            revset,
+            all,
+            cached,
+            json,
+        }) => {
+            let index = if *cached {
+                feedback::load_index(&fb_dir)?
+                    .context("No cached feedback index; run `zed-pr-review feedback fetch` first")?
+            } else {
+                let client = Client::for_workspace(&root, cli.repo.as_deref())?;
+                let effective_revset = revset.as_deref().or(top_revset.as_deref());
+                let fetched =
+                    feedback::fetch_stack_feedback(&client, cli.pr.as_deref(), effective_revset)?;
+                feedback::save_index(&fb_dir, &fetched)?;
+                fetched
+            };
+            let include_all = *all || *top_all;
+            if *json {
+                let threads = feedback::visible_threads(&index, include_all);
+                let drafts = feedback::load_draft_map(&fb_dir);
+                let items: Vec<Value> = threads
+                    .iter()
+                    .map(|t| {
+                        let draft = drafts.get(&(t.pr_number, t.thread.id.clone()));
+                        let staged_reply = draft
+                            .and_then(|d| d.reply_body.as_deref())
+                            .filter(|b| !b.trim().is_empty());
+                        json!({
+                            "index": t.index,
+                            "bookmark": t.bookmark,
+                            "change_id": t.change_id,
+                            "pr_number": t.pr_number,
+                            "pr_url": t.pr_url,
+                            "thread": t.thread,
+                            "staged_reply": staged_reply,
+                            "staged_reply_agent": draft.is_some_and(|d| d.reply_agent && staged_reply.is_some()),
+                            "staged_resolve": draft.is_some_and(|d| d.resolve),
+                            "has_uncertain_attempt": draft.is_some_and(|d| d.attempt.is_some()),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&items)?);
+            } else {
+                feedback_view::print_plain_summary(&index, &fb_dir, include_all);
+            }
+            Ok(())
+        }
+        Some(FeedbackAction::Show { index: idx, all }) => {
+            let index = feedback::load_index(&fb_dir)?
+                .context("No feedback index found; run `zed-pr-review feedback fetch` first")?;
+            let item = feedback::thread_by_index(&index, *idx, *all || *top_all)?;
+            let drafts = feedback::load_draft_map(&fb_dir);
+            let loc = match item.thread.effective_line() {
+                Some(l) => format!("{}:{l}", item.thread.path),
+                None => item.thread.path.clone(),
+            };
+            println!(
+                "[{}] PR #{} ({}) — {loc}{}{}",
+                item.index,
+                item.pr_number,
+                item.bookmark,
+                if item.thread.is_outdated {
+                    " [outdated]"
+                } else {
+                    ""
+                },
+                if item.thread.is_resolved {
+                    " [resolved]"
+                } else {
+                    ""
+                }
+            );
+            for comment in &item.thread.comments {
+                println!("\n@{} ({}):", comment.author, comment.created_at);
+                println!("{}", comment.body);
+            }
+            if let Some(draft) = drafts.get(&(item.pr_number, item.thread.id.clone())) {
+                if let Some(reply) = draft.reply_body.as_deref()
+                    && !reply.trim().is_empty()
+                {
+                    println!(
+                        "\n--- Staged reply (local){} ---\n{reply}",
+                        if draft.reply_agent { " [agent]" } else { "" }
+                    );
+                }
+                if draft.resolve {
+                    println!("\n[Staged: resolve on publish]");
+                }
+                if draft.attempt.is_some() {
+                    println!("\n[Uncertain publish attempt: run `zed-pr-review feedback recover`]");
+                }
+            }
+            Ok(())
+        }
+        Some(FeedbackAction::Open {
+            index: idx,
+            checkout,
+            all,
+        }) => {
+            let index = feedback::load_index(&fb_dir)?
+                .context("No feedback index found; run `zed-pr-review feedback fetch` first")?;
+            let item = feedback::thread_by_index(&index, *idx, *all || *top_all)?;
+            let change_id = (!item.change_id.is_empty()).then_some(item.change_id.as_str());
+            if let Some(warning) = feedback::open_in_zed(
+                &root,
+                change_id,
+                &item.thread.path,
+                item.thread.effective_line(),
+                *checkout,
+            )? {
+                eprintln!("{warning}");
+            }
+            Ok(())
+        }
+        Some(FeedbackAction::Reply {
+            index: idx,
+            thread,
+            body,
+            body_file,
+            agent,
+            all,
+        }) => {
+            let index = feedback::load_index(&fb_dir)?
+                .context("No feedback index found; run `zed-pr-review feedback fetch` first")?;
+            let include_all = *all || *top_all;
+            let pr_filter = cli.pr.as_deref().map(parse_pr_number).transpose()?;
+            let item = if let Some(thread_id) = thread {
+                feedback::thread_by_id(&index, pr_filter, thread_id, include_all)?
+            } else if let Some(one_based) = idx {
+                if let Some(pr_num) = pr_filter {
+                    feedback::thread_by_pr_and_index(&index, pr_num, *one_based, include_all)?
+                } else {
+                    feedback::thread_by_index(&index, *one_based, include_all)?
+                }
+            } else {
+                bail!("Provide either a thread <INDEX> or --thread <THREAD_ID>");
+            };
+            let non_interactive =
+                body.is_some() || body_file.is_some() || !io::stdin().is_terminal();
+            let (reply_text, effective_agent) =
+                if let Some(raw) = read_body_input(body.as_deref(), body_file.as_deref())? {
+                    (trim_blank_edges(&raw), *agent)
+                } else {
+                    let drafts = feedback::load_draft_map(&fb_dir);
+                    let existing_draft = drafts.get(&(item.pr_number, item.thread.id.clone()));
+                    let existing = existing_draft.and_then(|d| d.reply_body.as_deref());
+                    let existing_agent = existing_draft.is_some_and(|d| d.reply_agent);
+                    let template = feedback::reply_template(&item.thread, existing);
+                    let store = feedback::open_thread_store(
+                        &fb_dir,
+                        &index.host,
+                        &index.repo,
+                        item.pr_number,
+                        &item.thread.id,
+                    )?;
+                    let edited = edit_message(&store, cli.editor.as_deref(), &template, "reply")?;
+                    (review_summary(&edited), *agent || existing_agent)
+                };
+            if reply_text.trim().is_empty() {
+                if non_interactive {
+                    bail!("Reply body must not be empty");
+                }
+                println!("Blank reply: cancelled. Nothing saved.");
+                return Ok(());
+            }
+            feedback::stage_reply(
+                &fb_dir,
+                &index.host,
+                &index.repo,
+                &item.thread,
+                &reply_text,
+                effective_agent,
+            )?;
+            println!(
+                "Saved local reply for [{}] PR #{} ({}){}. Nothing published yet.",
+                item.index,
+                item.pr_number,
+                item.thread.path,
+                if effective_agent { " [agent]" } else { "" }
+            );
+            Ok(())
+        }
+        Some(FeedbackAction::Resolve { index: idx, all }) => {
+            let index = feedback::load_index(&fb_dir)?
+                .context("No feedback index found; run `zed-pr-review feedback fetch` first")?;
+            let item = feedback::thread_by_index(&index, *idx, *all || *top_all)?;
+            feedback::set_resolve(&fb_dir, &index.host, &index.repo, &item.thread, true)?;
+            println!(
+                "Marked [{}] PR #{} ({}) to resolve on publish.",
+                item.index, item.pr_number, item.thread.path
+            );
+            Ok(())
+        }
+        Some(FeedbackAction::Unresolve { index: idx, all }) => {
+            let index = feedback::load_index(&fb_dir)?
+                .context("No feedback index found; run `zed-pr-review feedback fetch` first")?;
+            let item = feedback::thread_by_index(&index, *idx, *all || *top_all)?;
+            feedback::set_resolve(&fb_dir, &index.host, &index.repo, &item.thread, false)?;
+            println!(
+                "Cleared resolve flag for [{}] PR #{} ({}).",
+                item.index, item.pr_number, item.thread.path
+            );
+            Ok(())
+        }
+        Some(FeedbackAction::Clear { index: idx, all }) => {
+            let index = feedback::load_index(&fb_dir)?
+                .context("No feedback index found; run `zed-pr-review feedback fetch` first")?;
+            let item = feedback::thread_by_index(&index, *idx, *all || *top_all)?;
+            if feedback::clear_staged(&fb_dir, &index.host, &index.repo, &item.thread)? {
+                println!(
+                    "Cleared staged reply and resolve flag for [{}] PR #{} ({}).",
+                    item.index, item.pr_number, item.thread.path
+                );
+            } else {
+                println!("No staged changes on [{}].", item.index);
+            }
+            Ok(())
+        }
+        Some(FeedbackAction::Publish {
+            revset,
+            allow_unpushed,
+            yes,
+        }) => {
+            let client = Client::for_workspace(&root, cli.repo.as_deref())?;
+            let effective_revset = revset.as_deref().or(top_revset.as_deref());
+            feedback::publish_staged(
+                &client,
+                &fb_dir,
+                effective_revset,
+                *allow_unpushed,
+                *yes,
+                confirm,
+            )?;
+            Ok(())
+        }
+        Some(FeedbackAction::Recover { retry }) => {
+            let client = Client::for_workspace(&root, cli.repo.as_deref())?;
+            feedback::recover_attempts(&client, &fb_dir, *retry, confirm)?;
+            Ok(())
+        }
+    }
+}
+
+fn list(draft: &Draft, draft_dir: &Path, json_output: bool) -> Result<()> {
+    if json_output {
+        let comments: Vec<Value> = draft
+            .comments
+            .iter()
+            .enumerate()
+            .map(|(index, comment)| {
+                json!({
+                    "index": index + 1,
+                    "path": comment.path,
+                    "start_line": comment.start_line,
+                    "line": comment.line,
+                    "column": comment.column,
+                    "selected_text": comment.selected_text,
+                    "body": comment.body,
+                    "agent": comment.agent,
+                })
+            })
+            .collect();
+        let output = json!({
+            "pr": {
+                "number": draft.pr.number,
+                "title": draft.pr.title,
+                "url": draft.pr.url,
+                "head_sha": draft.pr.head_sha,
+                "base_sha": draft.pr.base_sha,
+                "reviewer": draft.pr.reviewer,
+            },
+            "draft_dir": draft_dir.display().to_string(),
+            "submitted": draft.submitted,
+            "has_uncertain_attempt": draft.attempt.is_some(),
+            "comments": comments,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
     println!(
         "Head: {}\nBase: {}\nReviewer: {}",
         draft.pr.head_sha, draft.pr.base_sha, draft.pr.reviewer
@@ -577,14 +1510,16 @@ fn list(draft: &Draft) {
     println!("{} saved comments:", draft.comments.len());
     for (index, comment) in draft.comments.iter().enumerate() {
         println!(
-            "\n{}. {}:{}–{} RIGHT\n{}",
+            "\n{}. {}:{}–{} RIGHT{}\n{}",
             index + 1,
             printable(&comment.path),
             comment.start_line,
             comment.line,
+            if comment.agent { " [agent]" } else { "" },
             printable(&comment.body)
         );
     }
+    Ok(())
 }
 
 fn fresh(client: &Client, draft: &Draft, review_entry: Option<&ReviewEntry>) -> Result<()> {

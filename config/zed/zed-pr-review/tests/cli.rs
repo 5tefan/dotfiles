@@ -38,6 +38,7 @@ struct StackFixture {
     root: PathBuf,
     bin_dir: PathBuf,
     gh_calls: PathBuf,
+    gh_payloads: PathBuf,
     editor: PathBuf,
     previous_commit: String,
 }
@@ -212,6 +213,8 @@ os.execv(real_git, [real_git] + args)
 
         let control = temp.path().join("gh-control.json");
         let gh_calls = temp.path().join("gh-calls.jsonl");
+        let gh_payloads = temp.path().join("gh-payloads.jsonl");
+        fs::write(&gh_payloads, "")?;
         fs::write(
             &control,
             serde_json::to_vec_pretty(&json!({
@@ -234,6 +237,7 @@ os.execv(real_git, [real_git] + args)
 import json, sys
 control_path = {control:?}
 calls_path = {calls:?}
+payloads_path = {payloads:?}
 args = sys.argv[1:]
 with open(calls_path, "a") as f:
     f.write(json.dumps(args) + "\n")
@@ -280,6 +284,8 @@ if args and args[0] == "api":
             sys.exit(0)
         if endpoint == f"repos/owner/project/pulls/{{num}}/reviews" and method == "POST":
             payload = json.loads(sys.stdin.read())
+            with open(payloads_path, "a") as f:
+                f.write(json.dumps({{"pr": int(num), "payload": payload}}) + "\n")
             state_map = {{"APPROVE": "APPROVED", "COMMENT": "COMMENTED", "REQUEST_CHANGES": "CHANGES_REQUESTED"}}
             print(json.dumps({{
                 "id": 777,
@@ -296,6 +302,7 @@ sys.exit(1)
 "#,
             control = control.to_str().unwrap(),
             calls = gh_calls.to_str().unwrap(),
+            payloads = gh_payloads.to_str().unwrap(),
         );
         write_executable(&bin_dir.join("gh"), &gh_script)?;
 
@@ -307,6 +314,7 @@ sys.exit(1)
             root,
             bin_dir,
             gh_calls,
+            gh_payloads,
             editor,
             previous_commit,
         })
@@ -538,6 +546,229 @@ fn full_stack_open_navigate_comment_submit_badges_and_close() -> Result<()> {
         ],
     )?;
     assert!(!rejected.status.success());
+
+    Ok(())
+}
+
+#[test]
+fn agent_cli_review_inspection_flag_commenting_and_github_quoting() -> Result<()> {
+    let fx = StackFixture::new()?;
+
+    // Open PR #101 (checked out at review/pr-101; PR #102 is also in the stack).
+    let open = fx.run_cli(&["--pr", "101", "open"], "", &[])?;
+    assert!(
+        open.status.success(),
+        "open failed: {}",
+        String::from_utf8_lossy(&open.stderr)
+    );
+    let at_before = jj_output(
+        &fx.root,
+        &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+    )?;
+
+    // Reset gh call log to verify offline read/draft commands do not call gh.
+    fs::write(&fx.gh_calls, "")?;
+
+    // 1. `review-info --json` lists bottom-to-top PRs offline.
+    let info = fx.run_cli(&["review-info", "--json"], "", &[])?;
+    assert!(
+        info.status.success(),
+        "review-info failed: {}",
+        String::from_utf8_lossy(&info.stderr)
+    );
+    let info_json: serde_json::Value = serde_json::from_slice(&info.stdout)?;
+    let prs = info_json.as_array().unwrap();
+    assert_eq!(prs.len(), 2);
+    assert_eq!(prs[0]["number"], 101);
+    assert_eq!(prs[0]["is_current"], true);
+    assert_eq!(prs[0]["draft_comment_count"], 0);
+    assert_eq!(prs[1]["number"], 102);
+    assert_eq!(prs[1]["is_current"], false);
+
+    // 2. `diff --pr 102 --file three.txt` prints cached patch offline.
+    let diff = fx.run_cli(&["diff", "--pr", "102", "--file", "three.txt"], "", &[])?;
+    assert!(
+        diff.status.success(),
+        "diff failed: {}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
+    let diff_out = String::from_utf8(diff.stdout)?;
+    assert!(diff_out.contains("diff --git a/three.txt b/three.txt"));
+    assert!(diff_out.contains("+delta"));
+
+    // 3. Flag-based agent comment on PR #102 while @ stays on PR #101!
+    let c102 = fx.run_cli(
+        &[
+            "comment",
+            "--agent",
+            "--pr",
+            "102",
+            "--path",
+            "three.txt",
+            "--line",
+            "1",
+            "--body",
+            "Check edge case.\n\n```rust\nlet x = 1;\n```",
+        ],
+        "",
+        &[],
+    )?;
+    assert!(
+        c102.status.success(),
+        "comment 102 failed: {}",
+        String::from_utf8_lossy(&c102.stderr)
+    );
+    let c102_out = String::from_utf8(c102.stdout)?;
+    assert!(c102_out.contains("PR #102"));
+    assert!(c102_out.contains("three.txt:1"));
+    assert!(c102_out.contains("[agent]"));
+
+    // Verify @ did not move.
+    let at_after = jj_output(
+        &fx.root,
+        &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+    )?;
+    assert_eq!(at_before, at_after);
+
+    // 4. Duplicate comment is rejected cleanly.
+    let dup = fx.run_cli(
+        &[
+            "comment",
+            "--agent",
+            "--pr",
+            "102",
+            "--path",
+            "three.txt",
+            "--line",
+            "1",
+            "--body",
+            "Check edge case.\n\n```rust\nlet x = 1;\n```",
+        ],
+        "",
+        &[],
+    )?;
+    assert!(!dup.status.success());
+    assert!(String::from_utf8_lossy(&dup.stderr).contains("Duplicate comment"));
+
+    // 5. Invalid path and out-of-bounds line are rejected cleanly.
+    let bad_path = fx.run_cli(
+        &[
+            "comment",
+            "--agent",
+            "--pr",
+            "102",
+            "--path",
+            "missing.txt",
+            "--line",
+            "1",
+            "--body",
+            "nope",
+        ],
+        "",
+        &[],
+    )?;
+    assert!(!bad_path.status.success());
+
+    let bad_line = fx.run_cli(
+        &[
+            "comment",
+            "--agent",
+            "--pr",
+            "102",
+            "--path",
+            "three.txt",
+            "--line",
+            "99",
+            "--body",
+            "nope",
+        ],
+        "",
+        &[],
+    )?;
+    assert!(!bad_line.status.success());
+
+    // 6. `--body-file` and `--body -` work on current PR #101.
+    let body_file = fx._temp.path().join("comment_body.md");
+    fs::write(&body_file, "First para.\n\nSecond para.\n")?;
+    let c101_a = fx.run_cli(
+        &[
+            "comment",
+            "--agent",
+            "--path",
+            "one.txt",
+            "--start-line",
+            "1",
+            "--line",
+            "2",
+            "--body-file",
+            body_file.to_str().unwrap(),
+        ],
+        "",
+        &[],
+    )?;
+    assert!(
+        c101_a.status.success(),
+        "comment 101 body-file failed: {}",
+        String::from_utf8_lossy(&c101_a.stderr)
+    );
+
+    let c101_b = fx.run_cli(
+        &["comment", "--path", "two.txt", "--line", "1", "--body", "-"],
+        "Human comment via stdin\n",
+        &[],
+    )?;
+    assert!(
+        c101_b.status.success(),
+        "comment 101 stdin failed: {}",
+        String::from_utf8_lossy(&c101_b.stderr)
+    );
+
+    // 7. `list --pr 102 --json` returns raw unquoted body + `agent: true` offline.
+    let list102 = fx.run_cli(&["list", "--pr", "102", "--json"], "", &[])?;
+    assert!(
+        list102.status.success(),
+        "list 102 failed: {}",
+        String::from_utf8_lossy(&list102.stderr)
+    );
+    let list102_json: serde_json::Value = serde_json::from_slice(&list102.stdout)?;
+    assert_eq!(list102_json["pr"]["number"], 102);
+    let comments102 = list102_json["comments"].as_array().unwrap();
+    assert_eq!(comments102.len(), 1);
+    assert_eq!(comments102[0]["agent"], true);
+    assert_eq!(
+        comments102[0]["body"],
+        "Check edge case.\n\n```rust\nlet x = 1;\n```"
+    );
+
+    // None of the inspection/comment/list commands should have called `gh`.
+    assert!(
+        fs::read_to_string(&fx.gh_calls)?.trim().is_empty(),
+        "offline commands unexpectedly called gh"
+    );
+
+    // 8. Submitting PR #101 renders agent comment as blockquote + `\- an agent` on GitHub
+    //    while keeping human comment unquoted.
+    let submit = fx.run_cli(
+        &["--editor", fx.editor.to_str().unwrap(), "submit-comment"],
+        "",
+        &[],
+    )?;
+    assert!(
+        submit.status.success(),
+        "submit-comment failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&submit.stdout),
+        String::from_utf8_lossy(&submit.stderr)
+    );
+    let posted_raw = fs::read_to_string(&fx.gh_payloads)?;
+    let posted: serde_json::Value = serde_json::from_str(posted_raw.lines().last().unwrap())?;
+    assert_eq!(posted["pr"], 101);
+    let posted_comments = posted["payload"]["comments"].as_array().unwrap();
+    assert_eq!(posted_comments.len(), 2);
+    assert_eq!(
+        posted_comments[0]["body"],
+        "> First para.\n>\n> Second para.\n\n\\- an agent"
+    );
+    assert_eq!(posted_comments[1]["body"], "Human comment via stdin");
 
     Ok(())
 }

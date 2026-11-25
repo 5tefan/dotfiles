@@ -42,6 +42,9 @@ directory outside the repo. Do not link the whole `~/.claude/` directory.
 - `describe-pr-stack`: descriptions and QA evidence for a stack of GitHub PRs.
   It requires an authenticated `gh` CLI. Parallel subagents are preferred, with
   a direct per-PR fallback when the agent does not support them.
+- `review-pr-stack`: local-only PR stack review and feedback-reply drafting via
+  `zed-pr-review`. Marks agent-authored drafts locally and never publishes,
+  submits, approves, requests changes, or resolves threads on GitHub.
 
 The first two skills were migrated from `~/.claude/skills/`.
 `describe-pr-stack` was moved out of
@@ -72,7 +75,7 @@ these task-specific skills.
 
 ## Verify installation
 
-Check that all three skills appear in Zed's **AI > Skills** settings and in
+Check that all four skills appear in Zed's **AI > Skills** settings and in
 Claude Code's `/skills` list. Invoking a skill to inspect its instructions does
 not authorize pushes, deployments, PR edits, or other side effects.
 

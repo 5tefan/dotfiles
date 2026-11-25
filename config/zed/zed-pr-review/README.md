@@ -117,15 +117,18 @@ Subcommands:
 - `push [-r REVSET] [--dry-run] [--json] [-t/--update-title] [-o/--open] [-n/--force-new-pr] [--ready] [--allow-empty-description]` — push the current `jj` bookmark stack to `origin` and create or retarget GitHub PRs
 - `stack [--watch]` — run `jj l` (or the live interactive viewer with `--watch`)
 - `sb` / `sf` — run `jj sb` / `jj sf`
-- `comment` — save an inline comment from Zed's selection environment variables
+- `comment [--path <PATH> --line <N> [--start-line <M>] (--body <TEXT|-> | --body-file <PATH>) [--agent]]` — save an inline comment locally (from Zed's selection env vars or explicit CLI flags; `--agent` flags the draft as agent-authored and renders it as a blockquote signed `\- an agent` when posted to GitHub)
+- `review-info [--json]` — inspect active local review stack PRs in bottom-to-top order offline
+- `diff [--pr <N>] [--file <PATH>]` — print cached PR diff patches from the active review stack offline
 - `finish` — open the 5-option review menu for the current review revision
 - `cancel [--yes]` — archive and clear the current PR's local draft
 - `submit-comment` / `approve` / `request-changes` — submit a review directly from the CLI
-- `list` — show saved comments, submission receipt, and recovery state
+- `list [--json]` — show saved comments, submission receipt, and recovery state
 - `edit <INDEX>` / `remove <INDEX>` — edit or delete a saved comment (1-based index)
 - `discard [--yes]` — archive and clear a local draft
 - `recover [--retry]` — reconcile an uncertain submission against GitHub before retrying
 - `ready [--reviewer <USER|ORG/TEAM>]` — mark the current PR ready for review
+- `feedback [fetch | list [--cached] [--json] | show <INDEX> | open <INDEX> | reply [<INDEX> | --thread <ID>] [--body <TEXT|->] [--body-file <PATH>] [--agent] | resolve <INDEX> | unresolve <INDEX> | clear <INDEX> | publish | recover]` — inspect, draft local replies/resolutions for, and safely publish GitHub review threads on your stack
 
 ## State Layout and Submission Safety
 

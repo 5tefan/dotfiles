@@ -3,6 +3,50 @@ use anyhow::{Context, Result, ensure};
 
 const REFERENCE_PREFIX: &str = "#|";
 const CONTEXT_LINES: usize = 5;
+const AGENT_SIGNATURE: &str = r"\- an agent";
+
+/// Deterministically wrap raw Markdown in a continuous blockquote followed by `\- an agent`.
+/// Idempotent when given text that is already formatted in this exact shape.
+pub fn format_agent_body(raw: &str) -> Result<String> {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let first = lines
+        .iter()
+        .position(|line| !line.trim().is_empty())
+        .context("Agent comment body must not be blank")?;
+    let last = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .unwrap_or(first);
+    let trimmed = &lines[first..=last];
+
+    // Keep idempotent so re-formatting already-formatted agent text does not double-quote or double-sign.
+    if trimmed.len() >= 3
+        && trimmed[trimmed.len() - 1] == AGENT_SIGNATURE
+        && trimmed[trimmed.len() - 2].trim().is_empty()
+        && trimmed[..trimmed.len() - 2]
+            .iter()
+            .all(|line| *line == ">" || line.starts_with("> "))
+    {
+        return Ok(trimmed.join("\n"));
+    }
+
+    let mut out = String::new();
+    for (idx, line) in trimmed.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        if line.trim().is_empty() {
+            out.push('>');
+        } else {
+            out.push_str("> ");
+            out.push_str(line);
+        }
+    }
+    out.push_str("\n\n");
+    out.push_str(AGENT_SIGNATURE);
+    Ok(out)
+}
 
 pub fn review_template(
     comments: &[Comment],
@@ -73,7 +117,14 @@ pub fn review_template(
             );
         }
         reference(&mut template, "");
-        reference(&mut template, "Your comment:");
+        reference(
+            &mut template,
+            if comment.agent {
+                "Your comment [agent]:"
+            } else {
+                "Your comment:"
+            },
+        );
         reference(&mut template, &comment.body);
     }
     Ok(template)
@@ -113,6 +164,7 @@ mod tests {
             column: 1,
             selected_text: "selected text".into(),
             body: "Please check this.\n\nMore detail.".into(),
+            agent: false,
         }
     }
 
@@ -205,5 +257,38 @@ mod tests {
             assert!(review_template(&[comment(1, 1)], |_| Ok(content.to_vec())).is_err());
         }
         assert!(review_template(&[comment(1, 1)], |_| anyhow::bail!("Missing blob")).is_err());
+    }
+
+    #[test]
+    fn format_agent_body_wraps_paragraphs_code_fences_lists_and_crlf() {
+        let raw = "\n\nbla bla bla\r\n\r\n```rust\r\ncode...\r\n```\r\n\r\n- item 1\r\n- item 2\r\n\r\ntherefore...\n\n";
+        let expected = concat!(
+            "> bla bla bla\n",
+            ">\n",
+            "> ```rust\n",
+            "> code...\n",
+            "> ```\n",
+            ">\n",
+            "> - item 1\n",
+            "> - item 2\n",
+            ">\n",
+            "> therefore...\n",
+            "\n",
+            r"\- an agent",
+        );
+        let formatted = format_agent_body(raw).unwrap();
+        assert_eq!(formatted, expected);
+        // Idempotent: formatting already-formatted agent text does not double-quote or double-sign.
+        assert_eq!(format_agent_body(&formatted).unwrap(), expected);
+    }
+
+    #[test]
+    fn format_agent_body_rejects_blank_input_and_preserves_indentation() {
+        assert!(format_agent_body("").is_err());
+        assert!(format_agent_body("   \r\n\t\n  ").is_err());
+        assert_eq!(
+            format_agent_body("    indented line\n  next").unwrap(),
+            ">     indented line\n>   next\n\n\\- an agent"
+        );
     }
 }

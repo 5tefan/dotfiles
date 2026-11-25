@@ -1,6 +1,6 @@
 //! Pinned GitHub reads, explicit PR transport/checkout, and non-retrying PR mutations.
 
-use crate::model::{ChangedFile, PullRequest};
+use crate::model::{ChangedFile, PullRequest, ReviewThread, ThreadComment};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -396,6 +396,165 @@ impl Client {
             "Unexpected mark-ready response; outcome is uncertain, check GitHub before retrying"
         );
         Ok(())
+    }
+
+    /// Fetch all review threads for a pull request via GitHub's GraphQL API.
+    /// Paginates both threads and per-thread comments.
+    pub fn fetch_review_threads(
+        &self,
+        pr_number: u64,
+        bookmark: &str,
+        head_sha: &str,
+    ) -> Result<Vec<ReviewThread>> {
+        self.validate_target()?;
+        ensure!(pr_number > 0, "PR number must be greater than 0");
+        let (owner, name) = self
+            .repo
+            .split_once('/')
+            .context("Repository must be OWNER/REPO")?;
+        let mut threads = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let response = self.graphql(
+                REVIEW_THREADS_QUERY,
+                &json!({
+                    "owner": owner,
+                    "name": name,
+                    "number": pr_number,
+                    "after": cursor,
+                }),
+            )?;
+            let page = parse_review_threads_page(&response, pr_number, bookmark, head_sha)?;
+            for (mut thread, comments_cursor) in page.threads {
+                if let Some(mut next_comment_cursor) = comments_cursor {
+                    loop {
+                        let more =
+                            self.fetch_thread_comments_page(&thread.id, &next_comment_cursor)?;
+                        thread.comments.extend(more.comments);
+                        match more.end_cursor {
+                            Some(next) if more.has_next_page => next_comment_cursor = next,
+                            _ => break,
+                        }
+                    }
+                }
+                threads.push(thread);
+            }
+            if page.has_next_page {
+                let next = page
+                    .end_cursor
+                    .context("reviewThreads pageInfo missing endCursor")?;
+                cursor = Some(next);
+            } else {
+                break;
+            }
+        }
+        Ok(threads)
+    }
+
+    /// Re-fetch a single review thread by its GraphQL node ID.
+    pub fn fetch_review_thread(
+        &self,
+        thread_id: &str,
+        pr_number: u64,
+        bookmark: &str,
+        head_sha: &str,
+    ) -> Result<ReviewThread> {
+        self.validate_target()?;
+        ensure!(
+            !thread_id.trim().is_empty(),
+            "Review thread ID must not be empty"
+        );
+        let response = self.graphql(REVIEW_THREAD_BY_ID_QUERY, &json!({ "id": thread_id }))?;
+        check_graphql_errors(&response)?;
+        let node = response
+            .get("data")
+            .and_then(|d| d.get("node"))
+            .filter(|n| !n.is_null())
+            .context("Review thread not found on GitHub")?;
+        let (mut thread, comments_cursor) =
+            parse_review_thread_node(node, pr_number, bookmark, head_sha)?;
+        if let Some(mut next_comment_cursor) = comments_cursor {
+            loop {
+                let more = self.fetch_thread_comments_page(&thread.id, &next_comment_cursor)?;
+                thread.comments.extend(more.comments);
+                match more.end_cursor {
+                    Some(next) if more.has_next_page => next_comment_cursor = next,
+                    _ => break,
+                }
+            }
+        }
+        Ok(thread)
+    }
+
+    fn fetch_thread_comments_page(
+        &self,
+        thread_id: &str,
+        after: &str,
+    ) -> Result<ThreadCommentsPage> {
+        let response = self.graphql(
+            REVIEW_THREAD_COMMENTS_QUERY,
+            &json!({ "id": thread_id, "after": after }),
+        )?;
+        check_graphql_errors(&response)?;
+        let comments = response
+            .get("data")
+            .and_then(|d| d.get("node"))
+            .and_then(|n| n.get("comments"))
+            .context("Missing comments in thread comments GraphQL response")?;
+        parse_thread_comments(comments)
+    }
+
+    /// Post a reply to a pull request review thread via GraphQL.
+    pub fn reply_to_review_thread(&self, thread_id: &str, body: &str) -> Result<ThreadComment> {
+        self.validate_target()?;
+        ensure!(
+            !thread_id.trim().is_empty(),
+            "Review thread ID must not be empty"
+        );
+        ensure!(!body.trim().is_empty(), "Reply body must not be empty");
+        let response = self.graphql(
+            REPLY_TO_REVIEW_THREAD_MUTATION,
+            &json!({
+                "threadId": thread_id,
+                "body": body,
+            }),
+        )?;
+        check_graphql_errors(&response)?;
+        let comment = response
+            .get("data")
+            .and_then(|d| d.get("addPullRequestReviewThreadReply"))
+            .and_then(|r| r.get("comment"))
+            .filter(|c| !c.is_null())
+            .context("Unexpected addPullRequestReviewThreadReply response; outcome is uncertain")?;
+        parse_thread_comment(comment)
+    }
+
+    /// Resolve a pull request review thread via GraphQL.
+    pub fn resolve_review_thread(&self, thread_id: &str) -> Result<bool> {
+        self.validate_target()?;
+        ensure!(
+            !thread_id.trim().is_empty(),
+            "Review thread ID must not be empty"
+        );
+        let response = self.graphql(
+            RESOLVE_REVIEW_THREAD_MUTATION,
+            &json!({ "threadId": thread_id }),
+        )?;
+        check_graphql_errors(&response)?;
+        let thread = response
+            .get("data")
+            .and_then(|d| d.get("resolveReviewThread"))
+            .and_then(|r| r.get("thread"))
+            .filter(|t| !t.is_null())
+            .context("Unexpected resolveReviewThread response; outcome is uncertain")?;
+        let returned_id = required_string(thread, "id")?;
+        ensure!(
+            returned_id == thread_id,
+            "resolveReviewThread returned mismatched thread ID"
+        );
+        thread["isResolved"]
+            .as_bool()
+            .context("resolveReviewThread response missing boolean isResolved")
     }
 
     /// List all PRs (open, closed, merged) for a head branch in this repository.
@@ -2057,6 +2216,306 @@ impl Client {
     }
 }
 
+const REVIEW_THREADS_QUERY: &str = r#"query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      reviewThreads(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isResolved
+          isOutdated
+          isCollapsed
+          path
+          line
+          originalLine
+          startLine
+          diffSide
+          comments(first: 100) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              databaseId
+              author { login }
+              body
+              createdAt
+              url
+            }
+          }
+        }
+      }
+    }
+  }
+}"#;
+
+const REVIEW_THREAD_BY_ID_QUERY: &str = r#"query($id: ID!) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      id
+      isResolved
+      isOutdated
+      isCollapsed
+      path
+      line
+      originalLine
+      startLine
+      diffSide
+      comments(first: 100) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          databaseId
+          author { login }
+          body
+          createdAt
+          url
+        }
+      }
+    }
+  }
+}"#;
+
+const REVIEW_THREAD_COMMENTS_QUERY: &str = r#"query($id: ID!, $after: String) {
+  node(id: $id) {
+    ... on PullRequestReviewThread {
+      comments(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          databaseId
+          author { login }
+          body
+          createdAt
+          url
+        }
+      }
+    }
+  }
+}"#;
+
+const REPLY_TO_REVIEW_THREAD_MUTATION: &str = r#"mutation($threadId: ID!, $body: String!) {
+  addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $threadId, body: $body}) {
+    comment {
+      id
+      databaseId
+      author { login }
+      body
+      createdAt
+      url
+    }
+  }
+}"#;
+
+const RESOLVE_REVIEW_THREAD_MUTATION: &str = r#"mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread {
+      id
+      isResolved
+    }
+  }
+}"#;
+
+#[derive(Debug)]
+pub(crate) struct ReviewThreadsPage {
+    pub threads: Vec<(ReviewThread, Option<String>)>,
+    pub has_next_page: bool,
+    pub end_cursor: Option<String>,
+}
+
+struct ThreadCommentsPage {
+    comments: Vec<ThreadComment>,
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+fn check_graphql_errors(response: &Value) -> Result<()> {
+    if let Some(errors) = response.get("errors").and_then(Value::as_array)
+        && !errors.is_empty()
+    {
+        let messages: Vec<&str> = errors
+            .iter()
+            .filter_map(|e| e.get("message").and_then(Value::as_str))
+            .collect();
+        let detail = if messages.is_empty() {
+            "unknown GraphQL error".to_owned()
+        } else {
+            messages.join("; ")
+        };
+        bail!("GitHub GraphQL error: {detail}");
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_review_threads_page(
+    response: &Value,
+    pr_number: u64,
+    bookmark: &str,
+    head_sha: &str,
+) -> Result<ReviewThreadsPage> {
+    check_graphql_errors(response)?;
+    let pr = response
+        .get("data")
+        .and_then(|d| d.get("repository"))
+        .and_then(|r| r.get("pullRequest"))
+        .filter(|p| !p.is_null())
+        .with_context(|| format!("PR #{pr_number} not found in GraphQL response"))?;
+    let resolved_head_sha = pr
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(head_sha);
+    let container = pr
+        .get("reviewThreads")
+        .context("Missing reviewThreads in GraphQL response")?;
+    let has_next_page = container
+        .get("pageInfo")
+        .and_then(|p| p.get("hasNextPage"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let end_cursor = container
+        .get("pageInfo")
+        .and_then(|p| p.get("endCursor"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let nodes = container
+        .get("nodes")
+        .and_then(Value::as_array)
+        .context("reviewThreads.nodes is not an array")?;
+    let mut threads = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        if node.is_null() {
+            continue;
+        }
+        threads.push(parse_review_thread_node(
+            node,
+            pr_number,
+            bookmark,
+            resolved_head_sha,
+        )?);
+    }
+    Ok(ReviewThreadsPage {
+        threads,
+        has_next_page,
+        end_cursor,
+    })
+}
+
+pub(crate) fn parse_review_thread_node(
+    node: &Value,
+    pr_number: u64,
+    bookmark: &str,
+    head_sha: &str,
+) -> Result<(ReviewThread, Option<String>)> {
+    let id = required_string(node, "id")?.to_owned();
+    ensure!(!id.trim().is_empty(), "Review thread has an empty id");
+    let is_resolved = node["isResolved"]
+        .as_bool()
+        .context("Review thread missing boolean isResolved")?;
+    let is_outdated = node["isOutdated"].as_bool().unwrap_or(false);
+    let is_collapsed = node["isCollapsed"].as_bool().unwrap_or(false);
+    let path = required_string(node, "path")?.to_owned();
+    let line = node["line"].as_u64().and_then(|v| u32::try_from(v).ok());
+    let original_line = node["originalLine"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok());
+    let start_line = node["startLine"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok());
+    let diff_side = node["diffSide"].as_str().unwrap_or("RIGHT").to_owned();
+    let comments_val = node
+        .get("comments")
+        .context("Review thread missing comments")?;
+    let comments_page = parse_thread_comments(comments_val)?;
+    let next_cursor = if comments_page.has_next_page {
+        comments_page.end_cursor
+    } else {
+        None
+    };
+    Ok((
+        ReviewThread {
+            id,
+            is_resolved,
+            is_outdated,
+            is_collapsed,
+            path,
+            line,
+            original_line,
+            start_line,
+            diff_side,
+            comments: comments_page.comments,
+            pr_number,
+            bookmark: bookmark.to_owned(),
+            head_sha: head_sha.to_owned(),
+        },
+        next_cursor,
+    ))
+}
+
+fn parse_thread_comments(value: &Value) -> Result<ThreadCommentsPage> {
+    let has_next_page = value
+        .get("pageInfo")
+        .and_then(|p| p.get("hasNextPage"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let end_cursor = value
+        .get("pageInfo")
+        .and_then(|p| p.get("endCursor"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let nodes = value
+        .get("nodes")
+        .and_then(Value::as_array)
+        .context("comments.nodes is not an array")?;
+    let mut comments = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        if node.is_null() {
+            continue;
+        }
+        comments.push(parse_thread_comment(node)?);
+    }
+    Ok(ThreadCommentsPage {
+        comments,
+        has_next_page,
+        end_cursor,
+    })
+}
+
+fn parse_thread_comment(node: &Value) -> Result<ThreadComment> {
+    let id = required_string(node, "id")?.to_owned();
+    ensure!(!id.trim().is_empty(), "Thread comment has an empty id");
+    let database_id = node.get("databaseId").and_then(Value::as_u64);
+    let author = node
+        .get("author")
+        .and_then(|a| a.get("login"))
+        .and_then(Value::as_str)
+        .unwrap_or("ghost")
+        .to_owned();
+    let body = node
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let created_at = node
+        .get("createdAt")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let url = node
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    Ok(ThreadComment {
+        id,
+        database_id,
+        author,
+        body,
+        created_at,
+        url,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Target {
     host: String,
@@ -2225,6 +2684,10 @@ fn parse_number(value: &str) -> Result<u64> {
     let number = value.parse::<u64>().context("PR number is too large")?;
     ensure!(number > 0, "PR number must be positive");
     Ok(number)
+}
+
+pub fn parse_pr_number(value: &str) -> Result<u64> {
+    Ok(parse_pr_spec(value)?.number)
 }
 
 fn parse_pr_spec(value: &str) -> Result<PrSpec> {
@@ -3754,5 +4217,80 @@ mod tests {
         assert!(client.check_identity(&pr).is_err());
         assert!(client.pr_endpoint(0).is_err());
         assert!(client.review_comments(42, 0).is_err());
+    }
+
+    #[test]
+    fn parses_review_threads_graphql_page_and_rejects_errors() {
+        let response = json!({
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "headRefOid": HEAD,
+                        "reviewThreads": {
+                            "pageInfo": { "hasNextPage": true, "endCursor": "CUR1" },
+                            "nodes": [
+                                {
+                                    "id": "PRRT_1",
+                                    "isResolved": false,
+                                    "isOutdated": true,
+                                    "isCollapsed": false,
+                                    "path": "src/lib.rs",
+                                    "line": null,
+                                    "originalLine": 42,
+                                    "startLine": null,
+                                    "diffSide": "RIGHT",
+                                    "comments": {
+                                        "pageInfo": { "hasNextPage": false, "endCursor": null },
+                                        "nodes": [
+                                            {
+                                                "id": "PRRC_1",
+                                                "databaseId": 1001,
+                                                "author": { "login": "alice" },
+                                                "body": "Please rename this.",
+                                                "createdAt": "2026-01-01T00:00:00Z",
+                                                "url": "https://github.com/org/project/pull/42#discussion_r1001"
+                                            },
+                                            {
+                                                "id": "PRRC_2",
+                                                "databaseId": null,
+                                                "author": null,
+                                                "body": "Follow-up",
+                                                "createdAt": "2026-01-02T00:00:00Z",
+                                                "url": ""
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        let page = parse_review_threads_page(&response, 42, "feat-a", "").unwrap();
+        assert!(page.has_next_page);
+        assert_eq!(page.end_cursor.as_deref(), Some("CUR1"));
+        assert_eq!(page.threads.len(), 1);
+        let (thread, next_comment_cursor) = &page.threads[0];
+        assert!(next_comment_cursor.is_none());
+        assert_eq!(thread.id, "PRRT_1");
+        assert!(!thread.is_resolved);
+        assert!(thread.is_outdated);
+        assert_eq!(thread.path, "src/lib.rs");
+        assert_eq!(thread.line, None);
+        assert_eq!(thread.original_line, Some(42));
+        assert_eq!(thread.effective_line(), Some(42));
+        assert_eq!(thread.head_sha, HEAD);
+        assert_eq!(thread.bookmark, "feat-a");
+        assert_eq!(thread.comments.len(), 2);
+        assert_eq!(thread.comments[0].author, "alice");
+        assert_eq!(thread.comments[0].database_id, Some(1001));
+        assert_eq!(thread.comments[1].author, "ghost");
+
+        let err_response = json!({
+            "errors": [{ "message": "API rate limit exceeded" }]
+        });
+        let err = parse_review_threads_page(&err_response, 42, "feat-a", HEAD).unwrap_err();
+        assert!(err.to_string().contains("API rate limit exceeded"));
     }
 }

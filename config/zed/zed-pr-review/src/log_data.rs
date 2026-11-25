@@ -165,6 +165,20 @@ pub fn format_ci_badge(badge: CiBadge) -> Span<'static> {
     )
 }
 
+pub fn format_thread_badge(count: usize) -> Span<'static> {
+    let label = if count == 1 {
+        "[1 thread]".to_owned()
+    } else {
+        format!("[{count} threads]")
+    };
+    Span::styled(
+        label,
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
 /// Edit only the same, still-visible, unambiguous mutable commit that was clicked.
 /// A normal jj edit snapshots local work and honors immutable protection. It can
 /// therefore snapshot work even when its subsequent stale-target check rejects an edit.
