@@ -39,6 +39,23 @@ must make sense, pass CI and introduce things in their final form.
 - **Don't edit stacks or branches outside the task**, such as the sandbox-infra
   stack or a branch already enqueued for merge.
 
+## Shape of a stack
+
+- Order revisions by dependency: data model, core rules and validation,
+  services, background work, API, UI, then integrations and extras, polish
+  last. Each PR can then be reviewed and tested without the ones above it.
+- Add the safety boundary before the capability it guards, so no revision
+  ships an unguarded version.
+- Background state machines need a way out of stuck states: a sweep that fails
+  or recovers anything left running or pending when a worker dies.
+- Re-running a process resets everything it produced (result, error,
+  timestamps), not only its status.
+- The UI shows a result only in the state that produced it, e.g. a verdict
+  badge only on a completed review.
+- Keep `scratch/stack_overview.md` up to date: one row per revision with what
+  it adds and why the next one needs it. Update it whenever a revision's
+  behaviour changes.
+
 ## Shape of a revision
 
 - One thing per revision. Split refactors from behaviour changes, and test-only
@@ -80,6 +97,9 @@ must make sense, pass CI and introduce things in their final form.
   when a migration in the stack was edited in place.
 - Run mypy as CI does: `mypy tiger_lily/ intern/`. A single-file run can crash
   inside mypy on `tiger_lily.viewer_context`; that isn't a real failure.
+- Check disk space before heavy runs. When a full run is OOM-killed or can't
+  run (e.g. full mypy with the dev server up), run a scoped version and say
+  which one ran.
 
 ## jj workflow
 
@@ -99,6 +119,8 @@ must make sense, pass CI and introduce things in their final form.
   lines per bookmark), then compare afterwards. Only the revisions you meant to
   change may differ. Also check `conflicts()` and `divergent()` across the
   stack.
+- Then run the affected tests and the typecheck at each revision you changed,
+  not only at the tip.
 - `.jj/repo` is shared between the Mac and the VMs over virtiofs, and jj's lock
   doesn't hold across machines. Overlapping fetches cause "reconcile divergent
   operations", which can rewrite main into conflicted mutable copies.
@@ -112,6 +134,12 @@ must make sense, pass CI and introduce things in their final form.
     `jj bookmark forget --include-remotes <name>`, then abandon the old chain
     after checking it holds nothing named.
 - Record the operation id before risky cleanup, so `jj op restore` can undo it.
+  Record it before every stack edit or rebase too, and end the report with
+  `jj op restore <id>`.
+- When the same change lands in several revisions, script it: one transform
+  whose replacements must each match exactly once, run on each revision. Don't
+  hand-edit each copy. Regenerate generated files with a loop over the
+  revisions the same way.
 
 ## Rebasing on main
 

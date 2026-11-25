@@ -33,7 +33,8 @@ scratch/<name>/
 ## STACK.md
 
 One row per revision in stack order, bottom first. Include revisions with no UI,
-so the table explains the whole stack.
+so the table explains the whole stack. If `scratch/stack_overview.md` exists,
+start from its summaries and keep the two consistent.
 
 ```markdown
 # <name> stack
@@ -74,6 +75,9 @@ only the PR in front of them.
 - Write the description while inspecting (step 5): open the image next to the
   revision's diff and say what feature the image shows.
 - Update the catalog whenever images are added, deleted or recaptured.
+- When a fix changes a captured screen, recapture the affected images and
+  update CATALOG.md, report.md and any PR description drafts that mention the
+  bug. Tell Stefan exactly which images to re-upload to which PRs.
 
 ### Writing descriptions
 
@@ -108,7 +112,8 @@ only the PR in front of them.
 - Write a seed script under `scratch/<name>/` and run it through
   `manage.py shell` (intern settings for intern data). It must be idempotent:
   delete its own previous rows first, matched by a `[QA]` title prefix or a
-  fixed id.
+  fixed id. A reused row must have every field the scenario depends on reset,
+  not only the ones the script usually sets.
 - Use the QA user `diff-review-ux@compa.ai` on tenant `lilac_greenhouse`. Create
   it if missing, and don't reset its password on every run, or the browser logs
   out.
@@ -125,8 +130,8 @@ Never capture a lower PR from the tip. Use a throwaway server per revision
 (`scratch/<name>/serve_rev.sh <bookmark>`):
 
 - Create a jj workspace in the scratchpad at the bookmark. Guard every `cd`.
-- Link `.venv` and both `node_modules`. If main's lockfile changed, give the
-  workspace its own `.venv` with `uv sync --frozen`.
+- Give the workspace its own `.venv` (`uv sync --frozen`) and install its own
+  `node_modules`. Never symlink them.
 - Copy the legacy `intern/frontend/dist` and `tiger_lily/frontend/dist`; login
   still uses them. Copy, don't symlink: symlinks fail the sketchy-file system
   check and get snapshotted into a commit.
@@ -165,6 +170,8 @@ Never capture a lower PR from the tip. Use a throwaway server per revision
 - Open every PNG alongside the revision's diff. Check that it shows what that
   revision adds and nothing from later revisions (e.g. agent4 must not have
   agent5's "System" label).
+- For each status or variant, check the screen shows that state and nothing
+  left over from another one, e.g. no verdict badge on a pending review.
 - Delete duplicates and useless shots (a scroll that changed nothing, a list
   with the column off-screen).
 - Add a CATALOG.md row for each kept image, following "Writing descriptions".
