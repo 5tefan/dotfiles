@@ -19,6 +19,10 @@
       "ctrl-shift-m": ["task::Spawn", { "task_name": "jj squash" }],
       "ctrl-shift-r": ["task::Spawn", { "task_name": "jj revision ready" }],
       "ctrl-shift-g": ["task::Spawn", { "task_name": "PR: open for review" }],
+      "ctrl-shift-x": [
+        "task::Spawn",
+        { "task_name": "PR: finish review", "reveal_target": "center" },
+      ],
 
       "\\ l f": ["task::Spawn", { "task_name": "forward_search" }],
       "\\ l v": ["task::Spawn", { "task_name": "latexmk (watch)" }],
@@ -28,10 +32,6 @@
     "context": "Editor",
     "bindings": {
       "ctrl-shift-c": ["task::Spawn", { "task_name": "PR: add comment" }],
-      "ctrl-shift-x": [
-        "task::Spawn",
-        { "task_name": "PR: finish review", "reveal_target": "center" },
-      ],
     },
   },
   {

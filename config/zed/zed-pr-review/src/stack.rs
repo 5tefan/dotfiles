@@ -135,6 +135,30 @@ impl Stack {
             .collect()
     }
 
+    pub fn entry(&self, number: u64) -> Option<&StackEntry> {
+        self.entries.get(&number)
+    }
+
+    pub fn parent_of(&self, number: u64) -> Option<&StackEntry> {
+        self.parents.get(&number).map(|n| &self.entries[n])
+    }
+
+    /// Connected PRs in bottom-to-top topological order (parent before children).
+    pub fn topological_order(&self) -> Vec<&StackEntry> {
+        let mut order = Vec::with_capacity(self.entries.len());
+        let mut queue = VecDeque::from([self.root]);
+        let mut seen = BTreeSet::from([self.root]);
+        while let Some(number) = queue.pop_front() {
+            order.push(&self.entries[&number]);
+            for &child in self.child_numbers(number) {
+                if seen.insert(child) {
+                    queue.push_back(child);
+                }
+            }
+        }
+        order
+    }
+
     /// All other connected PRs, nearest first over undirected stack edges.
     /// At each node, enqueue children in PR-number order before its parent.
     pub fn preparation_order(&self) -> Vec<StackEntry> {

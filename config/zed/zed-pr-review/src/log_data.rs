@@ -14,6 +14,7 @@
 //! OSC payloads and unsupported SGR attributes are discarded. Tabs use eight-column
 //! stops; CR, LF and CRLF are line breaks. IDs assume jj's Git backend (32/40 digits).
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -26,6 +27,7 @@ use unicode_width::UnicodeWidthStr;
 use vte::{Params, Perform};
 
 use crate::github::workspace_git_dir;
+use crate::review_stack::{ReviewStatus, status_map};
 use crate::store::{Store, prepare_directory};
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -92,7 +94,62 @@ pub fn load(root: &Path) -> Result<Snapshot> {
         "--color=always",
     ]);
     let output = run(&mut command, "load jj l (the l alias must run jj log)")?;
-    Ok(parse(&output.stdout))
+    let mut snapshot = parse(&output.stdout);
+    let statuses = status_map(&root.join("scratch/zed-pr-review"));
+    attach_review_badges(&mut snapshot, &statuses);
+    Ok(snapshot)
+}
+
+fn attach_review_badges(snapshot: &mut Snapshot, statuses: &HashMap<String, ReviewStatus>) {
+    if statuses.is_empty() {
+        return;
+    }
+    let mut annotated_rows = HashSet::new();
+    for span in &snapshot.revisions {
+        if !annotated_rows.insert(span.row) {
+            continue;
+        }
+        let Some(status) = statuses.get(&span.revision.change_id) else {
+            continue;
+        };
+        let badge = format_review_badge(&span.revision, status);
+        if let Some(badge) = badge
+            && let Some(line) = snapshot.lines.get_mut(span.row)
+        {
+            line.spans.push(Span::raw(" "));
+            line.spans.push(badge);
+        }
+    }
+}
+
+fn format_review_badge(revision: &Revision, status: &ReviewStatus) -> Option<Span<'static>> {
+    if revision.commit_id != status.expected_commit_id {
+        return Some(Span::styled(
+            "[! modified]",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(state) = status.submitted_state.as_deref() {
+        let (label, color) = match state {
+            "APPROVED" => ("[✓ approved]", Color::Green),
+            "COMMENTED" => ("[✓ commented]", Color::Cyan),
+            "CHANGES_REQUESTED" => ("[✗ changes requested]", Color::Red),
+            _ => ("[✓ submitted]", Color::Green),
+        };
+        return Some(Span::styled(
+            label,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if status.pending_comments > 0 {
+        return Some(Span::styled(
+            format!("[{} pending]", status.pending_comments),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    None
 }
 
 /// Edit only the same, still-visible, unambiguous mutable commit that was clicked.
@@ -1029,5 +1086,74 @@ mod tests {
             assert!(edit(root, &span.revision).is_err());
         }
         Ok(())
+    }
+
+    #[test]
+    fn review_badges_attach_pending_submitted_and_modified_states() {
+        let rev_pending = Revision {
+            change_id: "k".repeat(32),
+            commit_id: "1".repeat(40),
+            immutable: false,
+            current: false,
+            divergent: false,
+        };
+        let rev_approved = Revision {
+            change_id: "m".repeat(32),
+            commit_id: "2".repeat(40),
+            immutable: false,
+            current: false,
+            divergent: false,
+        };
+        let rev_modified = Revision {
+            change_id: "p".repeat(32),
+            commit_id: "3".repeat(40),
+            immutable: false,
+            current: true,
+            divergent: false,
+        };
+        let output = format!(
+            "@  {}pppppppp{} review/pr-123\n○  {}kkkkkkkk{} review/pr-122\n○  {}mmmmmmmm{} review/pr-121\n",
+            open(&rev_modified),
+            CLOSE,
+            open(&rev_pending),
+            CLOSE,
+            open(&rev_approved),
+            CLOSE,
+        );
+        let mut snapshot = parse(output.as_bytes());
+        let statuses = HashMap::from([
+            (
+                rev_pending.change_id.clone(),
+                ReviewStatus {
+                    pr_number: 122,
+                    expected_commit_id: rev_pending.commit_id.clone(),
+                    pending_comments: 2,
+                    submitted_state: None,
+                },
+            ),
+            (
+                rev_approved.change_id.clone(),
+                ReviewStatus {
+                    pr_number: 121,
+                    expected_commit_id: rev_approved.commit_id.clone(),
+                    pending_comments: 1,
+                    submitted_state: Some("APPROVED".into()),
+                },
+            ),
+            (
+                rev_modified.change_id.clone(),
+                ReviewStatus {
+                    pr_number: 123,
+                    expected_commit_id: "f".repeat(40),
+                    pending_comments: 1,
+                    submitted_state: None,
+                },
+            ),
+        ]);
+        attach_review_badges(&mut snapshot, &statuses);
+        let lines = text(&snapshot);
+        assert!(lines[0].ends_with("[! modified]"));
+        assert!(lines[1].ends_with("[2 pending]"));
+        assert!(lines[2].ends_with("[✓ approved]"));
     }
 }

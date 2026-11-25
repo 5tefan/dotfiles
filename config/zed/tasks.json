@@ -154,15 +154,4 @@
     "use_new_terminal": true,
     "show_command": false,
   },
-  {
-    "label": "PR: full diff",
-    "command": "~/.config/zed/zed-pr-review/target/release/zed-pr-review diff",
-    "cwd": "$ZED_WORKTREE_ROOT",
-    "save": "none",
-    "reveal": "always",
-    "hide": "never",
-    "allow_concurrent_runs": false,
-    "use_new_terminal": true,
-    "show_command": false,
-  },
 ]

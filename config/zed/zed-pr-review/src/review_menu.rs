@@ -18,33 +18,40 @@ use crate::log_view::{Screen, plain_status};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReviewAction {
-    /// Explicitly abandon the local draft and snapshots, not the GitHub review or checkout.
+    /// Archive and clear the local draft for this PR, staying on the review stack.
     Cancel,
     Comment,
     Approve,
     RequestChanges,
+    /// Abandon all local review/pr-* revisions and return to previous @.
+    CloseStack,
 }
 
-const CHOICES: [(ReviewAction, &str, &str); 4] = [
+const CHOICES: [(ReviewAction, &str, &str); 5] = [
     (
         ReviewAction::Cancel,
-        "1  Exit + abandon",
-        "Local draft/snapshots only; no GitHub or checkout changes.",
+        "1  Abandon draft",
+        "Archive and clear local draft for this PR; stay on stack.",
     ),
     (
         ReviewAction::Comment,
         "2  Comment",
-        "Submit a COMMENT-only review.",
+        "Submit a COMMENT-only review; stay on stack.",
     ),
     (
         ReviewAction::Approve,
         "3  Approve",
-        "Submit an APPROVE review.",
+        "Submit an APPROVE review; stay on stack.",
     ),
     (
         ReviewAction::RequestChanges,
         "4  Request changes",
-        "Submit a REQUEST_CHANGES review.",
+        "Submit a REQUEST_CHANGES review; stay on stack.",
+    ),
+    (
+        ReviewAction::CloseStack,
+        "5  Close review stack",
+        "Abandon all review/pr-* commits and return to previous @.",
     ),
 ];
 
@@ -77,10 +84,7 @@ fn choose_plain(
     for (_, title, description) in CHOICES {
         writeln!(output, "{title}\n   {description}")?;
     }
-    write!(
-        output,
-        "Choice [1–4] (blank/q cancels and keeps draft/snapshots): "
-    )?;
+    write!(output, "Choice [1–5] (blank/q cancels and keeps draft): ")?;
     output.flush()?;
     let mut line = String::new();
     input
@@ -92,7 +96,8 @@ fn choose_plain(
         "2" => Ok(Some(ReviewAction::Comment)),
         "3" => Ok(Some(ReviewAction::Approve)),
         "4" => Ok(Some(ReviewAction::RequestChanges)),
-        _ => bail!("Invalid review choice: enter 1–4 or leave blank; no action selected"),
+        "5" => Ok(Some(ReviewAction::CloseStack)),
+        _ => bail!("Invalid review choice: enter 1–5 or leave blank; no action selected"),
     }
 }
 
@@ -177,7 +182,7 @@ impl Menu {
             KeyCode::Enter if key.kind == KeyEventKind::Press => {
                 return ControlFlow::Break(self.selected.map(|index| CHOICES[index].0));
             }
-            KeyCode::Char(number @ '1'..='4') if key.kind == KeyEventKind::Press => {
+            KeyCode::Char(number @ '1'..='5') if key.kind == KeyEventKind::Press => {
                 return ControlFlow::Break(Some(CHOICES[number as usize - '1' as usize].0));
             }
             _ => {}
@@ -195,7 +200,7 @@ fn pending_label(count: usize) -> String {
 
 fn centered(area: Rect) -> Rect {
     let width = area.width.min(80);
-    let height = area.height.min(18);
+    let height = area.height.min(20);
     Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -232,7 +237,7 @@ fn draw(frame: &mut Frame, label: &str, pending_comments: usize, selected: Optio
         Paragraph::new(pending_label(pending_comments)).alignment(Alignment::Center),
         pending,
     );
-    let detailed = choices.height >= 8 && choices.width >= 60;
+    let detailed = choices.height >= 10 && choices.width >= 60;
     let items = CHOICES.iter().map(|(_, title, description)| {
         let mut lines = vec![Line::styled(
             *title,
@@ -251,14 +256,14 @@ fn draw(frame: &mut Frame, label: &str, pending_comments: usize, selected: Optio
         &mut ListState::default().with_selected(selected),
     );
     frame.render_widget(
-        Paragraph::new("1–4: choose · ↑/↓: select · Enter: confirm").alignment(Alignment::Center),
+        Paragraph::new("1–5: choose · ↑/↓: select · Enter: confirm").alignment(Alignment::Center),
         help,
     );
     frame.render_widget(
         Paragraph::new(if selected.is_none() {
-            "Enter / Esc / q / Ctrl-C: dismiss; keep draft/snapshots"
+            "Enter / Esc / q / Ctrl-C: dismiss; keep draft"
         } else {
-            "Esc / q / Ctrl-C: dismiss; keep draft/snapshots"
+            "Esc / q / Ctrl-C: dismiss; keep draft"
         })
         .alignment(Alignment::Center),
         dismissal,
@@ -291,8 +296,8 @@ mod tests {
     }
 
     #[test]
-    fn numbers_return_all_four_explicit_actions() {
-        for (number, (action, _, _)) in ('1'..='4').zip(CHOICES) {
+    fn numbers_return_all_five_explicit_actions() {
+        for (number, (action, _, _)) in ('1'..='5').zip(CHOICES) {
             assert_eq!(
                 Menu::default().key(key(KeyCode::Char(number))),
                 ControlFlow::Break(Some(action))
@@ -303,7 +308,7 @@ mod tests {
     #[test]
     fn arrows_select_and_wrap_but_do_not_act_until_enter() {
         let mut menu = Menu::default();
-        for index in [0, 1, 2, 3, 0] {
+        for index in [0, 1, 2, 3, 4, 0] {
             assert_eq!(menu.key(key(KeyCode::Down)), ControlFlow::Continue(()));
             assert_eq!(menu.selected, Some(index));
             assert_eq!(
@@ -311,13 +316,13 @@ mod tests {
                 ControlFlow::Break(Some(CHOICES[index].0))
             );
         }
-        for index in [3, 2, 1, 0, 3] {
+        for index in [4, 3, 2, 1, 0, 4] {
             assert_eq!(menu.key(key(KeyCode::Up)), ControlFlow::Continue(()));
             assert_eq!(menu.selected, Some(index));
         }
         let mut menu = Menu::default();
         assert_eq!(menu.key(key(KeyCode::Up)), ControlFlow::Continue(()));
-        assert_eq!(menu.selected, Some(3));
+        assert_eq!(menu.selected, Some(4));
     }
 
     #[test]
@@ -342,7 +347,7 @@ mod tests {
 
     #[test]
     fn plain_menu_reads_only_one_line_for_every_choice() {
-        for (number, (action, _, _)) in ('1'..='4').zip(CHOICES) {
+        for (number, (action, _, _)) in ('1'..='5').zip(CHOICES) {
             let mut input = Cursor::new(format!(" {number} \r\nReview body\nAnother line\n"));
             let mut output = Vec::new();
             assert_eq!(
@@ -382,12 +387,12 @@ mod tests {
 
     #[test]
     fn plain_invalid_choice_errors_without_retrying_or_echoing_input() {
-        for first in ["0", "5", "approve", "1 2", "\u{1b}[31m"] {
+        for first in ["0", "6", "approve", "1 2", "\u{1b}[31m"] {
             let mut input = Cursor::new(format!("{first}\n3\n"));
             let error = choose_plain(&mut input, &mut Vec::new(), "PR", 1).unwrap_err();
             assert_eq!(
                 error.to_string(),
-                "Invalid review choice: enter 1–4 or leave blank; no action selected"
+                "Invalid review choice: enter 1–5 or leave blank; no action selected"
             );
             let mut remaining = String::new();
             input.read_to_string(&mut remaining).unwrap();
@@ -402,15 +407,15 @@ mod tests {
         assert_eq!(pending_label(1), "1 pending comment");
         assert_eq!(
             centered(Rect::new(2, 4, 120, 40)),
-            Rect::new(22, 15, 80, 18)
+            Rect::new(22, 14, 80, 20)
         );
-        for (width, height) in [(120, 40), (80, 18), (40, 12), (10, 4), (1, 1), (0, 0)] {
+        for (width, height) in [(120, 40), (80, 20), (40, 12), (10, 4), (1, 1), (0, 0)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| draw(frame, &label, 2, None)).unwrap();
             terminal
                 .draw(|frame| draw(frame, &label, 2, Some(3)))
                 .unwrap();
-            if width >= 80 && height >= 18 {
+            if width >= 80 && height >= 20 {
                 let buffer = terminal.backend().buffer();
                 let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
                 assert!(text.contains(&label));

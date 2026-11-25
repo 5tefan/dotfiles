@@ -51,7 +51,7 @@ impl Comment {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ChangedFile {
     pub filename: String,
     pub status: String,
