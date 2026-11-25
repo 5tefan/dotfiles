@@ -301,6 +301,12 @@ impl Client {
         Ok(client)
     }
 
+    /// Resolve the repository for CI status polling without querying the
+    /// authenticated GitHub user.
+    pub fn for_ci(directory: &Path) -> Result<Self> {
+        Self::in_workspace(directory, None)
+    }
+
     fn in_workspace(directory: &Path, target: Option<Target>) -> Result<Self> {
         let root = workspace_root(directory)?;
         let git_dir = command_path(
@@ -2017,6 +2023,30 @@ impl Client {
         serde_json::from_slice(&bytes).context("Invalid GitHub API JSON")
     }
 
+    pub(crate) fn get_text(&self, endpoint: &str) -> Result<String> {
+        let bytes = run(
+            &mut self.api_command("GET", endpoint)?,
+            "read GitHub API text (check gh authentication and repository access)",
+        )?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub(crate) fn graphql(&self, query: &str, variables: &Value) -> Result<Value> {
+        let body = serde_json::to_vec(&json!({
+            "query": query,
+            "variables": variables,
+        }))
+        .context("Cannot encode GitHub GraphQL request")?;
+        let mut command = self.api_command("POST", "graphql")?;
+        command.args(["--input", "-"]);
+        let bytes = run_with_input(
+            &mut command,
+            &body,
+            "read GitHub GraphQL API (check gh authentication and repository access)",
+        )?;
+        serde_json::from_slice(&bytes).context("Invalid GitHub GraphQL JSON")
+    }
+
     pub(crate) fn get_pages<T: DeserializeOwned>(&self, endpoint: &str) -> Result<Vec<T>> {
         let bytes = run(
             self.api_command("GET", endpoint)?
@@ -2722,12 +2752,24 @@ fn stop_background_child(child: &mut Child) {
 }
 
 fn run_background(command: &mut Command, operation: &str, timeout: Duration) -> Result<Vec<u8>> {
+    run_background_with_stdin(command, None, operation, timeout)
+}
+
+fn run_background_with_stdin(
+    command: &mut Command,
+    stdin: Option<fs::File>,
+    operation: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     // Anonymous files avoid pipe-buffer deadlocks and waiting for EOF from helpers
     // that inherited stdout/stderr. Never include their contents in command errors.
     let mut stdout = tempfile::tempfile().context("Cannot capture background command output")?;
     let stderr = tempfile::tempfile().context("Cannot capture background command errors")?;
     command
-        .stdin(Stdio::null())
+        .stdin(match stdin {
+            Some(file) => Stdio::from(file),
+            None => Stdio::null(),
+        })
         .stdout(
             stdout
                 .try_clone()
@@ -2786,6 +2828,24 @@ fn run(command: &mut Command, operation: &str) -> Result<Vec<u8>> {
     }
     let output = command
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Cannot {operation}; is the required executable installed?"))?;
+    successful_output(output, operation)
+}
+
+fn run_with_input(command: &mut Command, input: &[u8], operation: &str) -> Result<Vec<u8>> {
+    let mut stdin = tempfile::tempfile().context("Cannot buffer command input")?;
+    stdin
+        .write_all(input)
+        .context("Cannot buffer command input")?;
+    stdin.rewind().context("Cannot rewind command input")?;
+    if let Some(timeout) = background_timeout_for(command) {
+        return run_background_with_stdin(command, Some(stdin), operation, timeout);
+    }
+    let output = command
+        .stdin(Stdio::from(stdin))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -2985,6 +3045,32 @@ mod tests {
             !survivor_file.exists(),
             "the descendant survived the timeout"
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_input_delivers_stdin_and_respects_background_timeout() -> Result<()> {
+        let echoed = run_with_input(
+            &mut Command::new("cat"),
+            b"{\"query\":\"{ viewer { login } }\"}",
+            "echo graphql input",
+        )?;
+        assert_eq!(echoed, b"{\"query\":\"{ viewer { login } }\"}");
+
+        let mut stdin = tempfile::tempfile()?;
+        stdin.write_all(b"payload")?;
+        stdin.rewind()?;
+        let start = Instant::now();
+        let error = run_background_with_stdin(
+            Command::new("sh").args(["-c", "sleep 2"]),
+            Some(stdin),
+            "read hanging graphql",
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(format!("{error:#}").contains("timed out after 100ms"));
         Ok(())
     }
 

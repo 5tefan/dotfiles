@@ -1,3 +1,4 @@
+pub mod ci_status;
 pub mod github;
 pub mod log_data;
 pub mod log_view;

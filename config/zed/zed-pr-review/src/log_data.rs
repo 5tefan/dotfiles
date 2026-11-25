@@ -26,6 +26,7 @@ use serde::Deserialize;
 use unicode_width::UnicodeWidthStr;
 use vte::{Params, Perform};
 
+use crate::ci_status::CiBadge;
 use crate::github::workspace_git_dir;
 use crate::review_stack::{ReviewStatus, status_map};
 use crate::store::{Store, prepare_directory};
@@ -150,6 +151,18 @@ fn format_review_badge(revision: &Revision, status: &ReviewStatus) -> Option<Spa
         ));
     }
     None
+}
+
+pub fn format_ci_badge(badge: CiBadge) -> Span<'static> {
+    let (label, color) = match badge {
+        CiBadge::Passing => ("✓", Color::Green),
+        CiBadge::OptionalFailed => ("!", Color::Yellow),
+        CiBadge::RequiredFailed => ("✗", Color::Red),
+    };
+    Span::styled(
+        label,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
 }
 
 /// Edit only the same, still-visible, unambiguous mutable commit that was clicked.
@@ -1155,5 +1168,20 @@ mod tests {
         assert!(lines[0].ends_with("[! modified]"));
         assert!(lines[1].ends_with("[2 pending]"));
         assert!(lines[2].ends_with("[✓ approved]"));
+    }
+
+    #[test]
+    fn ci_badges_use_expected_symbols_and_colors() {
+        let passing = format_ci_badge(CiBadge::Passing);
+        assert_eq!(passing.content.as_ref(), "✓");
+        assert_eq!(passing.style.fg, Some(Color::Green));
+
+        let optional = format_ci_badge(CiBadge::OptionalFailed);
+        assert_eq!(optional.content.as_ref(), "!");
+        assert_eq!(optional.style.fg, Some(Color::Yellow));
+
+        let required = format_ci_badge(CiBadge::RequiredFailed);
+        assert_eq!(required.content.as_ref(), "✗");
+        assert_eq!(required.style.fg, Some(Color::Red));
     }
 }

@@ -1,6 +1,7 @@
 //! An interactive jj log. Refreshes preserve a semantic viewport anchor; only a
 //! change of working-copy identity brings @ back into view automatically.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,7 @@ use ratatui::widgets::Paragraph;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use unicode_width::UnicodeWidthStr;
 
+use crate::ci_status::{self, CiBadge, CiRequest};
 use crate::log_data::{self, Revision, RevisionSpan, Snapshot};
 
 const REFRESH: Duration = Duration::from_secs(1);
@@ -329,6 +331,7 @@ pub(crate) fn plain_status(value: &str) -> String {
 fn draw(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     view: &mut View,
+    ci_badges: &HashMap<String, CiBadge>,
     status: &str,
     editing: bool,
 ) -> Result<Rect> {
@@ -343,7 +346,24 @@ fn draw(
         frame.render_widget(Paragraph::new(title).style(Style::default().add_modifier(Modifier::BOLD)),
             Rect::new(area.x, area.y, area.width, area.height.min(1)));
         if let Some(snapshot) = &view.snapshot {
-            let lines: Vec<_> = snapshot.lines.iter().skip(view.top).take(view.height).cloned().collect();
+            let mut lines: Vec<_> = snapshot.lines.iter().skip(view.top).take(view.height).cloned().collect();
+            if !ci_badges.is_empty() {
+                let mut badged_rows = HashSet::new();
+                for span in &snapshot.revisions {
+                    if span.row < view.top || span.row >= view.top + view.height {
+                        continue;
+                    }
+                    if !badged_rows.insert(span.row) {
+                        continue;
+                    }
+                    if let Some(&badge) = ci_badges.get(&span.revision.commit_id)
+                        && let Some(line) = lines.get_mut(span.row - view.top)
+                    {
+                        line.spans.push(ratatui::text::Span::raw(" "));
+                        line.spans.push(log_data::format_ci_badge(badge));
+                    }
+                }
+            }
             frame.render_widget(Paragraph::new(Text::from(lines)).scroll((0, view.left.min(u16::MAX as usize) as u16)), body);
             for span in &snapshot.revisions {
                 if span.row < view.top || span.row >= view.top + view.height {
@@ -385,6 +405,8 @@ pub fn run(root: &Path) -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
     let (requests, replies) = worker(root)?;
+    let mut ci_worker = ci_status::spawn_worker(root);
+    let mut ci_badges: HashMap<String, CiBadge> = HashMap::new();
     let mut view = View::default();
     let mut click = Click::default();
     let mut pending = None;
@@ -397,6 +419,27 @@ pub fn run(root: &Path) -> Result<()> {
     let mut dirty = true;
     let mut body = Rect::default();
     loop {
+        if let Some(ci) = ci_worker.as_ref() {
+            let mut disconnected = false;
+            loop {
+                match ci.replies.try_recv() {
+                    Ok(badges) => {
+                        if badges != ci_badges {
+                            ci_badges = badges;
+                            dirty = true;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            if disconnected {
+                ci_worker = None;
+            }
+        }
         let reply = match replies.try_recv() {
             Ok(Reply::Edited(result)) => {
                 busy = false;
@@ -422,6 +465,14 @@ pub fn run(root: &Path) -> Result<()> {
             match loaded {
                 Ok(snapshot) => {
                     let linked = !snapshot.revisions.is_empty();
+                    if let Some(ci) = ci_worker.as_ref() {
+                        let commits: Vec<String> = snapshot
+                            .revisions
+                            .iter()
+                            .map(|s| s.revision.commit_id.clone())
+                            .collect();
+                        let _ = ci.requests.send(CiRequest::UpdateCommits(commits));
+                    }
                     view.apply(snapshot);
                     if read_failed || status == "Loading jj l…" {
                         status = if linked { "Mutable IDs are underlined. Shift-drag selects text." }
@@ -460,6 +511,7 @@ pub fn run(root: &Path) -> Result<()> {
             body = draw(
                 &mut terminal,
                 &mut view,
+                &ci_badges,
                 &status,
                 editing || pending.is_some(),
             )?;
