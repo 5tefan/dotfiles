@@ -102,8 +102,9 @@ typechanged = ''
 # starship can't hide plain errors, so this shows the code or signal name
 # whenever the last command failed.
 [status]
+disabled = false
 symbol = 'x '
-format = '[$symbol$common]($style) '
+format = '[$symbol$common_meaning$signal_name$maybe_int]($style) '
 style = '160'
 not_executable_symbol = 'noexec'
 not_found_symbol = 'notfound'

@@ -4,7 +4,7 @@ Write natural text that is easy to read in a single pass.
 
 1. Seek to minimize dependency length to reduce strain on working memory. For
    example, keep noun and determiners or adjectives nearby. Minimize distance
-   bewteen a verb and its subject.
+   between a verb and its subject.
 2. Do not mix inanimate subjects with animate verbs. For example, do not say
    "the sentence eats ...".
 3. Avoid stacked noun compounds to reduce bracketing ambiguity and avoid
@@ -21,4 +21,3 @@ straightforward, and keep helpful connecting words.
 
 The version control system is `jj`. Remember to turn the pager off using
 `JJ_PAGER=cat jj` when calling `jj` commands like `jj log`, etc.
-

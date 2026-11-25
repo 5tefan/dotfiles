@@ -7,8 +7,6 @@ alias .....="cd ../../../.."
 
 alias ls='ls --color=auto'
 alias grep='grep --color=auto'
-alias fgrep='fgrep --color=auto'
-alias egrep='egrep --color=auto'
 
 # Eternal bash history.
 # ---------------------
@@ -24,17 +22,10 @@ export HISTFILE=~/.bash_eternal_history
 # http://superuser.com/questions/20900/bash-history-loss
 PROMPT_COMMAND="history -a; $PROMPT_COMMAND"
 
-# show git branch in prompt
-source ~/.git-prompt.sh
-if [[ "$HOSTNAME" = atlas* ]]; then
-    export PS1='\W $(__git_ps1 " (%s)") \$ '
-else
-    export PS1='\u@\h \W $(__git_ps1 " (%s)") \$ '
-fi
-
 export EDITOR="vim"
-export TERM="screen"
 export HOST="localhost"
 export WWW_HOME="https://duckduckgo.com/lite"
 
 source $HOME/.z.sh
+
+[ -d ~/.cargo/bin ] && export PATH=$PATH:~/.cargo/bin

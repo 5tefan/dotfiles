@@ -43,16 +43,13 @@ set list
 set laststatus=2
 
 " Do not convert spaces into tabs.
-set softtabstop=0 expandtab
+set expandtab
 
 " Tab char appears 4 spaces wide
 set tabstop=4
 
-" Pressing tab inserts 4 spaces.
+" Indent by 4 spaces when using >>, <<, == etc. and smarttab at start of line
 set shiftwidth=4 smarttab
-
-" Indent by 4 spaces when using >>, <<, == etc.
-set shiftwidth=4
 
 " Indent by 4 spaces when pressing <TAB>
 set softtabstop=4
@@ -137,11 +134,10 @@ let g:vimwiki_conceal_onechar_markers = 0
 " disables link conceal.
 let g:vimwiki_conceallevel = 0
 
-" indentLine looks like another culript.
+" indentLine looks like another culprit.
 let g:indentLine_fileTypeExclude = ['json', 'vimwiki']
 let g:indentLine_setConceal = 0
 
-let g:vimwiki_conceal_onechar_markers=0
 let g:vimwiki_list = [wiki_1]
 
 autocmd FileType * setlocal fo-=c fo-=r fo-=o
@@ -213,7 +209,6 @@ function! VimwikiHandleFenInclude(value)
 endfunction
 
 function! VimwikiWikiIncludeHandler(value)
-    call writefile(['VimwikiWikiIncludeHandler called with: ' . string(a:value)], expand('~') . '/tmp/vimwiki_debug.log', 'a')
     if a:value =~ '{{pgn:'
         return VimwikiHandlePgnInclude(a:value)
     elseif a:value =~ '{{fen:' || a:value =~ '{{wfen:' || a:value =~ '{{bfen:'
@@ -236,4 +231,4 @@ cnoreabbrev wcn Wcn
 cnoreabbrev wcp Wcp
 
 " repeat last macro
-map , @@
+nnoremap , @@

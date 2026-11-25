@@ -43,7 +43,7 @@
   "agent": {
     "default_model": {
       "provider": "copilot_chat",
-      "model": "gpt-6-astra",
+      "model": "gemini-4-neon",
       "enable_thinking": true,
       "effort": "high",
     },
@@ -75,6 +75,9 @@
             },
             {
               "pattern": "^https?://zed\\.dev",
+            },
+            {
+              "pattern": "^https?://api\\.github\\.com",
             },
           ],
         },
@@ -130,9 +133,6 @@
               "pattern": "^source\\s+\\.venv/bin/activate\\b",
             },
             {
-              "pattern": "^source\\s+\\.venv/bin/activate\\s*&&\\s*\\./manage\\.py\\b",
-            },
-            {
               "pattern": "^\\./manage\\.py\\b",
             },
             {
@@ -160,16 +160,13 @@
               "pattern": "^tree\\-sitter\\b.*(\\s|$)",
             },
             {
-              "pattern": "cd (intern|tiger_lily)/frontend\\b",
+              "pattern": "^cd (intern|tiger_lily)/frontend\\b",
             },
             {
-              "pattern": "^\\./manage\\.py\\b",
+              "pattern": "^(yarn|npx) (tsc|lint)\\b",
             },
             {
-              "pattern": "(yarn|npx) (tsc|lint)\\b",
-            },
-            {
-              "pattern": "ls intern/frontend/src/__generated__",
+              "pattern": "^ls intern/frontend/src/__generated__",
             },
             {
               "pattern": "^(ruff|mypy)\\b",
@@ -178,13 +175,10 @@
               "pattern": "^(ls|rg|grep|head|tail|sort|uniq|wc|jq|echo|tr|printf|base64|diff|cmp)\\b",
             },
             {
-              "pattern": "^(sleep|command)\\b",
+              "pattern": "^(sleep|command|date)\\b",
             },
             {
               "pattern": "^yarn\\s+test(\\s|$)",
-            },
-            {
-              "pattern": "^source\\s+\\.venv/bin/activate(\\s|$)",
             },
             {
               "pattern": "^set\\b",
@@ -228,7 +222,7 @@
           "rename_symbol": true,
           "read_file": true,
           "grep": true,
-          "skill": false,
+          "skill": true,
           "spawn_agent": true,
           "terminal": true,
           "update_plan": true,
@@ -269,7 +263,7 @@
   "close_on_file_delete": true,
   "edit_predictions": {
     "provider": "copilot",
-    "disabled_globs": [".env"],
+    "disabled_globs": [".env*"],
   },
   "excerpt_context_lines": 10,
   "expand_excerpt_lines": 15,

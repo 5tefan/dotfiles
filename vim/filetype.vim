@@ -1,4 +1,3 @@
-" Support Chess PNG files.
+" Support Chess PGN files.
 " https://www.vim.org/scripts/script.php?script_id=677
 au BufNewFile,BufRead *.pgn    setf pgn
-

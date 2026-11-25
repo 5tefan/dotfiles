@@ -75,7 +75,7 @@ case_sensitive_searching=off
 #    RFC 1345 Mnemonic
 #    Ukrainian Cyrillic (cp866u)
 #    Ukrainian Cyrillic (KOI8-U)
-character_set=Western (ISO-8859-1)
+character_set=UNICODE (UTF-8)
 
 # cookie_accept_domains and cookie_reject_domains are comma-delimited
 # lists of domains from which Lynx should automatically accept or reject
@@ -314,4 +314,3 @@ vi_keys=on
 # The visited_links setting controls how Lynx organizes the information
 # in the Visited Links Page.
 visited_links=LAST_REVERSED
-

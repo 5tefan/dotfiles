@@ -26,8 +26,6 @@ brew "fd"
 brew "findutils"
 # Command-line fuzzy finder written in Go
 brew "fzf"
-# GNU awk utility
-brew "gawk"
 # GitHub command-line tool
 brew "gh"
 # Distributed revision control system
@@ -66,8 +64,6 @@ brew "nvtop"
 brew "parallel"
 # Ultra-fast CSV data-wrangling toolkit
 brew "qsv"
-# Reattach process (e.g., tmux) to background
-brew "reattach-to-user-namespace"
 # Search tool like grep and The Silver Searcher
 brew "ripgrep"
 # Utility that provides fast incremental file transfer
@@ -94,8 +90,6 @@ brew "viddy"
 brew "vim"
 # Internet file retriever
 brew "wget"
-# Tracks most-used directories to make cd smarter
-brew "z"
 # Online diagram software
 cask "drawio"
 # Mind mapping and knowledge management software

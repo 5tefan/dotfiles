@@ -21,7 +21,6 @@ export EDITOR="vim"
 
 alias ls='ls --color=auto'
 alias grep='grep --color=auto'
-alias rg='rg --color=always'
 
 source $HOME/.z.sh
 

@@ -10,10 +10,10 @@
 - shell:
     - description: Installing submodules
       command: git submodule update --init --recursive
-    - description: Configure .*-common.sh
+    - description: Configure shell startup files
       command: |
-        grep -qxsF '[ -f ~/.bash-common.sh ] && source ~/.bash-common.sh' ~/.bashrc || echo '[ -f ~/.bash-common.sh ] && source ~/.bash-common.sh' >> ~/.bashrc;
-        grep -qxsF '[ -f ~/.zsh-common.zsh ] && source ~/.zsh-common.zsh' ~/.zshrc || echo '[ -f ~/.zsh-common.zsh ] && source ~/.zsh-common.zsh' >> ~/.zshrc;
+        grep -qxsF '[ -f ~/.bash-common.sh ] && source ~/.bash-common.sh' ~/.bashrc 2>/dev/null || echo '[ -f ~/.bash-common.sh ] && source ~/.bash-common.sh' >> ~/.bashrc;
+        grep -qxsF '[ -f ~/.zsh-common.zsh ] && source ~/.zsh-common.zsh' ~/.zshrc 2>/dev/null || echo '[ -f ~/.zsh-common.zsh ] && source ~/.zsh-common.zsh' >> ~/.zshrc;
     - description: Install Homebrew if missing (macOS only)
       command: |
         if [ "$(uname)" = Darwin ] && [ ! -x /opt/homebrew/bin/brew ]; then
@@ -22,8 +22,8 @@
     - description: Set up Homebrew if missing (macOS only)
       command: |
         if [ "$(uname)" = Darwin ]; then
-          grep -qxsF 'eval "$(/opt/homebrew/bin/brew shellenv)"' ~/.bash_profile || echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.bash_profile;
-          grep -qxsF 'eval "$(/opt/homebrew/bin/brew shellenv)"' ~/.zprofile || echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile;
+          grep -qxsF 'eval "$(/opt/homebrew/bin/brew shellenv)"' ~/.bash_profile 2>/dev/null || echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.bash_profile;
+          grep -qxsF 'eval "$(/opt/homebrew/bin/brew shellenv)"' ~/.zprofile 2>/dev/null || echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile;
         fi
     - description: Install Homebrew packages (macOS only)
       command: |
@@ -40,7 +40,6 @@
     ~/.gitconfig: gitconfig
     ~/.gitignore: gitignore
     ~/.lynxrc: lynxrc
-    ~/.git-prompt.sh: git-prompt.sh
     ~/.bash-common.sh: bash-common.sh
     ~/.zsh-common.zsh: zsh-common.zsh
     ~/.z.sh: z/z.sh
@@ -59,4 +58,4 @@
 
 - shell:
     - description: Build zed-pr-review
-      command: cargo build --locked --release --bin zed-pr-review --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml
+      command: PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$PATH" cargo build --locked --release --bin zed-pr-review --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml
