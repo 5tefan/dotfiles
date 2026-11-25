@@ -5,15 +5,42 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::{Seek, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const API_VERSION: &str = "X-GitHub-Api-Version: 2022-11-28";
 const BOOKMARK_TEMPLATE: &str =
     r#"if(!remote && !name.starts_with("zed-pr-review/"), name ++ "\t" ++ conflict ++ "\n")"#;
+
+thread_local! {
+    static BACKGROUND_COMMAND_TIMEOUT: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+/// Limit gh reads and Git fetches through the shared runner to 60 seconds each on
+/// the current thread. Other threads and foreground commands are unaffected.
+/// Nested scopes restore the
+/// previous deadline setting, including when `work` returns an error or unwinds.
+/// This is a per-command limit, not a deadline for the entire closure.
+pub fn with_background_deadlines<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
+    with_background_timeout(Duration::from_secs(60), work)
+}
+
+fn with_background_timeout<T>(timeout: Duration, work: impl FnOnce() -> Result<T>) -> Result<T> {
+    struct RestoreTimeout(Option<Duration>);
+    impl Drop for RestoreTimeout {
+        fn drop(&mut self) {
+            BACKGROUND_COMMAND_TIMEOUT.set(self.0);
+        }
+    }
+    let _restore = RestoreTimeout(BACKGROUND_COMMAND_TIMEOUT.replace(Some(timeout)));
+    work()
+}
 
 #[derive(Clone, Debug)]
 pub struct Client {
@@ -369,6 +396,186 @@ impl Client {
         checkout_sha(&self.root)
     }
 
+    /// Fetch pinned history without invoking jj, importing refs, taking a workspace/draft
+    /// lock, or changing files. The caller supplies the base branch from its live PR read.
+    /// These refs are outside jj's import namespaces and, like foreground transport refs,
+    /// intentionally remain reachable after use; no automatic eviction is performed.
+    pub fn prefetch_pr(&self, pr: &PullRequest, base_ref: &str) -> Result<()> {
+        self.check_identity(pr)?;
+        validate_bookmark(base_ref)?;
+        let source = self.source_remote(pr)?;
+        let namespace = self.prefetch_namespace(pr, base_ref, source.as_ref())?;
+        if self
+            .prefetched_base(pr, base_ref, &namespace, source.is_some())?
+            .is_some()
+        {
+            return Ok(());
+        }
+        // A cache miss can leave old refs, including a partial fork fetch. Never let
+        // fetch dereference one of those names into a user branch (even if dangling).
+        for suffix in ["head", "base", "source"] {
+            let symbolic = self
+                .git_command()
+                .args(["symbolic-ref", "--quiet", &format!("{namespace}/{suffix}")])
+                .output()?;
+            ensure!(
+                symbolic.status.code() == Some(1),
+                "Cannot prefetch over a symbolic or unreadable cache ref"
+            );
+        }
+        let url = format!("https://{}/{}.git", self.host, self.repo);
+        self.check_transport_url(&self.repo, &url)?;
+        if let Some(source) = &source {
+            self.check_transport_url(&pr.head_repo, &source.url)?;
+        }
+        let shallow = text(run(
+            self.git_command()
+                .args(["rev-parse", "--is-shallow-repository"]),
+            "inspect repository history depth",
+        )?)?;
+        let mut fetch = self.pr_fetch_command_for(&self.repo);
+        if shallow.trim() == "true" {
+            fetch.arg("--unshallow");
+        }
+        fetch.args([
+            "--",
+            &url,
+            &format!("refs/pull/{}/head:{namespace}/head", pr.number),
+            &format!("refs/heads/{base_ref}:{namespace}/base"),
+        ]);
+        let same_repo = pr.head_repo.eq_ignore_ascii_case(&self.repo);
+        if source.is_some() && same_repo {
+            fetch.arg(format!("refs/heads/{}:{namespace}/source", pr.head_ref));
+        }
+        run(
+            &mut fetch,
+            "prefetch the pinned PR and base history (check gh authentication)",
+        )?;
+        if let Some(source) = source.as_ref().filter(|_| !same_repo) {
+            run(
+                self.pr_fetch_command_for(&pr.head_repo).args([
+                    "--",
+                    &source.url,
+                    &format!("refs/heads/{}:{namespace}/source", pr.head_ref),
+                ]),
+                "prefetch only the PR source branch",
+            )?;
+        }
+        ensure!(
+            self.prefetched_base(pr, base_ref, &namespace, source.is_some())?
+                .is_some(),
+            "Prefetched head/source does not match the pinned PR, or base does not contain the pinned commit; resolve the PR again"
+        );
+        self.merge_base(pr)?;
+        ensure!(
+            self.source_remote(pr)? == source,
+            "PR source remote changed during prefetch; retry"
+        );
+        Ok(())
+    }
+
+    fn prefetch_namespace(
+        &self,
+        pr: &PullRequest,
+        base_ref: &str,
+        source: Option<&SourceRemote>,
+    ) -> Result<String> {
+        // Length-delimited JSON avoids ambiguous concatenation. Cosmetic PR fields and
+        // the reviewer do not affect transport; source configuration affects tracking.
+        let key = serde_json::to_vec(&(
+            1,
+            self.host.to_ascii_lowercase(),
+            self.repo.to_ascii_lowercase(),
+            pr.number,
+            pr.head_sha.to_ascii_lowercase(),
+            pr.base_sha.to_ascii_lowercase(),
+            pr.head_repo.to_ascii_lowercase(),
+            &pr.head_ref,
+            base_ref,
+            source.map(|source| (&source.name, &source.url)),
+        ))?;
+        Ok(format!(
+            "refs/zed-pr-review-prefetch/{:x}",
+            Sha256::digest(key)
+        ))
+    }
+
+    fn prefetched_base(
+        &self,
+        pr: &PullRequest,
+        base_ref: &str,
+        namespace: &str,
+        has_source: bool,
+    ) -> Result<Option<String>> {
+        // Inspect only this key, in one Git process, rather than enumerating and probing
+        // each retained PR. Missing, symbolic, non-commit, or stale entries are misses.
+        let listing = text(run(
+            self.git_command().args([
+                "for-each-ref",
+                "--format=%(refname)%09%(objectname)%09%(objecttype)%09%(symref)",
+                &format!("{namespace}/"),
+            ]),
+            "inspect prefetched PR refs",
+        )?)?;
+        let mut refs = BTreeMap::new();
+        for line in listing.lines() {
+            let fields: Vec<_> = line.split('\t').collect();
+            ensure!(fields.len() == 4, "Unexpected prefetched Git ref state");
+            if fields[2] == "commit" && fields[3].is_empty() {
+                validate_sha(fields[1])?;
+                refs.insert(fields[0], fields[1]);
+            }
+        }
+        for suffix in if has_source {
+            &["head", "source"][..]
+        } else {
+            &["head"][..]
+        } {
+            if !refs
+                .get(format!("{namespace}/{suffix}").as_str())
+                .is_some_and(|sha| sha.eq_ignore_ascii_case(&pr.head_sha))
+            {
+                return Ok(None);
+            }
+        }
+        let Some(base) = refs.get(format!("{namespace}/base").as_str()) else {
+            return Ok(None);
+        };
+        if self.check_base_history(pr, base_ref, base).is_err() {
+            return Ok(None);
+        }
+        Ok(Some((*base).to_owned()))
+    }
+
+    fn publish_prefetched_refs(&self, refs: &[(String, String)]) -> Result<()> {
+        // Create all refs atomically, without dereferencing or overwriting any existing
+        // name. Publish verified object IDs, not cache ref names that could change.
+        let input: String = refs
+            .iter()
+            .map(|(reference, sha)| format!("create {reference} {sha}\n"))
+            .collect();
+        let mut child = self
+            .git_command()
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "update-ref",
+                "--no-deref",
+                "--stdin",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Cannot publish prefetched PR refs")?;
+        child.stdin.take().unwrap().write_all(input.as_bytes())?;
+        successful_output(
+            child.wait_with_output()?,
+            "publish prefetched PR refs locally",
+        )?;
+        Ok(())
+    }
+
     /// Fetch the pinned PR/base into private refs, including forks without a source remote.
     /// If exactly one configured remote identifies the source repository, also fetch only
     /// its source branch, verify the pinned head, and track it. Refuse ambiguous remotes,
@@ -384,17 +591,11 @@ impl Client {
         let before = self.checkout_commit()?;
         let source = self.source_remote(pr)?;
         self.check_import_refs(&[])?;
+        let cache_namespace = self.prefetch_namespace(pr, &base_ref, source.as_ref())?;
+        let cached_base =
+            self.prefetched_base(pr, &base_ref, &cache_namespace, source.is_some())?;
         let url = format!("https://{}/{}.git", self.host, self.repo);
-        // Reject URL rewrites rather than letting local configuration redirect credentials
-        // or turn an HTTPS fetch into a local/SSH/external-helper operation.
-        let actual_url = text(run(
-            self.fetch_command().args(["ls-remote", "--get-url", &url]),
-            "check the GitHub transport URL",
-        )?)?;
-        ensure!(
-            actual_url.trim() == url,
-            "Git URL rewriting is not supported for PR fetches"
-        );
+        self.check_transport_url(&self.repo, &url)?;
         let token = transport_token(&self.git_dir)?;
         let namespace = token
             .path()
@@ -417,38 +618,40 @@ impl Client {
             existing.is_empty(),
             "PR fetch namespace already exists; no refs were overwritten, retry"
         );
-        let shallow = text(run(
-            self.git_command()
-                .args(["rev-parse", "--is-shallow-repository"]),
-            "inspect repository history depth",
-        )?)?;
-        let mut fetch = self.fetch_command();
-        fetch.args([
-            "fetch",
-            "--atomic",
-            "--no-tags",
-            "--no-prune",
-            "--no-prune-tags",
-            "--no-recurse-submodules",
-            "--no-auto-maintenance",
-            "--no-write-commit-graph",
-            "--no-write-fetch-head",
-            "--refmap=",
-            "--no-filter",
-        ]);
-        if shallow.trim() == "true" {
-            fetch.arg("--unshallow");
+        if let Some(actual_base) = &cached_base {
+            let mut refs = vec![
+                (head_ref.clone(), pr.head_sha.clone()),
+                (fetched_base.clone(), actual_base.clone()),
+            ];
+            if let Some(source) = &source {
+                self.check_transport_url(&pr.head_repo, &source.url)?;
+                refs.push((
+                    format!("refs/heads/zed-pr-review/{namespace}/source"),
+                    pr.head_sha.clone(),
+                ));
+            }
+            self.publish_prefetched_refs(&refs)?;
+        } else {
+            let shallow = text(run(
+                self.git_command()
+                    .args(["rev-parse", "--is-shallow-repository"]),
+                "inspect repository history depth",
+            )?)?;
+            let mut fetch = self.pr_fetch_command_for(&self.repo);
+            if shallow.trim() == "true" {
+                fetch.arg("--unshallow");
+            }
+            fetch.args([
+                "--",
+                &url,
+                &format!("refs/pull/{}/head:{head_ref}", pr.number),
+                &format!("refs/heads/{base_ref}:{fetched_base}"),
+            ]);
+            run(
+                &mut fetch,
+                "fetch the pinned PR and base history (check gh authentication)",
+            )?;
         }
-        fetch.args([
-            "--",
-            &url,
-            &format!("refs/pull/{}/head:{head_ref}", pr.number),
-            &format!("refs/heads/{base_ref}:{fetched_base}"),
-        ]);
-        run(
-            &mut fetch,
-            "fetch the pinned PR and base history (check gh authentication)",
-        )?;
         let actual_head = self
             .git_ref_target(&head_ref)?
             .context("Fetched PR head ref is missing")?;
@@ -462,64 +665,24 @@ impl Client {
         let actual_base = self
             .git_ref_target(&fetched_base)?
             .context("Fetched PR base ref is missing")?;
-        if !actual_base.eq_ignore_ascii_case(&pr.base_sha) {
-            // GitHub's PR base SHA can lag behind the branch tip. Fetching the
-            // branch supplies its history; it must not change our pinned diff.
-            let ancestor = self
-                .git_command()
-                .args(["merge-base", "--is-ancestor", &pr.base_sha, &actual_base])
-                .output()
-                .context("Cannot check the fetched base history")?;
-            ensure!(
-                ancestor.status.code() != Some(1),
-                "Fetched base branch {base_ref} at {actual_base} does not contain pinned PR base {}. The branch was rewound or diverged; resolve the PR again before opening it",
-                pr.base_sha
-            );
-            successful_output(
-                ancestor,
-                "check that the fetched base contains the pinned commit",
-            )
-            .with_context(|| {
-                format!(
-                    "Cannot verify pinned PR base {} against fetched {base_ref} at {actual_base}",
-                    pr.base_sha
-                )
-            })?;
-        }
+        self.check_base_history(pr, &base_ref, &actual_base)?;
         let mut imported_refs = vec![
             (head_ref.clone(), pr.head_sha.clone()),
             (fetched_base.clone(), actual_base),
         ];
         if let Some(source) = &source {
-            let actual_url = text(run(
-                self.fetch_command_for(&pr.head_repo)
-                    .args(["ls-remote", "--get-url", &source.url]),
-                "check the source transport URL",
-            )?)?;
-            ensure!(
-                actual_url.trim() == source.url,
-                "Git URL rewriting is not supported for PR fetches"
-            );
             let source_ref = format!("refs/heads/zed-pr-review/{namespace}/source");
-            run(
-                self.fetch_command_for(&pr.head_repo).args([
-                    "fetch",
-                    "--atomic",
-                    "--no-tags",
-                    "--no-prune",
-                    "--no-prune-tags",
-                    "--no-recurse-submodules",
-                    "--no-auto-maintenance",
-                    "--no-write-commit-graph",
-                    "--no-write-fetch-head",
-                    "--refmap=",
-                    "--no-filter",
-                    "--",
-                    &source.url,
-                    &format!("refs/heads/{}:{source_ref}", pr.head_ref),
-                ]),
-                "fetch only the PR source branch into a private ref",
-            )?;
+            if cached_base.is_none() {
+                self.check_transport_url(&pr.head_repo, &source.url)?;
+                run(
+                    self.pr_fetch_command_for(&pr.head_repo).args([
+                        "--",
+                        &source.url,
+                        &format!("refs/heads/{}:{source_ref}", pr.head_ref),
+                    ]),
+                    "fetch only the PR source branch into a private ref",
+                )?;
+            }
             ensure!(
                 self.git_ref_target(&source_ref)?.as_deref() == Some(pr.head_sha.as_str()),
                 "PR source branch does not match the pinned PR head; resolve the PR again"
@@ -540,11 +703,11 @@ impl Client {
             &imported_refs,
             "import the fetched PR into jj without updating the working copy",
         )?;
+        ensure!(
+            self.source_remote(pr)? == source,
+            "PR source remote changed during fetch; retry"
+        );
         if let Some(source) = &source {
-            ensure!(
-                self.source_remote(pr)?.as_ref() == Some(source),
-                "PR source remote changed during fetch; retry"
-            );
             self.track_source(pr, source)?;
         }
         self.commit_state(&pr.head_sha)?;
@@ -552,6 +715,56 @@ impl Client {
             self.checkout_commit()? == before,
             "jj @ changed during fetch; inspect the workspace before opening the PR"
         );
+        if cached_base.is_none() {
+            // Keep the first foreground open warm too, so returning to it does not
+            // fetch again. Another worker may have published the same cache meanwhile.
+            let cache_refs: Vec<_> = imported_refs
+                .iter()
+                .map(|(reference, sha)| {
+                    (
+                        format!(
+                            "{cache_namespace}/{}",
+                            reference.rsplit('/').next().unwrap()
+                        ),
+                        sha.clone(),
+                    )
+                })
+                .collect();
+            let _ = self.publish_prefetched_refs(&cache_refs);
+        }
+        Ok(())
+    }
+
+    fn check_base_history(
+        &self,
+        pr: &PullRequest,
+        base_ref: &str,
+        actual_base: &str,
+    ) -> Result<()> {
+        if !actual_base.eq_ignore_ascii_case(&pr.base_sha) {
+            // GitHub's PR base SHA can lag behind the branch tip. Fetching the
+            // branch supplies its history; it must not change our pinned diff.
+            let ancestor = self
+                .git_command()
+                .args(["merge-base", "--is-ancestor", &pr.base_sha, actual_base])
+                .output()
+                .context("Cannot check the fetched base history")?;
+            ensure!(
+                ancestor.status.code() != Some(1),
+                "Fetched base branch {base_ref} at {actual_base} does not contain pinned PR base {}. The branch was rewound or diverged; resolve the PR again before opening it",
+                pr.base_sha
+            );
+            successful_output(
+                ancestor,
+                "check that the fetched base contains the pinned commit",
+            )
+            .with_context(|| {
+                format!(
+                    "Cannot verify pinned PR base {} against fetched {base_ref} at {actual_base}",
+                    pr.base_sha
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -1390,8 +1603,37 @@ impl Client {
         Ok(())
     }
 
-    fn fetch_command(&self) -> Command {
-        self.fetch_command_for(&self.repo)
+    fn check_transport_url(&self, repo: &str, url: &str) -> Result<()> {
+        // Reject URL rewrites rather than letting local configuration redirect credentials
+        // or turn an HTTPS fetch into a local/SSH/external-helper operation.
+        let actual_url = text(run(
+            self.fetch_command_for(repo)
+                .args(["ls-remote", "--get-url", url]),
+            "check the GitHub transport URL",
+        )?)?;
+        ensure!(
+            actual_url.trim() == url,
+            "Git URL rewriting is not supported for PR fetches"
+        );
+        Ok(())
+    }
+
+    fn pr_fetch_command_for(&self, repo: &str) -> Command {
+        let mut command = self.fetch_command_for(repo);
+        command.args([
+            "fetch",
+            "--atomic",
+            "--no-tags",
+            "--no-prune",
+            "--no-prune-tags",
+            "--no-recurse-submodules",
+            "--no-auto-maintenance",
+            "--no-write-commit-graph",
+            "--no-write-fetch-head",
+            "--refmap=",
+            "--no-filter",
+        ]);
+        command
     }
 
     fn fetch_command_for(&self, repo: &str) -> Command {
@@ -1428,6 +1670,9 @@ impl Client {
             .env("GIT_ALLOW_PROTOCOL", "https")
             .env("GH_HOST", &self.host)
             .env("GH_PROMPT_DISABLED", "1")
+            // GIT_TERMINAL_PROMPT=0 does not disable askpass. An explicit empty
+            // value also prevents fallback to core.askPass or SSH_ASKPASS.
+            .env("GIT_ASKPASS", "")
             .env_remove("GH_REPO")
             .env_remove("GH_DEBUG");
         command
@@ -1566,6 +1811,34 @@ impl Client {
     fn validate_target(&self) -> Result<()> {
         validate_host(&self.host)?;
         validate_repo(&self.repo)
+    }
+
+    /// Validate optional selectors against a pinned tab without discovery or any I/O.
+    /// Explicit arguments may confirm the registered PR, but must never rebind it.
+    pub fn check_explicit_pr(
+        &self,
+        pr: &PullRequest,
+        requested_pr: Option<&str>,
+        requested_repo: Option<&str>,
+    ) -> Result<()> {
+        self.check_identity(pr)?;
+        let requested_pr = requested_pr.map(parse_pr_spec).transpose()?;
+        let requested_repo = requested_repo.map(parse_repo_spec).transpose()?;
+        let target = explicit_target(requested_pr.as_ref(), requested_repo.as_ref())?;
+        ensure!(
+            requested_pr
+                .as_ref()
+                .is_none_or(|requested| requested.number == pr.number),
+            "--pr number does not match the registered PR; open the requested PR separately"
+        );
+        if let Some(target) = target {
+            ensure!(
+                target.host.eq_ignore_ascii_case(&pr.host)
+                    && target.repo.eq_ignore_ascii_case(&pr.repo),
+                "--pr/--repo target does not match the registered PR; open the requested PR separately"
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn check_identity(&self, pr: &PullRequest) -> Result<()> {
@@ -2239,7 +2512,98 @@ fn text(bytes: Vec<u8>) -> Result<String> {
     String::from_utf8(bytes).context("Command output was not UTF-8")
 }
 
+fn background_timeout_for(command: &Command) -> Option<Duration> {
+    let timeout = BACKGROUND_COMMAND_TIMEOUT.get()?;
+    let program = Path::new(command.get_program()).file_name()?;
+    // Local Git/jj inspection remains on the blocking fast path. Only gh and Git
+    // fetch can perform network transport through this shared runner.
+    let network = program == "gh"
+        || program == "gh.exe"
+        || ((program == "git" || program == "git.exe")
+            && command.get_args().any(|arg| arg == "fetch"));
+    network.then_some(timeout)
+}
+
+fn stop_background_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // The child is the leader of a fresh process group. Kill its transport and
+        // credential helpers too; killing only Git/gh can leave those running.
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    // Also cover platforms without process groups and failures of the group kill.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_background(command: &mut Command, operation: &str, timeout: Duration) -> Result<Vec<u8>> {
+    // Anonymous files avoid pipe-buffer deadlocks and waiting for EOF from helpers
+    // that inherited stdout/stderr. Never include their contents in command errors.
+    let mut stdout = tempfile::tempfile().context("Cannot capture background command output")?;
+    let stderr = tempfile::tempfile().context("Cannot capture background command errors")?;
+    command
+        .stdin(Stdio::null())
+        .stdout(
+            stdout
+                .try_clone()
+                .context("Cannot capture background command output")?,
+        )
+        .stderr(stderr);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let start = Instant::now();
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("Cannot {operation}; is the required executable installed?"))?;
+    let mut interval = Duration::from_millis(1);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                stop_background_child(&mut child);
+                return Err(error).with_context(|| format!("Cannot wait to {operation}"));
+            }
+        }
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            stop_background_child(&mut child);
+            bail!("Cannot {operation}: background command timed out after {timeout:?}");
+        }
+        std::thread::sleep(interval.min(remaining));
+        interval = (interval * 2).min(Duration::from_millis(100));
+    };
+    // Check status before reading potentially large output from a failed command.
+    successful_output(
+        Output {
+            status,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        operation,
+    )?;
+    stdout
+        .rewind()
+        .context("Cannot read background command output")?;
+    let mut bytes = Vec::new();
+    stdout
+        .read_to_end(&mut bytes)
+        .context("Cannot read background command output")?;
+    Ok(bytes)
+}
+
 fn run(command: &mut Command, operation: &str) -> Result<Vec<u8>> {
+    if let Some(timeout) = background_timeout_for(command) {
+        return run_background(command, operation, timeout);
+    }
     let output = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2292,6 +2656,211 @@ mod tests {
             "head": { "sha": HEAD, "ref": "feature/topic", "repo": { "full_name": "contributor/project" } },
             "base": { "sha": BASE, "repo": { "full_name": "upstream/project" } }
         })
+    }
+
+    #[test]
+    fn background_deadlines_are_scoped_and_thread_local() -> Result<()> {
+        assert_eq!(BACKGROUND_COMMAND_TIMEOUT.get(), None);
+        let value = with_background_deadlines(|| {
+            assert_eq!(
+                BACKGROUND_COMMAND_TIMEOUT.get(),
+                Some(Duration::from_secs(60))
+            );
+            assert_eq!(
+                std::thread::spawn(|| BACKGROUND_COMMAND_TIMEOUT.get())
+                    .join()
+                    .unwrap(),
+                None
+            );
+            let value = with_background_timeout(Duration::from_millis(100), || {
+                assert_eq!(
+                    BACKGROUND_COMMAND_TIMEOUT.get(),
+                    Some(Duration::from_millis(100))
+                );
+                Ok(42)
+            })?;
+            assert_eq!(
+                BACKGROUND_COMMAND_TIMEOUT.get(),
+                Some(Duration::from_secs(60))
+            );
+            Ok(value)
+        })?;
+        assert_eq!(value, 42);
+        assert_eq!(BACKGROUND_COMMAND_TIMEOUT.get(), None);
+        let failed: Result<()> = with_background_deadlines(|| bail!("scope failure"));
+        assert!(failed.is_err());
+        assert_eq!(BACKGROUND_COMMAND_TIMEOUT.get(), None);
+        let panicked = std::panic::catch_unwind(|| {
+            with_background_deadlines(|| -> Result<()> { panic!("scope unwind") })
+        });
+        assert!(panicked.is_err());
+        assert_eq!(BACKGROUND_COMMAND_TIMEOUT.get(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn background_deadlines_skip_quick_local_commands_and_foreground() -> Result<()> {
+        let client = client();
+        let gh = client.api_command("GET", "user")?;
+        let fetch = client.pr_fetch_command_for(&client.repo);
+        assert_eq!(background_timeout_for(&gh), None);
+        assert_eq!(background_timeout_for(&fetch), None);
+        with_background_deadlines(|| {
+            assert_eq!(background_timeout_for(&gh), Some(Duration::from_secs(60)));
+            assert_eq!(
+                background_timeout_for(&fetch),
+                Some(Duration::from_secs(60))
+            );
+            assert_eq!(
+                background_timeout_for(client.git_command().arg("for-each-ref")),
+                None
+            );
+            assert_eq!(
+                background_timeout_for(jj_command(&client.root).arg("root")),
+                None
+            );
+            Ok(())
+        })?;
+        assert_eq!(background_timeout_for(&gh), None);
+        assert_eq!(background_timeout_for(&fetch), None);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_runner_captures_output_without_pipe_deadlocks() -> Result<()> {
+        let output = run_background(
+            Command::new("sh").args([
+                "-c",
+                "printf 'captured output'; printf 'private stderr' >&2",
+            ]),
+            "read test output",
+            Duration::from_secs(2),
+        )?;
+        assert_eq!(output, b"captured output");
+        let output = run_background(
+            Command::new("sh").args(["-c",
+                "dd if=/dev/zero bs=65536 count=4 2>/dev/null; dd if=/dev/zero bs=65536 count=4 1>&2 2>/dev/null"]),
+            "read large test output", Duration::from_secs(2),
+        )?;
+        assert_eq!(output, vec![0; 262144]);
+        let error = run_background(
+            Command::new("sh")
+                .env("PRIVATE_TEST_VALUE", "secret environment")
+                .args([
+                    "-c",
+                    "printf 'secret stdout'; printf '%s' \"$PRIVATE_TEST_VALUE\" >&2; exit 7",
+                    "secret argument",
+                ]),
+            "run failing test",
+            Duration::from_secs(2),
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("exit status"), "{error}");
+        for secret in [
+            "secret stdout",
+            "secret environment",
+            "secret argument",
+            "PRIVATE_TEST_VALUE",
+        ] {
+            assert!(!error.contains(secret), "{error}");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_runner_times_out_and_kills_the_process_group() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let pid_file = temp.path().join("leader-pid");
+        let survivor_file = temp.path().join("surviving-helper");
+        let start = Instant::now();
+        let error = run_background(
+            Command::new("sh")
+                .env("PRIVATE_TEST_VALUE", "secret timeout environment")
+                .args(["-c", "printf '%s' \"$$\" > \"$1\"; printf '%s' \"$PRIVATE_TEST_VALUE\" >&2; (sleep 0.4; printf leaked > \"$2\") & wait", "secret timeout argument"])
+                .arg(&pid_file).arg(&survivor_file),
+            "run sleeping test", Duration::from_millis(100),
+        ).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let error = format!("{error:#}");
+        assert!(error.contains("timed out after 100ms"), "{error}");
+        assert!(!error.contains("secret"), "{error}");
+        assert!(!error.contains("PRIVATE_TEST_VALUE"), "{error}");
+        let pid = fs::read_to_string(pid_file)?.parse::<u32>()?;
+        assert!(
+            !Command::new("/bin/kill")
+                .args(["-0", "--", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?
+                .success(),
+            "the direct child must be reaped"
+        );
+        // A kill of only the leader would let the helper finish and write this file.
+        // Avoid probing orphan zombies: some test environments reap them slowly.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !survivor_file.exists(),
+            "the descendant survived the timeout"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prefetch_key_uses_transport_identity_not_cosmetic_fields() -> Result<()> {
+        let client = client();
+        let pr = map_pr(&pull_json(), &target(), 42, "reviewer")?;
+        let key = client.prefetch_namespace(&pr, "main", None)?;
+        let mut cosmetic = pr.clone();
+        cosmetic.title = "New title".into();
+        cosmetic.reviewer = "another-reviewer".into();
+        assert_eq!(client.prefetch_namespace(&cosmetic, "main", None)?, key);
+        for field in ["number", "head", "base", "source-repo", "source-ref"] {
+            let mut changed = pr.clone();
+            match field {
+                "number" => changed.number += 1,
+                "head" => changed.head_sha = BASE.into(),
+                "base" => changed.base_sha = HEAD.into(),
+                "source-repo" => changed.head_repo = "another/project".into(),
+                "source-ref" => changed.head_ref = "another/branch".into(),
+                _ => unreachable!(),
+            }
+            assert_ne!(
+                client.prefetch_namespace(&changed, "main", None)?,
+                key,
+                "{field}"
+            );
+        }
+        assert_ne!(client.prefetch_namespace(&pr, "release", None)?, key);
+        for (host, repo) in [
+            ("github.example", "upstream/project"),
+            ("github.com", "other/project"),
+        ] {
+            let mut changed = client.clone();
+            changed.host = host.into();
+            changed.repo = repo.into();
+            assert_ne!(changed.prefetch_namespace(&pr, "main", None)?, key);
+        }
+        let mut source = SourceRemote {
+            name: "origin".into(),
+            url: "https://github.com/contributor/project.git".into(),
+        };
+        let with_source = client.prefetch_namespace(&pr, "main", Some(&source))?;
+        assert_ne!(with_source, key);
+        source.name = "renamed".into();
+        assert_ne!(
+            client.prefetch_namespace(&pr, "main", Some(&source))?,
+            with_source
+        );
+        source.name = "origin".into();
+        source.url = "https://github.example/contributor/project.git".into();
+        assert_ne!(
+            client.prefetch_namespace(&pr, "main", Some(&source))?,
+            with_source
+        );
+        Ok(())
     }
 
     fn listed_json(number: u64, sha: &str, owner: &str) -> Value {
@@ -2452,6 +3021,73 @@ mod tests {
             .unwrap(),
             Some(target())
         );
+    }
+
+    #[test]
+    fn explicit_selectors_must_match_the_registered_pr_without_io() -> Result<()> {
+        // This client has nonexistent workspace paths, so successful checks cannot
+        // depend on GitHub discovery, Git, jj, or local workspace state.
+        let mut client = client();
+        let mut pr = map_pr(&pull_json(), &target(), 42, "reviewer")?;
+        for (requested_pr, requested_repo) in [
+            (None, None),
+            (Some("42"), None),
+            (Some("042"), Some("upstream/project")),
+            (None, Some("GITHUB.COM/Upstream/Project")),
+            (Some("https://GITHUB.COM/Upstream/Project/pull/42/"), None),
+            (
+                Some("https://github.com/upstream/project/pull/42"),
+                Some("upstream/project"),
+            ),
+        ] {
+            client.check_explicit_pr(&pr, requested_pr, requested_repo)?;
+        }
+        for (requested_pr, requested_repo) in [
+            (Some("43"), None),
+            (Some("https://github.com/upstream/project/pull/43"), None),
+            (Some("https://ghe.example/upstream/project/pull/42"), None),
+            (Some("https://github.com/other/project/pull/42"), None),
+            (None, Some("ghe.example/upstream/project")),
+            (None, Some("other/project")),
+            (Some("42"), Some("other/project")),
+            (
+                Some("https://github.com/upstream/project/pull/42"),
+                Some("other/project"),
+            ),
+            (Some("0"), None),
+            (None, Some("invalid")),
+        ] {
+            assert!(
+                client
+                    .check_explicit_pr(&pr, requested_pr, requested_repo)
+                    .is_err(),
+                "{requested_pr:?}, {requested_repo:?}"
+            );
+        }
+        let mut wrong_client = client.clone();
+        wrong_client.repo = "other/project".into();
+        assert!(wrong_client.check_explicit_pr(&pr, None, None).is_err());
+        wrong_client = client.clone();
+        wrong_client.reviewer = "someone-else".into();
+        assert!(wrong_client.check_explicit_pr(&pr, None, None).is_err());
+
+        // Preserve explicit_target's existing host default: a bare --repo means
+        // github.com unless a PR URL supplies the host.
+        client.host = "ghe.example".into();
+        pr.host = "GHE.EXAMPLE".into();
+        client.check_explicit_pr(&pr, Some("42"), None)?;
+        client.check_explicit_pr(&pr, None, Some("GHE.example/Upstream/Project"))?;
+        client.check_explicit_pr(
+            &pr,
+            Some("https://ghe.example/upstream/project/pull/42"),
+            Some("upstream/project"),
+        )?;
+        assert!(
+            client
+                .check_explicit_pr(&pr, None, Some("upstream/project"))
+                .is_err()
+        );
+        Ok(())
     }
 
     #[test]
@@ -2786,6 +3422,42 @@ mod tests {
         );
         let jj = jj_command(&client.root);
         assert!(jj.get_args().any(|arg| arg == "--ignore-working-copy"));
+    }
+
+    #[test]
+    fn prefetch_transport_disables_terminal_gh_and_askpass_prompts() {
+        let client = client();
+        for repo in [client.repo.as_str(), "contributor/project"] {
+            let command = client.pr_fetch_command_for(repo);
+            for (name, value) in [
+                ("GIT_TERMINAL_PROMPT", "0"),
+                ("GIT_ASKPASS", ""),
+                ("GH_PROMPT_DISABLED", "1"),
+                ("GH_HOST", "github.com"),
+                ("GIT_ALLOW_PROTOCOL", "https"),
+            ] {
+                assert!(
+                    command
+                        .get_envs()
+                        .any(|(key, val)| key == name && val == Some(std::ffi::OsStr::new(value))),
+                    "{name}"
+                );
+            }
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap())
+                .collect();
+            for config in [
+                "credential.interactive=false",
+                "credential.helper=",
+                "credential.https://github.com.helper=!gh auth git-credential",
+            ] {
+                assert!(
+                    args.windows(2).any(|pair| pair == ["-c", config]),
+                    "{config}"
+                );
+            }
+        }
     }
 
     #[test]

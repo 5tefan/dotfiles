@@ -390,8 +390,20 @@ fn check_tree_entries(directory: &Path, is_base: bool) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).context("Cannot inspect existing state"),
     }
-    for entry in fs::read_dir(directory)? {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("Cannot inspect existing state"),
+    };
+    for entry in entries {
         let entry = entry?;
+        // Background preparation atomically publishes and removes temporary files.
+        // A disappeared entry is not an unsafe file that can survive checkout.
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("Cannot inspect existing state entry"),
+        };
         if is_base
             && entry
                 .file_name()
@@ -404,7 +416,7 @@ fn check_tree_entries(directory: &Path, is_base: bool) -> Result<()> {
                 "Conflicting state ignore file at {}; no files were changed",
                 entry.path().display()
             );
-        } else if entry.file_type()?.is_dir() {
+        } else if kind.is_dir() {
             check_tree_entries(&entry.path(), false)?;
         } else {
             regular_file_or_missing(&entry.path())?;

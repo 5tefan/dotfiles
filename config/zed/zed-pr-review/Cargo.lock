@@ -926,6 +926,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

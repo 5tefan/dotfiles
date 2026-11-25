@@ -26,13 +26,15 @@ Install this dotfiles configuration at `~/.config/zed`, then build the local
 binary:
 
 ```sh
-cargo build --locked --release --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml
+cargo build --locked --release --bin zed-pr-review --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml
 ```
 
 The tasks in `../tasks.json` run
 `~/.config/zed/zed-pr-review/target/release/zed-pr-review`. Rebuild after changing
 the Rust source, including when upgrading to the live log viewer or finish-review
-dialog; the tasks do not build automatically.
+dialog; the tasks do not build automatically. Open a new diff after upgrading to
+get cached patch metadata for offline commenting; older tabs keep their existing
+live GitHub checks.
 
 Open the jj workspace in Zed, press **Ctrl-Shift-G**, and enter a PR number or
 URL. You do not need to fetch or track its original branch first. `open` fetches
@@ -205,8 +207,9 @@ Press **r** to refresh immediately. Use **j/k**, arrow keys, the wheel, or
 PageUp/PageDown to scroll; **h/l** pans horizontally, and **@** reveals the current
 PR. Home/End and Ctrl-U/Ctrl-D also work. Shift-drag selects text. Refresh failures
 leave the last graph visible and show an error; a later successful read clears it.
-The viewer is read-only and does not hold the workspace lock, so other review
-tasks can run while it stays open.
+The viewer does not change the checkout or hold the workspace lock, so other
+review tasks can run while it stays open. It also starts background preparation
+and shows its progress, as described below.
 
 After validating the originating review, the viewer follows the active PR on
 refresh when you move through the stack. An explicit `--pr` keeps it pinned to
@@ -251,6 +254,40 @@ terminals**. If either is redirected or piped, it prints the PR stack or runs
 `jj l` once instead. PR output uses colors on a terminal and plain text when
 stdout is redirected. `--pr` cannot force a source buffer into review mode;
 use `open` first.
+
+### Background preparation and quick stack navigation
+
+After **Ctrl-Shift-G** opens the current diff, a detached worker prepares the rest
+of its stack. **Ctrl-Shift-L** also starts preparation after loading the graph.
+The worker visits the nearest child, then the parent, then works outward in
+breadth-first order. Forks are included. One worker runs per workspace, with one
+PR prepared at a time to limit disk and network contention.
+
+Preparation fetches Git objects into `refs/zed-pr-review-prefetch/` and writes
+frozen diff snapshots plus cached GitHub patches. It **does not change `@`, import
+Git refs into jj, track bookmarks, activate a session, open tabs, or change drafts**.
+No workspace lock is held. Network reads happen outside per-PR draft locks and
+have a 60-second deadline per command. Foreground review commands have priority;
+if you jump to a PR while its local snapshots are being written, navigation waits
+up to 30 seconds for that work rather than preparing it twice.
+
+Ctrl-Shift-J/K reuse prepared snapshots and fetched objects when their exact PR
+head, base, source, and reviewer still match. Changed revisions use fresh data;
+cleaned or cancelled snapshots are never reused. Returning to an unchanged PR
+can reopen the same frozen diff. Explicit `open` and `diff` still create new
+snapshot directories, so old tabs are never assigned to another revision.
+
+Navigation also reuses a graph for up to **60 seconds**, while checking the
+current and target PRs live. New children can appear on the next full refresh:
+press **r** in the stack view or run `stack`. The live view refreshes every 30
+seconds. It shows `Prepared N/M adjacent PRs`; failures are recorded in
+`scratch/zed-pr-review/prefetch/status.json` and do not prevent ordinary opening.
+
+This makes additional authenticated GitHub reads and Git fetches, and uses local
+disk space; it never posts reviews or pushes. Prepared snapshots follow normal
+review cleanup. Fetched refs are retained, like the existing review refs.
+Set `ZED_PR_REVIEW_PREFETCH=0` in the Zed task environment to disable automatic
+preparation. A worker already running finishes its current finite pass.
 
 ### Use the live jj log
 
@@ -361,8 +398,7 @@ has no effect; `--draft-dir` is rejected.
 1. Use a registered **head snapshot** from `open` or `diff`. Ordinary source
    files are not review context, even when a saved session matches `@`. Keep the
    snapshot unchanged on disk and in the editor; the comment task does not save
-   buffers. The CLI checks the whole file against the head blob and its exact
-   recorded digest. Bare-CR files are rejected because their editor rows can
+   buffers. The CLI checks the whole file against its pinned snapshot digest. Bare-CR files are rejected because their editor rows can
    differ from GitHub's line numbers.
 2. Select one continuous, nonblank range on the **RIGHT (head) side**, within one
    excerpt and one GitHub diff hunk. Added lines and right-side context are
@@ -372,6 +408,15 @@ has no effect; `--draft-dir` is rejected.
 4. Type a multiline comment. Press Enter, then **Ctrl-D on an empty line** to
    finish stdin. A nonblank body is saved locally; nothing is published. A blank
    body cancels. Ctrl-C cancels the current input and keeps earlier comments.
+
+**New sessions save comments entirely locally.** The prompt and save use the
+frozen head bytes and cached GitHub patch; they make no GitHub requests or Git
+blob reads, and do not scan all tracked repository paths. The recorded jj
+checkout must still match the pinned PR, and the session and selection must be
+intact. A remote push or account change does not prevent saving a private draft:
+submission checks GitHub again and refuses mismatched revisions or accounts.
+Legacy sessions without cached patches use the previous live checks. Open a new
+diff to enable the local path; existing drafts are preserved.
 
 The selection behavior was verified in the **Zed 1.29.3 source**, whose relevant
 code is unchanged from 1.29.2; the actual GUI workflow has **not** been tested.
@@ -385,11 +430,11 @@ continuous right-side selection within one excerpt and one hunk.
 
 For snapshots, the CLI maps only the exact registered `head/` path in that
 session's manifest to its repository filename. It validates the manifest and
-snapshot digests, the whole file against the pinned head blob, the selected text
-at the supplied coordinates, and the range against the GitHub patch. It never
+snapshot digests, the selected text at the supplied coordinates, and the range
+against the cached GitHub patch. It never
 finds a file or line by searching for matching text. Base snapshots, unknown
-paths, modified snapshots, cleaned sessions, cancelled sessions, and stale sessions
-are rejected.
+paths, modified snapshots, cleaned sessions, cancelled sessions, and a mismatched
+recorded checkout are rejected.
 
 The CLI reads these environment variables directly. **Never interpolate selected
 text into a task command, shell argument, or shell script**, even inside quotes.
@@ -421,8 +466,10 @@ REPO_ROOT/scratch/zed-pr-review/<draft-key>/diff-<unique>/
 
 The snapshots are frozen copies of the changed files, not live workspace files.
 The manifest records the pinned PR, merge base, repository paths, sides, and
-content digests. `active.json` at the state root identifies the active session.
-Reopening creates a new directory rather than replacing the old snapshots.
+content digests and GitHub patches. `active.json` at the state root identifies the
+active session; `<draft-key>/prepared.json` identifies its reusable prepared diff.
+Explicit `open` and `diff` create new directories rather than replacing old
+snapshots; stack navigation can reuse an unchanged prepared directory.
 **Old tabs stay bound to their original session**, even after another PR opens.
 You can add inline comments from registered head snapshots with `PR: add comment`;
 do not edit the snapshots. Cancelled tabs are rejected rather than rebound to a
@@ -449,8 +496,9 @@ An explicit `--pr` must agree with the session; it cannot rebind an existing vie
 or active review.
 For commands that check the current revision, a mismatch in `@`, the PR head,
 base, or identity causes a refusal rather than silently choosing a different PR.
-`@` must match the pinned head or its empty child. Local cancellation is the
-exception: it acts on the registered local session without those live checks.
+`@` must match the pinned head or its empty child. Local comments use pinned data
+and defer remote checks until submission. Local cancellation does not require
+either live remote checks or a matching checkout.
 Run `open` again to switch or refresh the active review. Reopening does not
 reassign old comments to a new revision; see the draft guidance below.
 
@@ -752,8 +800,12 @@ or clean a submitted draft.
 
 ## Tests and validation limits
 
-The Rust tests run offline. Integration tests use real local jj/Git objects, a
-fake `gh`, and a non-GUI editor. Navigation tests redirect stdin and stdout and
+The tests run offline and require no Python interpreter. Integration tests use
+real local jj/Git objects and the Rust `zpr-test-helper` executable for fake `gh`,
+Git/jj wrappers, hooks, editor/Zed commands, delay gates, and terminal drivers.
+Cargo builds the helper once. Each isolated fixture installs symlinks with
+adjacent JSON configuration; the helper never falls back to real `gh` or network
+transport. Ordinary Git/jj calls still execute the real local tools. Navigation tests redirect stdin and stdout and
 require `stack --watch` to run `jj l` once in local mode, with no viddy or GitHub
 calls. Review regression tests cover one-shot output and checkout guards. PR
 terminal tests cover colors, scrolling, automatic and manual refresh, failed-read
@@ -775,12 +827,57 @@ with Ratatui's test backend. Session unit tests cover local cancellation,
 archives and retained metadata, partial cancellation and retries, isolation from
 other reviews, rejection of old cancelled tabs, and cleanup with a `COMMENTED`
 receipt. These are not proof of the full Zed workflow or live GitHub behavior.
-The tests do not exercise the Zed GUI or mutate live GitHub reviews. Run them with:
+The tests do not exercise the Zed GUI or mutate live GitHub reviews.
+
+The helper lives in `tests/support/`. `gh.rs` implements the stateful and ordered
+GitHub fixtures; `transport.rs` and `cli_tools.rs` implement the command wrappers.
+`pty.rs` uses Unix PTYs through `libc` and an incremental `vte` parser. The three
+terminal drivers preserve mouse/navigation, refresh, terminal-restoration, editor
+handoff, and signal checks. Processes are bounded and cleaned up on failures.
+`helper_gh.rs` tests the fixture's own argument validation, mutations, failure modes,
+and concurrent reads. The existing JSON controls and request-log formats remain
+compatible. No helper code runs in the production CLI; use `--bin zed-pr-review`
+when building only the application.
+
+For a quick feedback loop, start with unit tests (run these from this directory):
+
+```sh
+cargo test --locked --lib --bins -- --test-threads=4
+```
+
+Then run the integration tests for the changed feature. Transport cases are
+individually selectable; the former group names remain valid filters:
+
+```sh
+# One transport case, rather than every checkout safeguard in both layouts:
+cargo test --locked --test checkout_transport local_transport_colocated_and_noncolocated::colocated::dirty -- --exact
+# All ignored-file safeguards, in both repository layouts:
+cargo test --locked --test checkout_transport ignored_files_colocated_and_noncolocated -- --test-threads=4
+# Local comments and background preparation:
+cargo test --locked --test cli cached_comments -- --test-threads=4
+cargo test --locked --test cli prefetch -- --test-threads=4
+```
+
+Run the full suite before finishing a change that affects multiple features:
 
 ```sh
 cargo test --locked --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml -- --test-threads=4
 cargo clippy --locked --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml --all-targets -- -D warnings
 ```
+
+The full suite still takes minutes: it creates hundreds of independent Git/jj
+repositories and runs real fetches, imports, and checkouts against local fixtures.
+Use four test threads as a starting point, rather than running one subprocess-heavy
+test per CPU. Test fixtures limit jj's Rayon pool to one thread so test-level
+parallelism does not multiply into many pools; production settings are unchanged.
+One terminal test also deliberately waits for the real 30-second refresh interval.
+
+Rust's `has been running for over 60 seconds` message is informational, not a
+failure or a timeout. Previously, one transport test name covered as many as 24
+sequential scenarios. Those scenarios now run as separate tests, with the same
+coverage and isolation. Long-running notices now identify individual transport
+cases rather than entire groups. Do not remove tests or raise timeouts just to
+hide that message.
 
 For just the navigation regressions:
 

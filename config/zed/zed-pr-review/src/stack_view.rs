@@ -92,7 +92,14 @@ impl View {
 
 /// The caller must route non-terminal input/output to the one-shot renderer.
 /// `load` must be read-only and must not hold a review workspace lock.
-pub fn run(mut load: impl FnMut() -> Result<Stack> + Send + 'static) -> Result<()> {
+pub fn run(load: impl FnMut() -> Result<Stack> + Send + 'static) -> Result<()> {
+    run_with_status(load, || None)
+}
+
+pub fn run_with_status(
+    mut load: impl FnMut() -> Result<Stack> + Send + 'static,
+    mut preparation_status: impl FnMut() -> Option<String>,
+) -> Result<()> {
     let screen = Screen::enter().context("Cannot enter the interactive PR stack")?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
@@ -116,7 +123,17 @@ pub fn run(mut load: impl FnMut() -> Result<Stack> + Send + 'static) -> Result<(
     let mut next_refresh = Instant::now();
     let mut dirty = true;
     let mut body = Rect::default();
+    let mut preparation = None;
+    let mut next_status = Instant::now();
     loop {
+        if Instant::now() >= next_status {
+            let current = preparation_status();
+            if current != preparation {
+                preparation = current;
+                dirty = true;
+            }
+            next_status = Instant::now() + Duration::from_millis(250);
+        }
         match replies.try_recv() {
             Ok(result) => {
                 busy = false;
@@ -185,7 +202,10 @@ pub fn run(mut load: impl FnMut() -> Result<Stack> + Send + 'static) -> Result<(
                 }
                 if area.height >= 2 {
                     frame.render_widget(
-                        Paragraph::new(plain_status(&status)),
+                        Paragraph::new(plain_status(&match &preparation {
+                            Some(preparation) => format!("{status} · {preparation}"),
+                            None => status.clone(),
+                        })),
                         Rect::new(area.x, area.y + area.height - 2, area.width, 1),
                     );
                 }

@@ -3,6 +3,7 @@ pub mod log_data;
 pub mod log_view;
 pub mod message;
 pub mod model;
+pub mod prefetch;
 pub mod ready;
 pub mod review_menu;
 pub mod selection;

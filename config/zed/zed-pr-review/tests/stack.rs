@@ -6,11 +6,15 @@ use anyhow::{Context, Result, ensure};
 use ratatui::style::Modifier;
 use serde_json::{Value, json};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 use zed_pr_review::github::Client;
 use zed_pr_review::model::PullRequest;
 use zed_pr_review::stack::{RenderedStack, Stack};
+
+mod support;
 
 const REPO: &str = "acme/widgets";
 const HOST: &str = "github.com";
@@ -76,15 +80,12 @@ fn run(plan: Value) -> Result<Value> {
     fs::create_dir(&bin)?;
     fs::create_dir(root.join("home"))?;
     fs::write(root.join("plan.json"), serde_json::to_vec(&plan)?)?;
-    fs::write(bin.join("gh"), include_str!("stack_gh.py"))?;
+    support::install(&bin.join("gh"), &json!({"tool":"stack-gh"}))?;
     for name in ["git", "jj"] {
-        fs::write(
-            bin.join(name),
-            "#!/bin/sh\necho 'unexpected Git/jj command' >&2\nexit 99\n",
+        support::install(
+            &bin.join(name),
+            &json!({"tool":"deny", "message":"unexpected Git/jj command"}),
         )?;
-    }
-    for name in ["gh", "git", "jj"] {
-        fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o700))?;
     }
     let mut paths = vec![bin];
     paths.extend(std::env::split_paths(
@@ -205,6 +206,126 @@ fn rejected(plan: Value, message: &str) -> Result<()> {
     Ok(())
 }
 
+fn exercise_cache(stack: &Stack, root: &Path, options: &Value) -> Result<Option<Stack>> {
+    let state = root.join("state");
+    fs::create_dir(&state)?;
+    assert!(Stack::cached(&state, &stack.current().pr).is_none());
+    // A held workspace lock and existing draft/active pointer must not interfere.
+    let _workspace = zed_pr_review::store::Store::at(&state.join("workspace"))?;
+    fs::write(state.join("draft.json"), b"untouched draft")?;
+    fs::write(state.join("active.json"), b"untouched active")?;
+    stack.remember(&state)?;
+    let path = state.join("stack.json");
+    let original = fs::read(&path)?;
+    let mut data: Value = serde_json::from_slice(&original)?;
+    assert_eq!(data["state"], json!(state));
+    assert!(
+        SystemTime::now().duration_since(serde_json::from_value(data["saved_at"].clone())?)?
+            < Duration::from_secs(60)
+    );
+    assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+
+    if options["check_paths"] == true {
+        check_cache_paths(stack, root, &state, &original)?;
+    }
+    if let Some(replacements) = options["replace"].as_array() {
+        for replacement in replacements {
+            *data.pointer_mut(replacement[0].as_str().unwrap()).unwrap() = replacement[1].clone();
+        }
+    }
+    if let Some(extra) = options.get("append") {
+        let entry = if let Some(index) = extra.as_u64() {
+            data["entries"][index as usize].clone()
+        } else {
+            extra.clone()
+        };
+        data["entries"].as_array_mut().unwrap().push(entry);
+    }
+    if let Some(age) = options["age_seconds"].as_i64() {
+        let now = SystemTime::now();
+        data["saved_at"] = json!(if age >= 0 {
+            now - Duration::from_secs(age as u64)
+        } else {
+            now + Duration::from_secs(age.unsigned_abs())
+        });
+    }
+    let bytes = match options["bytes"].as_str() {
+        Some(bytes) => bytes.as_bytes().to_vec(),
+        None => serde_json::to_vec(&data)?,
+    };
+    fs::write(&path, &bytes)?;
+    let current = match options.get("current") {
+        Some(current) => serde_json::from_value(current.clone())?,
+        None => stack.current().pr.clone(),
+    };
+    let cached = Stack::cached(&state, &current);
+    assert_eq!(fs::read(&path)?, bytes, "cache loads must be read-only");
+    assert_eq!(fs::read(state.join("draft.json"))?, b"untouched draft");
+    assert_eq!(fs::read(state.join("active.json"))?, b"untouched active");
+    let mut names = fs::read_dir(&state)?
+        .map(|entry| Ok(entry?.file_name()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    names.sort();
+    assert_eq!(
+        names,
+        ["active.json", "draft.json", "stack.json", "workspace"]
+    );
+    Ok(cached)
+}
+
+fn check_cache_paths(stack: &Stack, root: &Path, state: &Path, bytes: &[u8]) -> Result<()> {
+    let current = &stack.current().pr;
+    let other = root.join("other-state");
+    fs::create_dir(&other)?;
+    fs::write(other.join("stack.json"), bytes)?;
+    assert!(Stack::cached(&other, current).is_none(), "relocated cache");
+    assert!(Stack::cached(&root.join("missing"), current).is_none());
+    assert!(!root.join("missing").exists());
+
+    let alias = root.join("alias");
+    symlink(state, &alias)?;
+    for path in [
+        alias,
+        state.join("."),
+        state.join("../state"),
+        root.join("alias/../state"),
+    ] {
+        assert!(Stack::cached(&path, current).is_none());
+        assert!(stack.remember(&path).is_err());
+    }
+    let path = state.join("stack.json");
+    fs::remove_file(&path)?;
+    symlink(other.join("stack.json"), &path)?;
+    assert!(Stack::cached(state, current).is_none());
+    assert!(stack.remember(state).is_err());
+    assert_eq!(fs::read(other.join("stack.json"))?, bytes);
+    fs::remove_file(&path)?;
+    symlink(root.join("absent-cache"), &path)?;
+    assert!(Stack::cached(state, current).is_none());
+    assert!(stack.remember(state).is_err());
+    assert!(!root.join("absent-cache").exists());
+    fs::remove_file(&path)?;
+    fs::hard_link(other.join("stack.json"), &path)?;
+    assert!(Stack::cached(state, current).is_none());
+    assert!(stack.remember(state).is_err());
+    fs::remove_file(&path)?;
+    fs::create_dir(&path)?;
+    assert!(Stack::cached(state, current).is_none());
+    assert!(stack.remember(state).is_err());
+    fs::remove_dir(&path)?;
+    // Existing corrupt regular files can be replaced without touching drafts.
+    fs::write(&path, b"broken JSON")?;
+    let old = fs::File::open(&path)?;
+    stack.remember(state)?;
+    assert!(Stack::cached(state, current).is_some());
+    use std::io::Read;
+    let mut previous = String::new();
+    (&old).read_to_string(&mut previous)?;
+    assert_eq!(previous, "broken JSON", "replacement must be atomic");
+    fs::write(&path, bytes)?;
+    Ok(())
+}
+
 #[test]
 fn stack_child() -> Result<()> {
     let Some(root) = std::env::var_os("ZPR_STACK_FIXTURE") else {
@@ -221,11 +342,25 @@ fn stack_child() -> Result<()> {
         reviewer: "reviewer".into(),
     };
     let result = (|| -> Result<Value> {
-        let stack = Stack::discover(&client, &current)?;
+        let mut stack = Stack::discover(&client, &current)?;
+        if let Some(options) = plan.get("cache") {
+            let Some(cached) = exercise_cache(&stack, &root, options)? else {
+                return Ok(json!({"cache_miss": true}));
+            };
+            stack = cached;
+        }
         if let Some(selected) = plan.get("selected") {
             let number = selected.as_u64().unwrap();
             let refreshed = client.read_pr(number)?;
-            stack.verify_adjacent(&client, &refreshed)?;
+            if plan["verify_cached"] == true {
+                let mut verifying_client = client.clone();
+                if let Some(host) = plan["client_host"].as_str() {
+                    verifying_client.host = host.into();
+                }
+                stack.verify_cached_adjacent(&verifying_client, &refreshed)?;
+            } else {
+                stack.verify_adjacent(&client, &refreshed)?;
+            }
         }
         let rendered: RenderedStack = stack.render_log();
         let lines: Vec<_> = rendered
@@ -253,7 +388,8 @@ fn stack_child() -> Result<()> {
             "lines": lines, "current_row": rendered.current_row,
             "current": stack.current().pr.number,
             "parent": stack.parent()?.map(|entry| entry.pr.number),
-            "children": stack.children().iter().map(|entry| entry.pr.number).collect::<Vec<_>>()
+            "children": stack.children().iter().map(|entry| entry.pr.number).collect::<Vec<_>>(),
+            "preparation": stack.preparation_order().iter().map(|entry| entry.pr.number).collect::<Vec<_>>()
         }))
     })();
     let result = match result {
@@ -912,6 +1048,374 @@ fn selected_neighbor_is_revalidated_after_prompting() -> Result<()> {
         navigation_plan(&current, &current, all.clone(), all),
         "not an adjacent stack candidate",
     )?;
+    Ok(())
+}
+
+#[test]
+fn preparation_is_nearest_first_with_children_before_parents() -> Result<()> {
+    let all = vec![
+        pr(1, "one", "main", 10, 1),
+        pr(2, "two", "one", 20, 10),
+        pr(3, "three", "two", 30, 20),
+        pr(4, "four", "three", 40, 30),
+        pr(5, "five", "four", 50, 40),
+    ];
+    for (index, expected) in [
+        (0, json!([2, 3, 4, 5])),
+        (2, json!([4, 2, 5, 1])),
+        (4, json!([4, 3, 2, 1])),
+    ] {
+        let result = success(plan(&all[index], vec![all.clone()], all.clone()))?;
+        assert_eq!(result["preparation"], expected);
+    }
+    let result = success(plan(
+        &all[0],
+        vec![vec![all[0].clone()]],
+        vec![all[0].clone()],
+    ))?;
+    assert_eq!(result["preparation"], json!([]));
+    Ok(())
+}
+
+#[test]
+fn preparation_crosses_forks_and_ancestors_without_duplicates() -> Result<()> {
+    let current = pr(50, "current", "parent", 30, 20);
+    let all = vec![
+        pr(90, "root", "main", 10, 1),
+        pr(70, "parent", "root", 20, 10),
+        current.clone(),
+        pr(60, "child", "current", 40, 30),
+        pr(40, "alternate", "current", 41, 30),
+        pr(80, "leaf", "child", 50, 40),
+        pr(30, "sibling", "parent", 25, 20),
+        pr(20, "cousin", "root", 15, 10),
+        pr(10, "side", "cousin", 16, 15),
+    ];
+    let unrelated = pr(99, "unrelated", "main", 99, 1);
+    let mut listing = all.clone();
+    listing.push(unrelated);
+    listing.reverse();
+    let result = success(plan(&current, vec![listing], all))?;
+    assert_eq!(
+        result["preparation"],
+        json!([40, 60, 70, 80, 30, 90, 20, 10])
+    );
+    Ok(())
+}
+
+#[test]
+fn cached_graph_recenters_on_every_connected_pr_without_live_reads() -> Result<()> {
+    let all = vec![
+        pr(1, "one", "main", 10, 1),
+        pr(2, "two", "one", 20, 10),
+        pr(3, "three", "one", 30, 10),
+        pr(4, "four", "two", 40, 20),
+        pr(5, "five", "three", 50, 30),
+    ];
+    for (index, parent, children, preparation) in [
+        (0, Value::Null, json!([2, 3]), json!([2, 3, 4, 5])),
+        (1, json!(1), json!([4]), json!([4, 1, 3, 5])),
+        (2, json!(1), json!([5]), json!([5, 1, 2, 4])),
+        (3, json!(2), json!([]), json!([2, 1, 3, 5])),
+        (4, json!(3), json!([]), json!([3, 1, 2, 4])),
+    ] {
+        let mut p = plan(&all[1], vec![all.clone()], all.clone());
+        p["cache"] = json!({"current": pin(&all[index], HOST)});
+        let result = success(p)?;
+        assert_eq!(result["current"], all[index]["number"]);
+        assert_eq!(result["parent"], parent);
+        assert_eq!(result["children"], children);
+        assert_eq!(result["preparation"], preparation);
+    }
+    Ok(())
+}
+
+#[test]
+fn cached_graph_requires_exact_current_identity_and_revision() -> Result<()> {
+    let parent = pr(1, "one", "main", 10, 1);
+    let current = pr(2, "two", "one", 20, 10);
+    let all = vec![parent, current.clone()];
+    let original = json!(pin(&current, HOST));
+    for (field, replacement) in [
+        ("host", json!("elsewhere.example")),
+        ("repo", json!("acme/elsewhere")),
+        ("number", json!(99)),
+        ("head_sha", json!(oid(21))),
+        ("base_sha", json!(oid(11))),
+        ("head_repo", json!("fork/widgets")),
+        ("head_ref", json!("renamed")),
+        ("reviewer", json!("someone-else")),
+        ("url", json!("https://github.com/acme/widgets/pull/99")),
+        ("author", json!("someone-else")),
+    ] {
+        let mut pins = original.clone();
+        pins[field] = replacement;
+        let mut p = plan(&current, vec![all.clone()], all.clone());
+        p["cache"] = json!({"current": pins});
+        assert_eq!(run(p)?["cache_miss"], true, "accepted changed {field}");
+    }
+    let mut pins = original;
+    pins["title"] = json!("Cosmetic change");
+    let mut p = plan(&current, vec![all.clone()], all);
+    p["cache"] = json!({"current": pins});
+    success(p)?;
+    Ok(())
+}
+
+#[test]
+fn stale_future_corrupt_and_invalid_cached_graphs_are_read_only_misses() -> Result<()> {
+    let current = pr(1, "one", "main", 10, 1);
+    let child = pr(2, "two", "one", 20, 10);
+    let all = vec![current.clone(), child];
+    let cases = vec![
+        json!({"age_seconds": 61}),
+        json!({"age_seconds": -60}),
+        json!({"bytes": "not JSON"}),
+        json!({"bytes": "{}"}),
+        json!({"replace": [["/version", 999]]}),
+        json!({"replace": [["/state", "/another/root/state"]]}),
+        json!({"replace": [["/saved_at", null]]}),
+        json!({"replace": [["/entries", []]]}),
+        json!({"append": 0}),
+        json!({"replace": [["/entries/1/state", "closed"]]}),
+        json!({"replace": [["/entries/1/pr/host", "elsewhere.example"]]}),
+        json!({"replace": [["/entries/1/pr/reviewer", "someone-else"]]}),
+        json!({"replace": [["/entries/1/pr/number", 0]]}),
+        json!({"replace": [["/entries/1/pr/head_sha", "bad-sha"]]}),
+        json!({"replace": [["/entries/1/pr/head_ref", "bad ref"]]}),
+        json!({"replace": [["/entries/1/pr/head_repo", "../unsafe"]]}),
+        json!({"replace": [["/entries/1/pr/url", "https://github.com/acme/widgets/pull/3"]]}),
+        json!({"replace": [["/entries/1/pr/author", "bad login"]]}),
+        json!({"replace": [["/entries/1/base_repo", "elsewhere/widgets"]]}),
+        json!({"replace": [["/entries/1/base_ref", "bad ref"]]}),
+        // A disconnected node, stale edge, cycle, and ambiguous parent.
+        json!({"replace": [["/entries/1/base_ref", "main"]]}),
+        json!({"replace": [["/entries/1/pr/base_sha", oid(11)]]}),
+        json!({"replace": [["/entries/1/pr/head_ref", "one"], ["/entries/1/pr/base_sha", oid(20)]]}),
+        json!({"append": {
+            "pr": pin(&pr(3, "one", "main", 10, 1), HOST),
+            "base_repo": REPO, "base_ref": "main", "state": "open", "draft": false,
+        }}),
+    ];
+    for options in cases {
+        let mut p = plan(&current, vec![all.clone()], all.clone());
+        p["cache"] = options.clone();
+        assert_eq!(run(p)?["cache_miss"], true, "accepted {options}");
+    }
+    for age in [0, 59] {
+        let mut p = plan(&current, vec![all.clone()], all.clone());
+        p["cache"] = json!({"age_seconds": age});
+        success(p)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn cache_is_atomic_unlocked_and_bound_to_safe_state_paths() -> Result<()> {
+    let current = pr(1, "one", "main", 10, 1);
+    let mut p = plan(&current, vec![vec![current.clone()]], vec![current.clone()]);
+    p["cache"] = json!({"check_paths": true});
+    success(p)?;
+    Ok(())
+}
+
+fn cached_navigation_plan(current: &Value, selected: &Value, all: Vec<Value>) -> Value {
+    let mut p = plan(current, vec![all.clone()], all);
+    p["cache"] = json!({});
+    p["verify_cached"] = true.into();
+    p["selected"] = selected["number"].clone();
+    let mut selected = selected.clone();
+    selected["merged"] = false.into();
+    p["steps"].as_array_mut().unwrap().extend([
+        read(&selected),
+        user(), // The caller's refreshed target pins.
+        user(),
+        read(current),
+        read(&selected),
+        user(), // Fast verification only.
+    ]);
+    p
+}
+
+#[test]
+fn cached_navigation_reads_only_current_target_and_reviewer() -> Result<()> {
+    let all = vec![
+        pr(1, "one", "main", 10, 1),
+        pr(2, "two", "one", 20, 10),
+        pr(3, "three", "one", 30, 10),
+        pr(4, "four", "two", 40, 20),
+        pr(5, "five", "three", 50, 30),
+    ];
+    for (current, selected) in [(0, 1), (0, 2), (1, 0), (2, 0), (1, 3)] {
+        success(cached_navigation_plan(
+            &all[current],
+            &all[selected],
+            all.clone(),
+        ))?;
+    }
+    // Reuse the same graph after moving from the root to a child.
+    let mut p = cached_navigation_plan(&all[0], &all[0], all.clone());
+    p["cache"]["current"] = json!(pin(&all[1], HOST));
+    let steps = p["steps"].as_array_mut().unwrap();
+    let len = steps.len();
+    steps[len - 3] = read(&all[1]);
+    success(p)?;
+    Ok(())
+}
+
+#[test]
+fn cached_navigation_rejects_drift_closing_and_reviewer_changes() -> Result<()> {
+    let parent = pr(1, "one", "main", 10, 1);
+    let current = pr(2, "two", "one", 20, 10);
+    let all = vec![parent.clone(), current.clone()];
+    // Offsets into the final four reads: user, current PR, target PR, user.
+    for (offset, path, replacement, message) in [
+        (
+            0,
+            "/body/login",
+            json!("someone-else"),
+            "GitHub user changed",
+        ),
+        (
+            3,
+            "/body/login",
+            json!("someone-else"),
+            "GitHub user changed",
+        ),
+        (
+            1,
+            "/body/head/sha",
+            json!(oid(21)),
+            "Current PR head, base branch",
+        ),
+        (
+            1,
+            "/body/head/ref",
+            json!("renamed"),
+            "Current PR head, base branch",
+        ),
+        (
+            1,
+            "/body/base/sha",
+            json!(oid(11)),
+            "Current PR head, base branch",
+        ),
+        (
+            1,
+            "/body/base/ref",
+            json!("retargeted-at-same-sha"),
+            "Current PR head, base branch",
+        ),
+        (
+            1,
+            "/body/base/repo/full_name",
+            json!("Acme/widgets"),
+            "Current PR head, base branch",
+        ),
+        (
+            2,
+            "/body/head/sha",
+            json!(oid(11)),
+            "Selected PR #1 head, base branch",
+        ),
+        (
+            2,
+            "/body/head/ref",
+            json!("renamed"),
+            "Selected PR #1 head, base branch",
+        ),
+        (
+            2,
+            "/body/head/repo/full_name",
+            json!("fork/widgets"),
+            "Selected PR #1 head, base branch",
+        ),
+        (
+            2,
+            "/body/base/sha",
+            json!(oid(2)),
+            "Selected PR #1 head, base branch",
+        ),
+        (
+            2,
+            "/body/base/ref",
+            json!("retargeted-at-same-sha"),
+            "Selected PR #1 head, base branch",
+        ),
+        (
+            2,
+            "/body/user/login",
+            json!("someone-else"),
+            "Selected PR #1 head, base branch",
+        ),
+        (
+            1,
+            "/body/state",
+            json!("closed"),
+            "must be open and not merged",
+        ),
+        (
+            2,
+            "/body/state",
+            json!("closed"),
+            "must be open and not merged",
+        ),
+        (
+            2,
+            "/body/merged",
+            json!(true),
+            "must be open and not merged",
+        ),
+        (
+            1,
+            "/body/merged_at",
+            json!("2026-01-01"),
+            "must be open and not merged",
+        ),
+        (
+            2,
+            "/body/head/repo",
+            Value::Null,
+            "head repository was deleted",
+        ),
+    ] {
+        let mut p = cached_navigation_plan(&current, &parent, all.clone());
+        let steps = p["steps"].as_array_mut().unwrap();
+        let index = steps.len() - 4 + offset;
+        *steps[index].pointer_mut(path).unwrap() = replacement;
+        rejected(p, message)?;
+    }
+    // A target read that already differs from the cached entry is not accepted,
+    // even if later live reads would agree with that changed target.
+    let mut changed = parent.clone();
+    changed["head"]["sha"] = json!(oid(11));
+    rejected(
+        cached_navigation_plan(&current, &changed, all.clone()),
+        "Selected PR #1 changed since stack discovery",
+    )?;
+    let mut p = cached_navigation_plan(&current, &parent, all.clone());
+    p["client_host"] = json!("elsewhere.example");
+    rejected(p, "does not match this client")?;
+    rejected(
+        cached_navigation_plan(&current, &current, all),
+        "not an adjacent stack candidate",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn cached_navigation_keeps_cached_choices_until_full_refresh() -> Result<()> {
+    let current = pr(1, "one", "main", 10, 1);
+    let selected = pr(2, "two", "one", 20, 10);
+    let added = pr(3, "three", "one", 30, 10);
+    let all = vec![current.clone(), selected.clone()];
+    // The fast path intentionally never requests a new listing. Changes elsewhere
+    // cannot prevent checking this exact, unchanged edge.
+    let result = success(cached_navigation_plan(&current, &selected, all.clone()))?;
+    assert_eq!(result["children"], json!([2]));
+    let fresh = vec![current.clone(), selected, added];
+    let result = success(plan(&current, vec![fresh.clone()], fresh))?;
+    assert_eq!(result["children"], json!([2, 3]));
     Ok(())
 }
 

@@ -18,6 +18,8 @@ const VERSION: u32 = 1;
 const STATE_PATH: &str = "scratch/zed-pr-review";
 const CLEANUP_FILE: &str = "cleanup.json";
 const CANCELLED_FILE: &str = "cancelled.json";
+const PREPARED_FILE: &str = "prepared.json";
+const STAGING_PREFIX: &str = "staging-";
 
 #[derive(Debug)]
 pub struct Session {
@@ -39,6 +41,9 @@ struct Manifest {
     directory: PathBuf,
     pr: PullRequest,
     merge_base: String,
+    // Old manifests recorded only has_patch, not the GitHub patch contents.
+    #[serde(default)]
+    patches_cached: bool,
     files: Vec<ManifestFile>,
 }
 
@@ -49,6 +54,8 @@ struct ManifestFile {
     status: String,
     previous_filename: Option<String>,
     has_patch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    patch: Option<String>,
     binary: bool,
     base: Option<Snapshot>,
     head: Option<Snapshot>,
@@ -103,17 +110,29 @@ impl Session {
     /// to match. Before commenting, the caller must verify the current PR and
     /// require jj @ to be its pinned head or an unchanged single-parent child.
     pub fn prepare(client: &Client, store: &Store, pr: &PullRequest) -> Result<Self> {
-        let root = workspace_root(&client.root)?;
-        let merge_base = client.merge_base(pr)?;
         let files = client.files(pr.number)?;
-        let session = create_session(&root, store, pr, &merge_base, &files, |sha, path| {
-            client.blob(sha, path)
-        })?;
+        let session = Self::prepare_local(client, store, pr, &files)?;
         ensure!(
             pr.same_revision(&client.read_pr(pr.number)?),
             "PR changed while preparing the full diff; prepare a new session"
         );
         Ok(session)
+    }
+
+    /// Build from already-fetched metadata and objects without network calls.
+    /// The caller must recheck PR pins after reading `files`, before calling this.
+    /// Background preparation uses this to keep network waits outside draft locks.
+    pub fn prepare_local(
+        client: &Client,
+        store: &Store,
+        pr: &PullRequest,
+        files: &[ChangedFile],
+    ) -> Result<Self> {
+        let root = workspace_root(&client.root)?;
+        let merge_base = client.merge_base(pr)?;
+        create_session(&root, store, pr, &merge_base, files, |sha, path| {
+            client.blob(sha, path)
+        })
     }
 
     pub fn head_root(&self) -> PathBuf {
@@ -124,6 +143,13 @@ impl Session {
     /// a repository filename. Never resolve an external file by its contents.
     pub fn selection_path(&self, file: &Path) -> Result<String> {
         self.validate()?;
+        Ok(self.checked_selection(file)?.repository_path.clone())
+    }
+
+    // The caller already validated the complete session. Keep exact RHS mapping
+    // checks here so load_for_file does not load and hash every snapshot twice.
+    fn checked_selection(&self, file: &Path) -> Result<&Snapshot> {
+        self.require_live()?;
         check_path(&self.root, file, false)?;
         // Keep the existing selection validator, including its no-symlink rule.
         let relative = repo_path(&self.head_root(), file)?;
@@ -138,7 +164,97 @@ impl Session {
             relative == snapshot.repository_path,
             "RHS snapshot does not mirror its repository filename"
         );
-        Ok(snapshot.repository_path.clone())
+        Ok(snapshot)
+    }
+
+    /// Cached GitHub metadata, including files whose patch is absent or empty.
+    /// None means a legacy manifest: the caller must obtain patches elsewhere.
+    /// This reads the loaded manifest only; it does not revalidate the session.
+    pub fn comment_files(&self) -> Option<Vec<ChangedFile>> {
+        self.manifest.patches_cached.then(|| {
+            self.manifest
+                .files
+                .iter()
+                .map(|file| ChangedFile {
+                    filename: file.filename.clone(),
+                    status: file.status.clone(),
+                    previous_filename: file.previous_filename.clone(),
+                    patch: file.patch.clone(),
+                })
+                .collect()
+        })
+    }
+
+    /// Local data for a comment prompt: repository path, pinned head bytes, and
+    /// cached GitHub files (None for legacy manifests).
+    ///
+    /// The caller must have just fully loaded this session with load_for_file,
+    /// or called validate. This checks the exact RHS mapping, selected bytes'
+    /// digest, immutable manifest, and live markers without rescanning unrelated
+    /// snapshots. After user input, use selection_path/validate again. This is
+    /// not a replacement for full validation before saving or submitting.
+    pub fn comment_data(&self, file: &Path) -> Result<(String, Vec<u8>, Option<Vec<ChangedFile>>)> {
+        self.check_identity()?;
+        let snapshot = self.checked_selection(file)?;
+        let bytes = fs::read(file).context("Cannot read selected head snapshot")?;
+        ensure!(
+            digest(&bytes) == snapshot.sha256,
+            "Snapshot content changed: {}; prepare a new diff",
+            file.display()
+        );
+        let manifest_path = self.directory.join("manifest.json");
+        check_path(&self.root, &manifest_path, false)?;
+        ensure!(
+            digest(&fs::read(manifest_path)?) == self.manifest_sha256,
+            "Session manifest changed; prepare a new diff instead of reusing these snapshots"
+        );
+        ensure!(
+            !exists_without_following(&self.directory.join(CANCELLED_FILE))?,
+            "This local review was cancelled; reopen the PR for a new review"
+        );
+        ensure!(
+            !exists_without_following(&self.directory.join(CLEANUP_FILE))?,
+            "Review snapshots were cleaned after submission; reopen the PR to prepare a new diff"
+        );
+        Ok((
+            snapshot.repository_path.clone(),
+            bytes,
+            self.comment_files(),
+        ))
+    }
+
+    /// Remember a fully validated session for this PR/reviewer without changing
+    /// the active session or draft. Call only after a successful prepare/open.
+    pub fn remember(&self, store: &Store) -> Result<()> {
+        self.validate()?;
+        ensure!(
+            exact_path(
+                &store.directory,
+                &self.root.join(STATE_PATH).join(draft_key(&self.pr))
+            ),
+            "Prepared session requires the exact local store for this PR and reviewer"
+        );
+        check_path(&self.root, &store.directory, true)?;
+        let path = store.directory.join(PREPARED_FILE);
+        if exists_without_following(&path)? {
+            check_path(&self.root, &path, false)?;
+        }
+        store.write_json(
+            PREPARED_FILE,
+            &Active {
+                version: VERSION,
+                root: self.root.clone(),
+                directory: self.directory.clone(),
+                manifest_sha256: self.manifest_sha256.clone(),
+            },
+        )
+    }
+
+    /// Reuse only an intact, live session for exactly the requested revision.
+    /// This local cache is disposable: missing, stale, or corrupt state is a
+    /// miss, never a foreground error. No pointer, draft, or session is changed.
+    pub fn prepared(store: &Store, pr: &PullRequest) -> Result<Option<Self>> {
+        Ok(load_prepared(store, pr).ok())
     }
 
     /// Atomically replace only the active pointer. Existing diff directories
@@ -213,6 +329,16 @@ impl Session {
     /// Require intact, live snapshots; retained cleanup metadata is not enough
     /// to authorize commenting or a new review decision.
     pub fn validate(&self) -> Result<()> {
+        self.check_identity()?;
+        let current = load_directory(&self.root, &self.root.join(STATE_PATH), &self.directory)?;
+        ensure!(
+            current.manifest_sha256 == self.manifest_sha256,
+            "Session manifest changed; prepare a new diff instead of reusing these snapshots"
+        );
+        current.require_live()
+    }
+
+    fn check_identity(&self) -> Result<()> {
         ensure!(
             self.pr == self.manifest.pr
                 && exact_path(&self.root, &self.manifest.root)
@@ -220,14 +346,13 @@ impl Session {
                 && self.merge_base == self.manifest.merge_base,
             "Session identity was altered"
         );
-        let current = load_directory(&self.root, &self.root.join(STATE_PATH), &self.directory)?;
+        Ok(())
+    }
+
+    fn require_live(&self) -> Result<()> {
+        self.require_not_cancelled()?;
         ensure!(
-            current.manifest_sha256 == self.manifest_sha256,
-            "Session manifest changed; prepare a new diff instead of reusing these snapshots"
-        );
-        current.require_not_cancelled()?;
-        ensure!(
-            current.cleanup.is_none(),
+            self.cleanup.is_none(),
             "Review snapshots were cleaned after submission; reopen the PR to prepare a new diff"
         );
         Ok(())
@@ -393,11 +518,50 @@ fn load_for_snapshot(
         session.require_not_cancelled()?;
     }
     if !allow_base {
-        session.selection_path(file)?;
+        session.checked_selection(file)?;
     } else if session.cleanup.is_none() && session.cancelled.is_none() {
         check_path(&root, file, false)?;
     }
     Ok(Some(session))
+}
+
+fn load_prepared(store: &Store, pr: &PullRequest) -> Result<Session> {
+    // Derive the workspace from the locked store, never from the cache pointer.
+    let root = store
+        .directory
+        .ancestors()
+        .nth(3)
+        .context("Prepared session store has no workspace root")?;
+    let state_base = root.join(STATE_PATH);
+    check_state_base(root, &state_base)?;
+    ensure!(
+        exact_path(&store.directory, &state_base.join(draft_key(pr))),
+        "Prepared session requires the exact local store for this PR and reviewer"
+    );
+    let path = store.directory.join(PREPARED_FILE);
+    check_path(root, &path, false)?;
+    let pointer: Active = serde_json::from_slice(&fs::read(path)?)?;
+    ensure!(
+        pointer.version == VERSION,
+        "Unsupported prepared session version"
+    );
+    ensure!(
+        exact_path(&pointer.root, root)
+            && pointer
+                .directory
+                .parent()
+                .is_some_and(|parent| exact_path(parent, &store.directory)),
+        "Prepared session belongs to another workspace or store"
+    );
+    check_digest(&pointer.manifest_sha256)?;
+    let session = load_directory(root, &state_base, &pointer.directory)?;
+    ensure!(
+        session.manifest_sha256 == pointer.manifest_sha256,
+        "Prepared session manifest changed"
+    );
+    session.require_live()?;
+    ensure!(session.pr.same_revision(pr), "Prepared PR revision changed");
+    Ok(session)
 }
 
 pub fn load_active(root: &Path, state_base: &Path) -> Result<Option<Session>> {
@@ -729,12 +893,20 @@ fn create_session(
     check_sha(&pr.head_sha)?;
     check_sha(&pr.base_sha)?;
     check_sha(merge_base)?;
+    // Cleanup enumerates only diff-* directories. A killed builder must leave
+    // staging data, never a partially written session that blocks later cleanup.
     let temporary = tempfile::Builder::new()
-        .prefix("diff-")
+        .prefix(STAGING_PREFIX)
         .tempdir_in(&store.directory)?;
-    let directory = temporary.path().to_path_buf();
-    fs::create_dir(directory.join("base"))?;
-    fs::create_dir(directory.join("head"))?;
+    let staging = temporary.path();
+    let suffix = staging
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(STAGING_PREFIX))
+        .context("Invalid staging directory name")?;
+    let directory = store.directory.join(format!("diff-{suffix}"));
+    fs::create_dir(staging.join("base"))?;
+    fs::create_dir(staging.join("head"))?;
     let mut entries = Vec::new();
     let mut filenames = BTreeSet::new();
     for file in files {
@@ -753,7 +925,7 @@ fn create_session(
                 .with_context(|| format!("Cannot prepare {side} snapshot for {path}"))?;
             binary |= bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
             let relative = format!("{side}/{path}");
-            write_snapshot(root, &directory, &relative, &bytes)?;
+            write_snapshot(root, staging, &relative, &bytes)?;
             Ok(Snapshot {
                 path: relative,
                 repository_path: path.to_owned(),
@@ -774,6 +946,7 @@ fn create_session(
                 .patch
                 .as_ref()
                 .is_some_and(|patch| !patch.trim().is_empty()),
+            patch: file.patch.clone(),
             binary,
             base,
             head,
@@ -785,14 +958,37 @@ fn create_session(
         directory: directory.clone(),
         pr: pr.clone(),
         merge_base: merge_base.to_owned(),
+        patches_cached: true,
         files: entries,
     };
     let mut bytes = serde_json::to_vec_pretty(&manifest)?;
     bytes.push(b'\n');
-    write_snapshot(root, &directory, "manifest.json", &bytes)?;
-    let session = load_directory(root, &state_base, &directory)?;
-    // Publish only complete sessions. A later PR recheck can fail, but such a
-    // session stays inactive and cannot replace the session in an existing tab.
+    write_snapshot(root, staging, "manifest.json", &bytes)?;
+    let session = load_directory_from(root, &state_base, &directory, staging)?;
+    session.require_live()?;
+    // The Store lock serializes publication. Never replace an existing session,
+    // even in the unlikely event that a random suffix is reused.
+    ensure!(
+        !exists_without_following(&directory)?,
+        "Session destination already exists; no snapshots were replaced"
+    );
+    fs::rename(staging, &directory).context("Cannot publish prepared snapshots")?;
+    let published = (|| -> Result<()> {
+        check_path(root, &directory, true)?;
+        #[cfg(unix)]
+        File::open(&store.directory)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = published {
+        // Move back before TempDir removes files, so interruption during error
+        // cleanup cannot expose a partially removed diff-* directory either.
+        fs::rename(&directory, staging).with_context(|| {
+            format!("Cannot withdraw session after publication failed: {error:#}")
+        })?;
+        return Err(error);
+    }
+    // A later PR recheck can fail, but the published session is complete and
+    // inactive. Existing tabs and pointers remain unchanged.
     let _ = temporary.keep();
     Ok(session)
 }
@@ -831,6 +1027,18 @@ fn sides<'a>(
 }
 
 fn load_directory(root: &Path, state_base: &Path, directory: &Path) -> Result<Session> {
+    load_directory_from(root, state_base, directory, directory)
+}
+
+// Only creation supplies separate staging contents. The manifest and returned
+// identity always name the final diff-* directory; ordinary loaders cannot use
+// a staging directory as a session or relax any snapshot/path validation.
+fn load_directory_from(
+    root: &Path,
+    state_base: &Path,
+    directory: &Path,
+    contents: &Path,
+) -> Result<Session> {
     check_state_base(root, state_base)?;
     let relative = directory
         .strip_prefix(state_base)
@@ -849,8 +1057,20 @@ fn load_directory(root: &Path, state_base: &Path, directory: &Path) -> Result<Se
                 .all(|c| c.is_ascii_alphanumeric() || c == b'-'),
         "Invalid session directory layout; expected <draft-key>/diff-<unique>"
     );
-    check_path(root, directory, true)?;
-    let path = directory.join("manifest.json");
+    if !exact_path(directory, contents) {
+        let suffix = components[1].strip_prefix("diff-").unwrap();
+        ensure!(
+            exact_path(
+                contents,
+                &state_base
+                    .join(components[0])
+                    .join(format!("{STAGING_PREFIX}{suffix}"))
+            ),
+            "Staging directory does not match the final session path"
+        );
+    }
+    check_path(root, contents, true)?;
+    let path = contents.join("manifest.json");
     check_path(root, &path, false)?;
     let bytes = fs::read(&path).context("Cannot read session manifest")?;
     let manifest: Manifest = serde_json::from_slice(&bytes).context("Invalid session manifest")?;
@@ -874,7 +1094,7 @@ fn load_directory(root: &Path, state_base: &Path, directory: &Path) -> Result<Se
     check_sha(&manifest.pr.base_sha)?;
     check_sha(&manifest.merge_base)?;
     let manifest_sha256 = digest(&bytes);
-    let cleanup_path = directory.join(CLEANUP_FILE);
+    let cleanup_path = contents.join(CLEANUP_FILE);
     let cleanup = if exists_without_following(&cleanup_path)? {
         check_path(root, &cleanup_path, false)?;
         let cleanup: Cleanup = serde_json::from_slice(&fs::read(&cleanup_path)?)
@@ -893,7 +1113,7 @@ fn load_directory(root: &Path, state_base: &Path, directory: &Path) -> Result<Se
     } else {
         None
     };
-    let cancelled_path = directory.join(CANCELLED_FILE);
+    let cancelled_path = contents.join(CANCELLED_FILE);
     let cancelled = if exists_without_following(&cancelled_path)? {
         check_path(root, &cancelled_path, false)?;
         let cancelled: Cancelled = serde_json::from_slice(&fs::read(&cancelled_path)?)
@@ -926,8 +1146,8 @@ fn load_directory(root: &Path, state_base: &Path, directory: &Path) -> Result<Se
     let mut actual_dirs = BTreeSet::new();
     inventory(
         root,
-        directory,
-        directory,
+        contents,
+        contents,
         &mut actual_files,
         &mut actual_dirs,
     )?;
@@ -944,6 +1164,18 @@ fn load_directory(root: &Path, state_base: &Path, directory: &Path) -> Result<Se
         ensure!(
             filenames.insert(&file.filename),
             "Duplicate manifest filename"
+        );
+        ensure!(
+            if manifest.patches_cached {
+                file.has_patch
+                    == file
+                        .patch
+                        .as_ref()
+                        .is_some_and(|patch| !patch.trim().is_empty())
+            } else {
+                file.patch.is_none()
+            },
+            "Inconsistent cached GitHub patch metadata"
         );
         let (base, head) = sides(
             &file.filename,
@@ -984,7 +1216,7 @@ fn load_directory(root: &Path, state_base: &Path, directory: &Path) -> Result<Se
                     complete = false;
                     continue;
                 }
-                let path = directory.join(&snapshot.path);
+                let path = contents.join(&snapshot.path);
                 check_path(root, &path, false)?;
                 let content = fs::read(&path)?;
                 ensure!(
@@ -2909,6 +3141,663 @@ mod tests {
         );
     }
 
+    fn staging_directories(store: &Store) -> Vec<PathBuf> {
+        fs::read_dir(&store.directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(STAGING_PREFIX)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn snapshots_are_staged_then_published_with_final_manifest_binding() {
+        let f = Fixture::new();
+        let mut stage = None;
+        let mut reads = 0;
+        let session = create_session(
+            &f.root,
+            &f.store,
+            &pr(),
+            &"c".repeat(40),
+            &[changed("src/example.rs", "modified", None)],
+            |_, _| {
+                reads += 1;
+                let stages = staging_directories(&f.store);
+                assert_eq!(stages.len(), 1);
+                assert!(
+                    load_store_sessions(&f.root, &f.state, &f.store.directory)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(Session::prepared(&f.store, &pr()).unwrap().is_none());
+                assert!(load_directory(&f.root, &f.state, &stages[0]).is_err());
+                if reads == 2 {
+                    assert_eq!(
+                        fs::read(stages[0].join("base/src/example.rs")).unwrap(),
+                        b"new\n"
+                    );
+                }
+                stage = Some(stages[0].clone());
+                Ok(b"new\n".to_vec())
+            },
+        )
+        .unwrap();
+        assert_eq!(reads, 2);
+        let stage = stage.unwrap();
+        assert!(!stage.exists());
+        assert!(staging_directories(&f.store).is_empty());
+        let suffix = stage
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .strip_prefix(STAGING_PREFIX)
+            .unwrap();
+        assert_eq!(
+            session.directory,
+            f.store.directory.join(format!("diff-{suffix}"))
+        );
+        let manifest: Manifest =
+            serde_json::from_slice(&fs::read(session.directory.join("manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest.directory, session.directory);
+        assert_eq!(manifest, session.manifest);
+        session.validate().unwrap();
+        session.remember(&f.store).unwrap();
+        let cached = Session::prepared(&f.store, &pr()).unwrap().unwrap();
+        assert_eq!(cached.directory, session.directory);
+        assert_eq!(cached.manifest_sha256, session.manifest_sha256);
+        assert_eq!(
+            cached
+                .selection_path(&cached.head_root().join("src/example.rs"))
+                .unwrap(),
+            "src/example.rs"
+        );
+        assert_eq!(
+            load_store_sessions(&f.root, &f.state, &f.store.directory)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!f.state.join("active.json").exists());
+        assert!(f.store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn staging_is_removed_on_blob_or_full_validation_failure() {
+        for failure in ["first_blob", "second_blob", "validation"] {
+            let f = Fixture::new();
+            let before: BTreeSet<_> = fs::read_dir(&f.store.directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            let mut reads = 0;
+            let result = create_session(
+                &f.root,
+                &f.store,
+                &pr(),
+                &"c".repeat(40),
+                &[changed("src/example.rs", "modified", None)],
+                |_, _| {
+                    reads += 1;
+                    assert!(
+                        load_store_sessions(&f.root, &f.state, &f.store.directory)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    if failure == "first_blob" || (failure == "second_blob" && reads == 2) {
+                        bail!("Interrupted blob read");
+                    }
+                    if failure == "validation" && reads == 2 {
+                        let stages = staging_directories(&f.store);
+                        replace(&stages[0].join("base/src/example.rs"), b"changed\n");
+                    }
+                    Ok(b"new\n".to_vec())
+                },
+            );
+            assert!(result.is_err(), "{failure}");
+            assert!(staging_directories(&f.store).is_empty(), "{failure}");
+            let after: BTreeSet<_> = fs::read_dir(&f.store.directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(after, before, "{failure}");
+            assert!(
+                load_store_sessions(&f.root, &f.state, &f.store.directory)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn staging_publication_never_replaces_an_existing_destination() {
+        let f = Fixture::new();
+        let mut destination = None;
+        let result = create_session(
+            &f.root,
+            &f.store,
+            &pr(),
+            &"c".repeat(40),
+            &[changed("example.rs", "added", None)],
+            |_, _| {
+                let stages = staging_directories(&f.store);
+                let suffix = stages[0]
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .strip_prefix(STAGING_PREFIX)
+                    .unwrap();
+                let path = f.store.directory.join(format!("diff-{suffix}"));
+                // Even an empty existing directory must not be overwritten by rename.
+                fs::create_dir(&path).unwrap();
+                destination = Some(path);
+                Ok(b"new\n".to_vec())
+            },
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("destination already exists")
+        );
+        let destination = destination.unwrap();
+        assert!(destination.is_dir());
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+        assert!(staging_directories(&f.store).is_empty());
+    }
+
+    #[test]
+    fn interrupted_staging_directories_do_not_block_cancellation_or_submitted_cleanup() {
+        for cancel in [false, true] {
+            let f = Fixture::new();
+            let session = f.session();
+            session.remember(&f.store).unwrap();
+            session.activate(&f.state).unwrap();
+            let mut stages = Vec::new();
+            for phase in ["empty", "base", "manifest", "complete"] {
+                // Model process termination at several write boundaries by retaining
+                // staging directories instead of allowing TempDir to remove them.
+                let staging = tempfile::Builder::new()
+                    .prefix(STAGING_PREFIX)
+                    .tempdir_in(&f.store.directory)
+                    .unwrap()
+                    .keep();
+                if phase != "empty" {
+                    fs::create_dir(staging.join("base")).unwrap();
+                    fs::create_dir(staging.join("head")).unwrap();
+                    write_snapshot(&f.root, &staging, "base/src/example.rs", b"old\n").unwrap();
+                }
+                if phase == "manifest" {
+                    fs::write(staging.join("manifest.json"), b"{partial manifest").unwrap();
+                }
+                if phase == "complete" {
+                    write_snapshot(&f.root, &staging, "head/src/example.rs", b"new\n").unwrap();
+                    let suffix = staging
+                        .file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .strip_prefix(STAGING_PREFIX)
+                        .unwrap();
+                    let mut manifest = session.manifest.clone();
+                    manifest.directory = f.store.directory.join(format!("diff-{suffix}"));
+                    write_snapshot(
+                        &f.root,
+                        &staging,
+                        "manifest.json",
+                        &serde_json::to_vec(&manifest).unwrap(),
+                    )
+                    .unwrap();
+                    load_directory_from(&f.root, &f.state, &manifest.directory, &staging).unwrap();
+                }
+                assert!(load_directory(&f.root, &f.state, &staging).is_err());
+                let mut files = BTreeSet::new();
+                let mut directories = BTreeSet::new();
+                inventory(&f.root, &staging, &staging, &mut files, &mut directories).unwrap();
+                let bytes: Vec<_> = files
+                    .into_iter()
+                    .map(|file| {
+                        let bytes = fs::read(staging.join(&file)).unwrap();
+                        (file, bytes)
+                    })
+                    .collect();
+                stages.push((staging, directories, bytes));
+            }
+            assert_eq!(
+                load_store_sessions(&f.root, &f.state, &f.store.directory)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                Session::prepared(&f.store, &pr())
+                    .unwrap()
+                    .unwrap()
+                    .directory,
+                session.directory
+            );
+            if cancel {
+                let draft = Draft::new(pr());
+                f.store.save(&draft).unwrap();
+                assert_eq!(cancel_review(&f.root, &f.store, &draft).unwrap(), 1);
+                assert_eq!(cancel_review(&f.root, &f.store, &draft).unwrap(), 0);
+            } else {
+                let draft = f.submitted("APPROVED");
+                assert_eq!(cleanup_submitted(&f.root, &f.store, &draft).unwrap(), 1);
+                assert_eq!(cleanup_submitted(&f.root, &f.store, &draft).unwrap(), 0);
+            }
+            assert!(!session.head_root().exists());
+            assert!(Session::prepared(&f.store, &pr()).unwrap().is_none());
+            assert_eq!(
+                load_store_sessions(&f.root, &f.state, &f.store.directory)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            for (staging, original_dirs, bytes) in stages {
+                let mut files = BTreeSet::new();
+                let mut directories = BTreeSet::new();
+                inventory(&f.root, &staging, &staging, &mut files, &mut directories).unwrap();
+                assert_eq!(directories, original_dirs);
+                assert_eq!(files, bytes.iter().map(|(file, _)| file.clone()).collect());
+                for (file, original) in bytes {
+                    assert_eq!(fs::read(staging.join(file)).unwrap(), original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_patches_preserve_absent_empty_and_renamed_files() {
+        let f = Fixture::new();
+        let mut files = vec![
+            changed("src/example.rs", "modified", None),
+            changed("new.rs", "renamed", Some("old.rs")),
+            changed("empty.rs", "added", None),
+        ];
+        files[1].patch = None;
+        files[2].patch = Some(" \n".into());
+        let session = f.with_files(&pr(), &files);
+        let loaded = load_directory(&f.root, &f.state, &session.directory).unwrap();
+        assert_eq!(loaded.comment_files(), Some(files));
+        assert!(!loaded.manifest.files[1].has_patch);
+        assert!(!loaded.manifest.files[2].has_patch);
+        let empty = f.with_files(&pr(), &[]);
+        assert_eq!(empty.comment_files(), Some(vec![]));
+        empty.remember(&f.store).unwrap();
+        assert_eq!(
+            Session::prepared(&f.store, &pr())
+                .unwrap()
+                .unwrap()
+                .directory,
+            empty.directory
+        );
+    }
+
+    #[test]
+    fn legacy_manifests_load_but_require_patch_fallback() {
+        for files in [vec![], vec![changed("src/example.rs", "modified", None)]] {
+            let f = Fixture::new();
+            let session = f.with_files(&pr(), &files);
+            let path = session.directory.join("manifest.json");
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            manifest.as_object_mut().unwrap().remove("patches_cached");
+            for file in manifest["files"].as_array_mut().unwrap() {
+                file.as_object_mut().unwrap().remove("patch");
+            }
+            replace(&path, &serde_json::to_vec(&manifest).unwrap());
+            let loaded = load_directory(&f.root, &f.state, &session.directory).unwrap();
+            assert!(loaded.comment_files().is_none());
+            loaded.remember(&f.store).unwrap();
+            let cached = Session::prepared(&f.store, &pr()).unwrap().unwrap();
+            assert!(cached.comment_files().is_none());
+            if !files.is_empty() {
+                let (path, bytes, files) = cached
+                    .comment_data(&cached.head_root().join("src/example.rs"))
+                    .unwrap();
+                assert_eq!(path, "src/example.rs");
+                assert_eq!(bytes, b"new\n");
+                assert!(files.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn cached_patch_flag_and_has_patch_must_agree() {
+        for field in ["patch", "has_patch", "patches_cached"] {
+            let f = Fixture::new();
+            let session = f.session();
+            change_manifest(&session, |manifest| match field {
+                "patch" => manifest.files[0].patch = None,
+                "has_patch" => manifest.files[0].has_patch = false,
+                _ => manifest.patches_cached = false,
+            });
+            assert!(load_directory(&f.root, &f.state, &session.directory).is_err());
+        }
+    }
+
+    #[test]
+    fn prepared_reuses_only_remembered_sessions_without_changing_active_or_draft() {
+        let f = Fixture::new();
+        assert!(Session::prepared(&f.store, &pr()).unwrap().is_none());
+        let first = f.session();
+        assert!(Session::prepared(&f.store, &pr()).unwrap().is_none());
+        first.remember(&f.store).unwrap();
+        assert!(!f.state.join("active.json").exists());
+        assert!(f.store.load().unwrap().is_none());
+        first.activate(&f.state).unwrap();
+        f.store.save(&Draft::new(pr())).unwrap();
+        let active = fs::read(f.state.join("active.json")).unwrap();
+        let draft = fs::read(f.store.directory.join("draft.json")).unwrap();
+        let second = f.session();
+        assert_ne!(first.directory, second.directory);
+        for expected in [&first, &second] {
+            expected.remember(&f.store).unwrap();
+            let pointer = fs::read(f.store.directory.join(PREPARED_FILE)).unwrap();
+            let mut current = pr();
+            current.title = "A title change is not a new revision".into();
+            let cached = Session::prepared(&f.store, &current).unwrap().unwrap();
+            assert_eq!(cached.directory, expected.directory);
+            assert_eq!(cached.manifest_sha256, expected.manifest_sha256);
+            assert_eq!(
+                fs::read(f.store.directory.join(PREPARED_FILE)).unwrap(),
+                pointer
+            );
+            assert_eq!(fs::read(f.state.join("active.json")).unwrap(), active);
+            assert_eq!(
+                fs::read(f.store.directory.join("draft.json")).unwrap(),
+                draft
+            );
+        }
+        assert!(archives(&f.store).is_empty());
+        assert_eq!(
+            load_store_sessions(&f.root, &f.state, &f.store.directory)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn prepared_requires_same_revision_and_store() {
+        let f = Fixture::new();
+        let session = f.session();
+        session.remember(&f.store).unwrap();
+        for field in [
+            "host",
+            "repo",
+            "number",
+            "head",
+            "base",
+            "head_repo",
+            "head_ref",
+            "reviewer",
+        ] {
+            let mut current = pr();
+            match field {
+                "host" => current.host = "elsewhere.example".into(),
+                "repo" => current.repo = "other/repo".into(),
+                "number" => current.number += 1,
+                "head" => current.head_sha = "d".repeat(40),
+                "base" => current.base_sha = "e".repeat(40),
+                "head_repo" => current.head_repo = "other/fork".into(),
+                "head_ref" => current.head_ref = "other-topic".into(),
+                _ => current.reviewer = "another".into(),
+            }
+            assert!(
+                Session::prepared(&f.store, &current).unwrap().is_none(),
+                "{field}"
+            );
+        }
+        let mut other = pr();
+        other.number += 1;
+        let other_store = Store::open(&f.state, &other).unwrap();
+        assert!(session.remember(&other_store).is_err());
+        fs::copy(
+            f.store.directory.join(PREPARED_FILE),
+            other_store.directory.join(PREPARED_FILE),
+        )
+        .unwrap();
+        assert!(Session::prepared(&other_store, &other).unwrap().is_none());
+        assert!(Session::prepared(&other_store, &pr()).unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_prepared_pointers_are_read_only_misses_and_can_be_replaced() {
+        let f = Fixture::new();
+        let session = f.session();
+        session.remember(&f.store).unwrap();
+        let path = f.store.directory.join(PREPARED_FILE);
+        let original: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for field in [
+            "version",
+            "root",
+            "directory",
+            "alias",
+            "manifest_sha256",
+            "unknown",
+            "json",
+        ] {
+            let mut pointer = original.clone();
+            match field {
+                "version" => pointer["version"] = 99.into(),
+                "root" => pointer["root"] = f.root.join("other").to_str().unwrap().into(),
+                "directory" => {
+                    pointer["directory"] = f
+                        .store
+                        .directory
+                        .join("diff-missing")
+                        .to_str()
+                        .unwrap()
+                        .into()
+                }
+                "alias" => {
+                    pointer["directory"] = format!("{}/head/..", session.directory.display()).into()
+                }
+                "manifest_sha256" => pointer["manifest_sha256"] = "0".repeat(64).into(),
+                _ => pointer["unknown"] = true.into(),
+            }
+            let bytes = if field == "json" {
+                b"{broken JSON".to_vec()
+            } else {
+                serde_json::to_vec(&pointer).unwrap()
+            };
+            fs::write(&path, &bytes).unwrap();
+            assert!(
+                Session::prepared(&f.store, &pr()).unwrap().is_none(),
+                "{field}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        session.remember(&f.store).unwrap();
+        assert!(Session::prepared(&f.store, &pr()).unwrap().is_some());
+        // An unrelated corrupt active pointer cannot invalidate a prepared hit.
+        fs::write(f.state.join("active.json"), b"{broken JSON").unwrap();
+        assert!(Session::prepared(&f.store, &pr()).unwrap().is_some());
+        fs::remove_file(&path).unwrap();
+        assert!(Session::prepared(&f.store, &pr()).unwrap().is_none());
+    }
+
+    #[test]
+    fn prepared_validates_the_whole_session_before_reuse() {
+        for damage in [
+            "base",
+            "head",
+            "missing",
+            "manifest",
+            "missing_manifest",
+            "directory",
+            "extra",
+        ] {
+            let f = Fixture::new();
+            let session = f.session();
+            session.remember(&f.store).unwrap();
+            match damage {
+                "base" | "head" => replace(
+                    &session.directory.join(damage).join("src/example.rs"),
+                    b"edited\n",
+                ),
+                "missing" => fs::remove_file(session.head_root().join("src/example.rs")).unwrap(),
+                "manifest" => {
+                    change_manifest(&session, |manifest| manifest.pr.title = "Changed".into())
+                }
+                "missing_manifest" => {
+                    fs::remove_file(session.directory.join("manifest.json")).unwrap()
+                }
+                "directory" => fs::remove_dir_all(&session.directory).unwrap(),
+                _ => fs::write(session.head_root().join("unregistered.rs"), b"new\n").unwrap(),
+            }
+            assert!(
+                Session::prepared(&f.store, &pr()).unwrap().is_none(),
+                "{damage}"
+            );
+            assert!(session.remember(&f.store).is_err(), "{damage}");
+        }
+    }
+
+    #[test]
+    fn prepared_does_not_reuse_cancelled_or_cleaned_sessions_even_before_deletion() {
+        for cancel in [false, true] {
+            let f = Fixture::new();
+            let session = f.session();
+            session.remember(&f.store).unwrap();
+            let draft = if cancel {
+                Draft::new(pr())
+            } else {
+                f.submitted("APPROVED")
+            };
+            if cancel {
+                mark_cancelled(&f, &session, &draft);
+            } else {
+                write_cleanup(&session, &f.store, draft.submitted.as_ref().unwrap()).unwrap();
+            }
+            assert!(session.head_root().join("src/example.rs").is_file());
+            assert!(Session::prepared(&f.store, &pr()).unwrap().is_none());
+            assert!(session.remember(&f.store).is_err());
+            if cancel {
+                cancel_review(&f.root, &f.store, &draft).unwrap();
+            } else {
+                cleanup_submitted(&f.root, &f.store, &draft).unwrap();
+            }
+            assert!(!session.head_root().exists());
+            assert!(Session::prepared(&f.store, &pr()).unwrap().is_none());
+            let fresh = f.session();
+            fresh.remember(&f.store).unwrap();
+            assert_eq!(
+                Session::prepared(&f.store, &pr())
+                    .unwrap()
+                    .unwrap()
+                    .directory,
+                fresh.directory
+            );
+        }
+    }
+
+    #[test]
+    fn local_comment_data_checks_selected_bytes_manifest_and_liveness() {
+        for damage in [
+            "content",
+            "missing",
+            "manifest",
+            "missing_manifest",
+            "cancelled",
+            "cleaned",
+            "identity",
+        ] {
+            let f = Fixture::new();
+            let session = f.session();
+            let file = session.head_root().join("src/example.rs");
+            let mut loaded = load_for_file(&f.root, &f.state, &file).unwrap().unwrap();
+            assert_eq!(
+                loaded.comment_data(&file).unwrap(),
+                (
+                    "src/example.rs".into(),
+                    b"new\n".to_vec(),
+                    loaded.comment_files()
+                )
+            );
+            match damage {
+                "content" => replace(&file, b"edited\n"),
+                "missing" => fs::remove_file(&file).unwrap(),
+                "manifest" => change_manifest(&session, |manifest| manifest.files[0].patch = None),
+                "missing_manifest" => {
+                    fs::remove_file(session.directory.join("manifest.json")).unwrap()
+                }
+                // Even invalid markers cannot authorize using a loaded live session.
+                "cancelled" => fs::write(session.directory.join(CANCELLED_FILE), b"{}").unwrap(),
+                "cleaned" => fs::write(session.directory.join(CLEANUP_FILE), b"{}").unwrap(),
+                _ => loaded.pr.head_sha = "d".repeat(40),
+            }
+            assert!(loaded.comment_data(&file).is_err(), "{damage}");
+        }
+    }
+
+    #[test]
+    fn local_comment_data_requires_exact_registered_rhs_mapping() {
+        let f = Fixture::new();
+        let session = f.session();
+        let ordinary = f.root.join("ordinary.rs");
+        fs::write(&ordinary, b"new\n").unwrap();
+        for path in [
+            ordinary,
+            session.directory.join("base/src/example.rs"),
+            session.directory.join("manifest.json"),
+            session.head_root().join("missing.rs"),
+            PathBuf::from(format!(
+                "{}/head/./src/example.rs",
+                session.directory.display()
+            )),
+            PathBuf::from(format!(
+                "{}/head//src/example.rs",
+                session.directory.display()
+            )),
+        ] {
+            assert!(session.comment_data(&path).is_err(), "{}", path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_and_local_comment_data_reject_symlinks_and_hardlinks() {
+        use std::os::unix::fs::symlink;
+
+        for pointer in [false, true] {
+            for hardlink in [false, true] {
+                let f = Fixture::new();
+                let session = f.session();
+                session.remember(&f.store).unwrap();
+                let file = session.head_root().join("src/example.rs");
+                let path = if pointer {
+                    f.store.directory.join(PREPARED_FILE)
+                } else {
+                    file.clone()
+                };
+                let source = f.root.join("linked-source");
+                fs::copy(&path, &source).unwrap();
+                fs::remove_file(&path).unwrap();
+                if hardlink {
+                    fs::hard_link(&source, &path).unwrap();
+                } else {
+                    symlink(&source, &path).unwrap();
+                }
+                assert!(Session::prepared(&f.store, &pr()).unwrap().is_none());
+                assert!(session.remember(&f.store).is_err());
+                if !pointer {
+                    assert!(session.comment_data(&file).is_err());
+                }
+            }
+        }
+    }
+
     #[test]
     fn manifest_round_trip_maps_only_exact_rhs_filenames() {
         let f = Fixture::new();
@@ -3197,12 +4086,13 @@ mod tests {
             column: 1,
             text: "new".into(),
         };
-        let mut files = [changed("src/example.rs", "modified", None)];
-        let mapped = session.selection_path(&selection.file).unwrap();
+        let (mapped, blob, files) = session.comment_data(&selection.file).unwrap();
+        let mut files = files.unwrap();
+        assert_eq!(mapped, session.selection_path(&selection.file).unwrap());
         let comment = make_comment(
             &session.head_root(),
             &selection,
-            b"new\n",
+            &blob,
             &files,
             "Feedback".into(),
         )

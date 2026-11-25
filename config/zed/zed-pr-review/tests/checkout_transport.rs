@@ -3,11 +3,12 @@
 //! Its Git shim substitutes local bare repositories for the two allowed HTTPS URLs;
 //! the real Git still performs every fetch, ref update, and object import.
 
+mod support;
+
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use zed_pr_review::github::{Client, workspace_root};
@@ -90,13 +91,19 @@ impl Fixture {
         f.common = f.commit("common\n", None)?;
         f.head = f.commit("fork head\n", Some(&f.common))?;
         f.base = f.commit("base diverged\n", Some(&f.common))?;
-        for (reference, sha) in [
-            ("refs/heads/main", &f.base),
-            ("refs/heads/feature/topic", &f.base),
-            ("refs/pull/42/head", &f.head),
-        ] {
-            f.git(&["update-ref", reference, sha])?;
-        }
+        output(
+            f.command(&f.real_git)
+                .arg("--no-pager")
+                .arg("--git-dir")
+                .arg(&f.server)
+                .args(["update-ref", "--stdin"]),
+            format!(
+                "update refs/heads/main {base}\nupdate refs/heads/feature/topic {base}\nupdate refs/pull/42/head {head}\n",
+                base = f.base,
+                head = f.head,
+            )
+            .as_bytes(),
+        )?;
         f.jj(&[
             "git",
             "init",
@@ -117,87 +124,15 @@ impl Fixture {
                 "base":{"sha":f.base,"ref":"main","repo":{"full_name":"upstream/project"}}
             }))?,
         )?;
-        let git_shim = r#"#!/usr/bin/env python3
-import json, os, subprocess, sys
-args = sys.argv[1:]
-root = os.environ['ZPR_FIXTURE']
-with open(root + '/git-calls.jsonl', 'a') as f: f.write(json.dumps(args) + '\n')
-def inject_pending(stage):
-    path = root + '/pending-ref.json'
-    if not os.path.exists(path): return
-    change = json.load(open(path))
-    if change['stage'] != stage: return
-    update = ['update-ref', change['reference'], change['target']] if change['target'] else ['update-ref', '-d', change['reference']]
-    subprocess.run([os.environ['ZPR_REAL_GIT'], '--no-pager', '--git-dir', change['git_dir'], '-c', 'core.hooksPath=/dev/null'] + update, check=True)
-    os.rename(path, root + '/injected-ref.json')
-if 'fetch' in args:
-    urls = {'https://github.com/upstream/project.git': '/base.git',
-            'https://github.com/contributor/fork.git': '/fork.git'}
-    requested = [a for a in args if a in urls]
-    assert len(requested) == 1, args
-    expected = requested[0]
-    refspecs = args[args.index('--')+2:]
-    if any(r.startswith('refs/pull/') for r in refspecs):
-        assert expected == 'https://github.com/upstream/project.git'
-        assert len(refspecs) == 2, args
-        assert refspecs[0].startswith('refs/pull/42/head:refs/heads/zed-pr-review/'), args
-        assert refspecs[1].startswith('refs/heads/main:refs/heads/zed-pr-review/'), args
-    else:
-        assert len(refspecs) == 1, args
-        branch = json.load(open(root + '/control.json'))['head']['ref']
-        assert refspecs[0].startswith('refs/heads/' + branch + ':refs/heads/zed-pr-review/'), args
-    assert not any(a.startswith('+') for a in args), args
-    assert os.environ['GIT_ALLOW_PROTOCOL'] == 'https'
-    for flag in ['--atomic', '--no-tags', '--no-prune', '--no-prune-tags', '--refmap=',
-                 '--no-write-fetch-head', '--no-recurse-submodules', '--no-auto-maintenance',
-                 '--no-write-commit-graph', '--no-filter']:
-        assert flag in args, args
-    assert 'http.followRedirects=false' in args and 'core.hooksPath=/dev/null' in args
-    args[args.index(expected)] = root + urls[expected]
-    os.environ['GIT_ALLOW_PROTOCOL'] = 'file'
-    result = subprocess.run([os.environ['ZPR_REAL_GIT']] + args)
-    inject_pending('first')
-    if os.environ.get('ZPR_SCENARIO') == 'api-race':
-        p = root + '/control.json'
-        data = json.load(open(p)); data['base']['ref'] = 'moved'; json.dump(data, open(p, 'w'))
-    sys.exit(result.returncode)
-if 'update-ref' in args and 'refs/remotes/origin/feature/topic' in args:
-    result = subprocess.run([os.environ['ZPR_REAL_GIT']] + args)
-    inject_pending('second')
-    sys.exit(result.returncode)
-if 'ls-remote' in args: assert '--get-url' in args, args
-assert not any(a in ['push', 'pull', 'clone'] for a in args), args
-os.execv(os.environ['ZPR_REAL_GIT'], [os.environ['ZPR_REAL_GIT']] + args)
-"#;
-        let gh_shim = r#"#!/usr/bin/env python3
-import json, os, sys
-args = sys.argv[1:]
-root = os.environ['ZPR_FIXTURE']
-with open(root + '/gh-calls.jsonl', 'a') as f: f.write(json.dumps(args) + '\n')
-if args == ['repo', 'view', '--json', 'nameWithOwner,url']:
-    assert os.path.isdir(os.environ['GIT_DIR'])
-    print(json.dumps({'nameWithOwner':'upstream/project','url':'https://github.com/upstream/project'}))
-elif args[0] == 'api' and '--method' in args and args[args.index('--method')+1] == 'GET':
-    if args[-1] == 'user': print(json.dumps({'login':'reviewer'}))
-    elif args[-1] == 'repos/upstream/project/pulls/42': print(open(root + '/control.json').read())
-    else: raise Exception(args)
-else: raise Exception(args)
-"#;
-        let jj_shim = r#"#!/usr/bin/env python3
-import json, os, subprocess, sys
-args = sys.argv[1:]
-root = os.environ['ZPR_FIXTURE']
-with open(root + '/jj-calls.jsonl', 'a') as f: f.write(json.dumps(args) + '\n')
-result = subprocess.run([os.environ['ZPR_REAL_JJ']] + args, stderr=subprocess.PIPE)
-sys.stderr.buffer.write(result.stderr)
-if result.returncode:
-    with open(root + '/jj-errors.log', 'ab') as f: f.write(result.stderr)
-sys.exit(result.returncode)
-"#;
-        for (name, contents) in [("git", git_shim), ("gh", gh_shim), ("jj", jj_shim)] {
-            let p = f.root.join("bin").join(name);
-            fs::write(&p, contents)?;
-            fs::set_permissions(p, fs::Permissions::from_mode(0o700))?;
+        for (name, config) in [
+            (
+                "git",
+                json!({"tool": "transport-git", "real_git": f.real_git}),
+            ),
+            ("gh", json!({"tool": "transport-gh"})),
+            ("jj", json!({"tool": "transport-jj", "real_jj": f.real_jj})),
+        ] {
+            support::install(&f.root.join("bin").join(name), &config)?;
         }
         let mut paths = vec![f.root.join("bin")];
         paths.extend(std::env::split_paths(&f.path));
@@ -214,6 +149,8 @@ sys.exit(result.returncode)
             .env("XDG_CONFIG_HOME", self.root.join("home"))
             .env("JJ_CONFIG", self.root.join("jj.toml"))
             .env("JJ_PAGER", "cat")
+            // Tiny isolated repositories do not benefit from a full Rayon pool per jj process.
+            .env("RAYON_NUM_THREADS", "1")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_AUTHOR_NAME", "Test")
@@ -274,310 +211,698 @@ sys.exit(result.returncode)
     }
 }
 
-#[test]
-fn local_transport_colocated_and_noncolocated() -> Result<()> {
-    for colocate in [false, true] {
-        for scenario in [
-            "dirty",
-            "empty",
-            "obstruction",
-            "directory-obstruction",
-            "target-conflicts",
-            "sparse",
-            "shallow",
-            "conflicts",
-            "stale",
-            "api-race",
-            "ref-race",
-            "url-rewrite",
-        ] {
-            let f = Fixture::new(colocate)?;
-            f.run(scenario)
-                .with_context(|| format!("colocate={colocate}, scenario={scenario}"))?;
-        }
-    }
-    Ok(())
-}
-
-fn base_tip_scenarios(scenarios: &[&str], shallow: bool) -> Result<()> {
-    for colocate in [false, true] {
-        for scenario in scenarios {
-            let f = Fixture::new(colocate)?;
-            let actual = match *scenario {
-                "rewind" => f.common.clone(),
-                "divergent" => f.commit("divergent base\n", Some(&f.common))?,
-                _ => {
-                    let mut tip = f.base.clone();
-                    for n in 1..15 {
-                        tip = f.commit(&format!("newer base {n}\n"), Some(&tip))?;
+// Preserve the former group names as filters while scheduling each isolated case separately.
+macro_rules! transport_scenarios {
+    ($group:ident, $runner:ident, { $($name:ident: ($($args:expr),+)),+ $(,)? }) => {
+        mod $group {
+            mod noncolocated {
+                $(
+                    #[test]
+                    fn $name() -> anyhow::Result<()> {
+                        crate::$runner(false, $($args),+)
                     }
-                    // Using this tip as the review pin would make the merge base the
-                    // PR head and empty the review diff. Keep the original base pin.
-                    let tip = f.git(&[
-                        "commit-tree",
-                        &format!("{tip}^{{tree}}"),
-                        "-p",
-                        &tip,
-                        "-p",
-                        &f.head,
-                        "-m",
-                        "Merge PR head into the newer base",
-                    ])?;
-                    assert_eq!(
-                        f.git(&[
-                            "rev-list",
-                            "--first-parent",
-                            "--count",
-                            &format!("{}..{tip}", f.base),
-                        ])?,
-                        "15"
-                    );
-                    tip
-                }
-            };
-            f.git(&["update-ref", "refs/heads/main", &actual])?;
-            fs::write(f.root.join("actual-base"), &actual)?;
-            if *scenario == "unavailable" {
-                // A real commit exists on the server, but no fetched ref reaches it.
-                let missing = f.commit("unavailable pinned base\n", Some(&f.base))?;
-                let mut control: Value =
-                    serde_json::from_slice(&fs::read(f.root.join("control.json"))?)?;
-                control["base"]["sha"] = json!(missing);
-                fs::write(f.root.join("control.json"), serde_json::to_vec(&control)?)?;
+                )+
             }
-            let child_scenario = if ["api-race", "ref-race"].contains(scenario)
-                || scenario.starts_with("pending-")
-            {
-                assert!(!shallow);
-                (*scenario).to_owned()
-            } else {
-                format!(
-                    "base-tip-{scenario}{}",
-                    if shallow { "-shallow" } else { "" }
-                )
-            };
-            f.run(&child_scenario).with_context(|| {
-                format!("colocate={colocate}, shallow={shallow}, scenario={scenario}")
-            })?;
+
+            mod colocated {
+                $(
+                    #[test]
+                    fn $name() -> anyhow::Result<()> {
+                        crate::$runner(true, $($args),+)
+                    }
+                )+
+            }
         }
+    };
+}
+
+fn run_scenario(colocate: bool, scenario: &str) -> Result<()> {
+    Fixture::new(colocate)?
+        .run(scenario)
+        .with_context(|| format!("colocate={colocate}, scenario={scenario}"))
+}
+
+transport_scenarios!(local_transport_colocated_and_noncolocated, run_scenario, {
+    dirty: ("dirty"),
+    empty: ("empty"),
+    obstruction: ("obstruction"),
+    directory_obstruction: ("directory-obstruction"),
+    target_conflicts: ("target-conflicts"),
+    sparse: ("sparse"),
+    shallow: ("shallow"),
+    conflicts: ("conflicts"),
+    stale: ("stale"),
+    api_race: ("api-race"),
+    ref_race: ("ref-race"),
+    url_rewrite: ("url-rewrite"),
+});
+
+transport_scenarios!(prefetch_reuses_transport_without_workspace_changes, run_scenario, {
+    prefetch_no_source: ("prefetch-no-source"),
+    prefetch_same_repo: ("prefetch-same-repo"),
+    prefetch_fork: ("prefetch-fork"),
+    prefetch_base_ahead: ("prefetch-base-ahead"),
+    prefetch_shallow: ("prefetch-shallow"),
+});
+
+transport_scenarios!(prefetch_stale_pins_and_source_configuration_miss, run_scenario, {
+    prefetch_stale_head: ("prefetch-stale-head"),
+    prefetch_stale_base: ("prefetch-stale-base"),
+    prefetch_source_added: ("prefetch-source-added"),
+    prefetch_source_renamed: ("prefetch-source-renamed"),
+    prefetch_source_removed: ("prefetch-source-removed"),
+});
+
+transport_scenarios!(prefetch_validates_refs_and_preserves_foreground_guards, run_scenario, {
+    prefetch_corrupt_base: ("prefetch-corrupt-base"),
+    prefetch_corrupt_source: ("prefetch-corrupt-source"),
+    prefetch_symbolic: ("prefetch-symbolic"),
+    prefetch_pending: ("prefetch-pending"),
+    prefetch_source_conflict: ("prefetch-source-conflict"),
+    prefetch_url_rewrite: ("prefetch-url-rewrite"),
+});
+
+fn prefetch_checkout(
+    client: &Client,
+    mut pr: zed_pr_review::model::PullRequest,
+    fixture: &Path,
+    scenario: &str,
+) -> Result<()> {
+    let directory = &client.root;
+    let git_calls = fixture.join("git-calls.jsonl");
+    let calls = || -> Result<Vec<Vec<String>>> {
+        fs::read_to_string(&git_calls)?
+            .lines()
+            .map(|line| Ok(serde_json::from_str(line)?))
+            .collect()
+    };
+    let fetch_count = || -> Result<usize> {
+        Ok(calls()?
+            .iter()
+            .filter(|args| args.iter().any(|arg| arg == "fetch"))
+            .count())
+    };
+    let real_git = std::env::var_os("ZPR_REAL_GIT").unwrap();
+    let server = fixture.join("base.git");
+    let server_git = |store: &Path, args: &[&str]| -> Result<String> {
+        output(
+            Command::new(&real_git)
+                .arg("--no-pager")
+                .arg("--git-dir")
+                .arg(store)
+                .args(args),
+            b"",
+        )
+    };
+    let with_source = matches!(
+        scenario,
+        "prefetch-same-repo"
+            | "prefetch-fork"
+            | "prefetch-source-renamed"
+            | "prefetch-source-removed"
+            | "prefetch-corrupt-source"
+            | "prefetch-source-conflict"
+    );
+    let mut control: Value = serde_json::from_slice(&fs::read(fixture.join("control.json"))?)?;
+    if scenario == "prefetch-source-added" {
+        control["head"]["repo"]["full_name"] = json!("upstream/project");
     }
-    Ok(())
-}
-
-#[test]
-fn base_tip_fast_forward_colocated_and_noncolocated() -> Result<()> {
-    base_tip_scenarios(&["fast-forward"], false)
-}
-
-#[test]
-fn base_tip_fast_forward_shallow_colocated_and_noncolocated() -> Result<()> {
-    base_tip_scenarios(&["fast-forward"], true)
-}
-
-#[test]
-fn base_tip_refusals_colocated_and_noncolocated() -> Result<()> {
-    base_tip_scenarios(&["rewind", "divergent", "unavailable"], false)
-}
-
-#[test]
-fn base_tip_refusals_shallow_colocated_and_noncolocated() -> Result<()> {
-    base_tip_scenarios(&["rewind", "divergent", "unavailable"], true)
-}
-
-#[test]
-fn base_tip_pending_private_ref_colocated_and_noncolocated() -> Result<()> {
-    for shallow in [false, true] {
-        base_tip_scenarios(&["unrelated-ref"], shallow)?;
+    if with_source {
+        let store = if scenario == "prefetch-fork" {
+            let fork = fixture.join("fork.git");
+            output(
+                Command::new(&real_git)
+                    .args(["--no-pager", "clone", "--bare"])
+                    .arg(&server)
+                    .arg(&fork),
+                b"",
+            )?;
+            git(
+                client,
+                &[
+                    "remote",
+                    "add",
+                    "source",
+                    "git@github.com:contributor/fork.git",
+                ],
+            )?;
+            fork
+        } else {
+            control["head"]["repo"]["full_name"] = json!("upstream/project");
+            git(client, &["remote", "add", "source", URL])?;
+            server.clone()
+        };
+        server_git(
+            &store,
+            &["update-ref", "refs/heads/feature/topic", &pr.head_sha],
+        )?;
     }
-    Ok(())
-}
-
-#[test]
-fn base_tip_existing_guards_colocated_and_noncolocated() -> Result<()> {
-    base_tip_scenarios(
+    fs::write(fixture.join("control.json"), serde_json::to_vec(&control)?)?;
+    pr = client.read_pr(42)?;
+    let mut base_tip = pr.base_sha.clone();
+    if scenario == "prefetch-base-ahead" {
+        let tree = server_git(
+            &server,
+            &["rev-parse", &format!("{}^{{tree}}", pr.base_sha)],
+        )?;
+        base_tip = server_git(
+            &server,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &pr.base_sha,
+                "-m",
+                "Base advanced",
+            ],
+        )?;
+        server_git(&server, &["update-ref", "refs/heads/main", &base_tip])?;
+    }
+    if scenario == "prefetch-shallow" {
+        server_git(
+            &client.git_dir,
+            &[
+                "fetch",
+                "--depth=1",
+                "--no-write-fetch-head",
+                &format!("file://{}", server.display()),
+                "refs/pull/42/head:refs/zed-pr-review-shallow-fixture",
+            ],
+        )?;
+    }
+    let kept_commit = client.checkout_commit()?;
+    for reference in [
+        "refs/heads/user-kept",
+        "refs/remotes/unrelated/kept",
+        "refs/tags/user-kept",
+    ] {
+        git(client, &["update-ref", reference, &kept_commit])?;
+    }
+    jj(directory, &["--ignore-working-copy", "git", "import"])?;
+    jj(directory, &["bookmark", "create", "user-local", "-r", "@"])?;
+    let recorded = client.checkout_commit()?;
+    let visible_refs = || {
+        git(
+            client,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads/",
+                "refs/remotes/",
+                "refs/tags/",
+            ],
+        )
+    };
+    let bookmarks = || {
+        jj(
+            directory,
+            &[
+                "--ignore-working-copy",
+                "bookmark",
+                "list",
+                "--all-remotes",
+                "-T",
+                r#"name ++ "\t" ++ remote ++ "\t" ++ conflict ++ "\t" ++ if(normal_target, normal_target.commit_id()) ++ "\t" ++ tracked ++ "\n""#,
+            ],
+        )
+    };
+    let refs_before = visible_refs()?;
+    let bookmarks_before = bookmarks()?;
+    let hooks = fixture.join("hooks");
+    fs::create_dir(&hooks)?;
+    let hook = hooks.join("reference-transaction");
+    support::install(
+        &hook,
+        &json!({"tool": "transport-hook", "marker": fixture.join("hook-ran")}),
+    )?;
+    git(
+        client,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+    )?;
+    fs::write(directory.join("keep.txt"), "unsnapshotted local changes\n")?;
+    fs::write(client.git_dir.join("FETCH_HEAD"), "keep fetch head\n")?;
+    if scenario == "prefetch-url-rewrite" {
+        git(
+            client,
+            &[
+                "config",
+                &format!("url.file://{}.insteadOf", server.display()),
+                URL,
+            ],
+        )?;
+    }
+    let jj_before = fs::read(fixture.join("jj-calls.jsonl"))?;
+    let gh_before = fs::read(fixture.join("gh-calls.jsonl"))?;
+    let prefetched = client.prefetch_pr(&pr, "main");
+    assert_eq!(
+        fs::read(fixture.join("jj-calls.jsonl"))?,
+        jj_before,
+        "background must not invoke jj at all"
+    );
+    assert_eq!(
+        fs::read(fixture.join("gh-calls.jsonl"))?,
+        gh_before,
+        "background uses the caller's live PR pins"
+    );
+    assert_eq!(client.checkout_commit()?, recorded);
+    assert_eq!(visible_refs()?, refs_before);
+    assert_eq!(bookmarks()?, bookmarks_before);
+    assert_eq!(
+        fs::read_to_string(directory.join("keep.txt"))?,
+        "unsnapshotted local changes\n"
+    );
+    assert!(!directory.join("file.txt").exists());
+    assert_eq!(
+        fs::read_to_string(client.git_dir.join("FETCH_HEAD"))?,
+        "keep fetch head\n"
+    );
+    assert!(!fixture.join("hook-ran").exists());
+    if scenario == "prefetch-url-rewrite" {
+        assert!(format!("{:#}", prefetched.unwrap_err()).contains("URL rewriting"));
+        assert_eq!(fetch_count()?, 0);
+        return Ok(());
+    }
+    prefetched?;
+    let network_fetches = if scenario == "prefetch-fork" { 2 } else { 1 };
+    assert_eq!(fetch_count()?, network_fetches);
+    let listing = git(
+        client,
         &[
-            "api-race",
-            "ref-race",
-            "pending-before-fallback-update",
-            "pending-first-fallback-update",
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/zed-pr-review-prefetch/",
         ],
-        false,
-    )
-}
+    )?;
+    assert_eq!(listing.lines().count(), if with_source { 3 } else { 2 });
+    let head_ref = listing
+        .lines()
+        .find_map(|line| {
+            let (name, _) = line.split_once(' ')?;
+            name.ends_with("/head").then_some(name.to_owned())
+        })
+        .unwrap();
+    let namespace = head_ref.strip_suffix("/head").unwrap();
+    assert!(listing.contains(&format!("{namespace}/base {base_tip}")));
+    assert_eq!(
+        git(client, &["rev-parse", "--is-shallow-repository"])?,
+        "false"
+    );
 
-#[test]
-fn immutable_heads_colocated_and_noncolocated() -> Result<()> {
-    tracking_scenarios(&[
-        "immutable",
-        "immutable-late-edit",
-        "ignore-removed-immutable",
-        "ignore-kept-immutable",
-        "ignore-late-file-immutable",
-    ])
-}
+    // A title edit must reuse the same deterministic key. A warm prefetch inspects
+    // all of its refs in one call, without scanning retained entries individually.
+    pr.title = "Cosmetic title edit".into();
+    let warm_start = calls()?.len();
+    client.prefetch_pr(&pr, "main")?;
+    let warm_calls = calls()?;
+    let inspections: Vec<_> = warm_calls[warm_start..]
+        .iter()
+        .filter(|args| args.iter().any(|arg| arg == "for-each-ref"))
+        .collect();
+    assert_eq!(inspections.len(), 1);
+    assert_eq!(inspections[0].last().unwrap(), &format!("{namespace}/"));
+    assert_eq!(fetch_count()?, network_fetches);
+    assert_eq!(fs::read(fixture.join("gh-calls.jsonl"))?, gh_before);
 
-#[test]
-fn ignored_files_colocated_and_noncolocated() -> Result<()> {
-    for colocate in [false, true] {
-        for scenario in [
-            "ignore-removed",
-            "ignore-kept",
-            "ignore-negated",
-            "ignore-node-modules",
-            "ignore-node-modules-contents",
-            "ignore-nested-removed",
-            "ignore-nested-kept",
-            "ignore-excludes",
-            "ignore-relative-excludes",
-            "ignore-core-changed",
-            "ignore-late-file",
-        ] {
-            let f = Fixture::new(colocate)?;
-            f.run(scenario)
-                .with_context(|| format!("colocate={colocate}, scenario={scenario}"))?;
+    let mut misses = true;
+    let mut source_name = "source";
+    match scenario {
+        "prefetch-stale-head" => {
+            control["head"]["sha"] = json!(pr.base_sha);
+            server_git(&server, &["update-ref", "refs/pull/42/head", &pr.base_sha])?;
         }
+        "prefetch-stale-base" => control["base"]["sha"] = json!(std::env::var("ZPR_COMMON")?),
+        "prefetch-source-added" => {
+            server_git(
+                &server,
+                &["update-ref", "refs/heads/feature/topic", &pr.head_sha],
+            )?;
+            git(client, &["remote", "add", "source", URL])?;
+        }
+        "prefetch-source-renamed" => {
+            git(
+                client,
+                &[
+                    "config",
+                    "--rename-section",
+                    "remote.source",
+                    "remote.renamed",
+                ],
+            )?;
+            source_name = "renamed";
+        }
+        "prefetch-source-removed" => {
+            git(client, &["config", "--remove-section", "remote.source"])?;
+        }
+        "prefetch-corrupt-base" => {
+            git(
+                client,
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "update-ref",
+                    &format!("{namespace}/base"),
+                    &pr.head_sha,
+                ],
+            )?;
+        }
+        "prefetch-corrupt-source" => {
+            git(
+                client,
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "update-ref",
+                    &format!("{namespace}/source"),
+                    &pr.base_sha,
+                ],
+            )?;
+        }
+        "prefetch-symbolic" => {
+            git(
+                client,
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "symbolic-ref",
+                    &head_ref,
+                    "refs/heads/user-kept",
+                ],
+            )?;
+            let count = fetch_count()?;
+            assert!(
+                format!("{:#}", client.prefetch_pr(&pr, "main").unwrap_err()).contains("symbolic")
+            );
+            assert_eq!(fetch_count()?, count);
+            assert_eq!(visible_refs()?, refs_before);
+        }
+        "prefetch-pending" => {
+            git(
+                client,
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "update-ref",
+                    "refs/tags/user-kept",
+                    &pr.head_sha,
+                ],
+            )?;
+            let error = format!("{:#}", client.fetch_pr(&pr).unwrap_err());
+            assert!(error.contains("pending Git changes"), "{error}");
+            assert_eq!(fetch_count()?, network_fetches);
+            assert_eq!(client.checkout_commit()?, recorded);
+            return Ok(());
+        }
+        "prefetch-source-conflict" => {
+            jj(
+                directory,
+                &[
+                    "--ignore-working-copy",
+                    "bookmark",
+                    "create",
+                    "feature/topic",
+                    "-r",
+                    &recorded,
+                ],
+            )?;
+            let error = format!("{:#}", client.fetch_pr(&pr).unwrap_err());
+            assert!(error.contains("Local source bookmark"), "{error}");
+            assert_eq!(fetch_count()?, network_fetches);
+            assert_eq!(client.checkout_commit()?, recorded);
+            return Ok(());
+        }
+        _ => misses = false,
+    }
+    fs::write(fixture.join("control.json"), serde_json::to_vec(&control)?)?;
+    pr = client.read_pr(42)?;
+    let before_foreground = fetch_count()?;
+    client.fetch_pr(&pr)?;
+    let tracks_source = (with_source && scenario != "prefetch-source-removed")
+        || scenario == "prefetch-source-added";
+    assert_eq!(
+        fetch_count()?,
+        before_foreground
+            + if misses {
+                if tracks_source { 2 } else { 1 }
+            } else {
+                0
+            }
+    );
+    assert_eq!(client.checkout_commit()?, recorded);
+    assert_eq!(
+        git(client, &["rev-parse", "refs/heads/user-kept"])?,
+        kept_commit
+    );
+    assert_eq!(
+        git(client, &["rev-parse", "refs/tags/user-kept"])?,
+        kept_commit
+    );
+    assert!(!fixture.join("hook-ran").exists());
+    assert_eq!(
+        fs::read_to_string(directory.join("keep.txt"))?,
+        "unsnapshotted local changes\n"
+    );
+    assert_eq!(
+        fs::read_to_string(client.git_dir.join("FETCH_HEAD"))?,
+        "keep fetch head\n"
+    );
+    let private = git(
+        client,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/zed-pr-review/",
+        ],
+    )?;
+    assert!(
+        private.contains(&format!("/head {}", pr.head_sha)),
+        "{private}"
+    );
+    assert!(private.contains(&format!("/base {base_tip}")), "{private}");
+    if tracks_source {
+        assert!(
+            private.contains(&format!("/source {}", pr.head_sha)),
+            "{private}"
+        );
+        assert_eq!(
+            git(
+                client,
+                &[
+                    "rev-parse",
+                    &format!("refs/remotes/{source_name}/feature/topic")
+                ]
+            )?,
+            pr.head_sha
+        );
+        assert!(
+            source_listing(client)?
+                .contains(&format!("{source_name}\tfalse\t{}\ttrue", pr.head_sha))
+        );
     }
     Ok(())
 }
 
-#[test]
-fn ignored_sibling_directories_use_bounded_batches() -> Result<()> {
-    tracking_scenarios(&["ignore-batched-directories"])
-}
-
-#[test]
-fn ignored_sibling_leaves_use_bounded_batches() -> Result<()> {
-    tracking_scenarios(&["ignore-batched-leaves"])
-}
-
-fn tracking_scenarios(scenarios: &[&str]) -> Result<()> {
-    for colocate in [false, true] {
-        for scenario in scenarios {
-            let f = Fixture::new(colocate)?;
-            f.run(scenario)
-                .with_context(|| format!("colocate={colocate}, scenario={scenario}"))?;
+fn run_base_tip_scenario(colocate: bool, scenario: &str, shallow: bool) -> Result<()> {
+    let f = Fixture::new(colocate)?;
+    let actual = match scenario {
+        "rewind" => f.common.clone(),
+        "divergent" => f.commit("divergent base\n", Some(&f.common))?,
+        _ => {
+            let mut tip = f.base.clone();
+            for n in 1..15 {
+                tip = f.commit(&format!("newer base {n}\n"), Some(&tip))?;
+            }
+            // Using this tip as the review pin would make the merge base the
+            // PR head and empty the review diff. Keep the original base pin.
+            let tip = f.git(&[
+                "commit-tree",
+                &format!("{tip}^{{tree}}"),
+                "-p",
+                &tip,
+                "-p",
+                &f.head,
+                "-m",
+                "Merge PR head into the newer base",
+            ])?;
+            assert_eq!(
+                f.git(&[
+                    "rev-list",
+                    "--first-parent",
+                    "--count",
+                    &format!("{}..{tip}", f.base),
+                ])?,
+                "15"
+            );
+            tip
         }
+    };
+    f.git(&["update-ref", "refs/heads/main", &actual])?;
+    fs::write(f.root.join("actual-base"), &actual)?;
+    if scenario == "unavailable" {
+        // A real commit exists on the server, but no fetched ref reaches it.
+        let missing = f.commit("unavailable pinned base\n", Some(&f.base))?;
+        let mut control: Value = serde_json::from_slice(&fs::read(f.root.join("control.json"))?)?;
+        control["base"]["sha"] = json!(missing);
+        fs::write(f.root.join("control.json"), serde_json::to_vec(&control)?)?;
     }
-    Ok(())
+    let child_scenario =
+        if ["api-race", "ref-race"].contains(&scenario) || scenario.starts_with("pending-") {
+            assert!(!shallow);
+            scenario.to_owned()
+        } else {
+            format!(
+                "base-tip-{scenario}{}",
+                if shallow { "-shallow" } else { "" }
+            )
+        };
+    f.run(&child_scenario)
+        .with_context(|| format!("colocate={colocate}, shallow={shallow}, scenario={scenario}"))
 }
 
-// Keep the groups bounded: each creates independent real Git/jj repositories.
-#[test]
-fn source_tracking_creation() -> Result<()> {
-    tracking_scenarios(&[
-        "track-same-repo",
-        "track-fork-present",
-        "track-fork-absent",
-        "track-wrong-host",
-        "track-local-equal",
-        "track-literal-name",
-    ])
-}
+transport_scenarios!(base_tip_fast_forward_colocated_and_noncolocated, run_base_tip_scenario, {
+    fast_forward: ("fast-forward", false),
+});
 
-#[test]
-fn source_tracking_updates() -> Result<()> {
-    tracking_scenarios(&[
-        "track-up-to-date",
-        "track-at-head-dirty",
-        "track-fast-forward",
-        "track-local-divergent",
-        "track-tracked-divergent",
-        "track-deleted",
-        "track-remote-rewind",
-    ])
-}
+transport_scenarios!(base_tip_fast_forward_shallow_colocated_and_noncolocated, run_base_tip_scenario, {
+    fast_forward: ("fast-forward", true),
+});
 
-#[test]
-fn source_tracking_refusals() -> Result<()> {
-    tracking_scenarios(&[
-        "track-source-mismatch",
-        "track-source-rewrite",
-        "track-ambiguous",
-        "track-pending-git",
-        "track-pending-remote",
-        "track-local-conflict",
-    ])
-}
+transport_scenarios!(base_tip_refusals_colocated_and_noncolocated, run_base_tip_scenario, {
+    rewind: ("rewind", false),
+    divergent: ("divergent", false),
+    unavailable: ("unavailable", false),
+});
 
-#[test]
-fn source_tracking_guards() -> Result<()> {
-    tracking_scenarios(&[
-        "track-auto",
-        "track-auto-conflict",
-        "track-other-remote",
-        "track-immutable",
-        "track-ignored",
-    ])
-}
+transport_scenarios!(base_tip_refusals_shallow_colocated_and_noncolocated, run_base_tip_scenario, {
+    rewind: ("rewind", true),
+    divergent: ("divergent", true),
+    unavailable: ("unavailable", true),
+});
 
-#[test]
-fn source_tracking_pending_refs() -> Result<()> {
-    tracking_scenarios(&[
-        "track-pending-delete",
-        "track-multiple-urls",
-        "track-symbolic-remote",
-    ])
-}
+transport_scenarios!(base_tip_pending_private_ref_colocated_and_noncolocated, run_base_tip_scenario, {
+    unrelated_ref: ("unrelated-ref", false),
+    unrelated_ref_shallow: ("unrelated-ref", true),
+});
 
-#[test]
-fn pending_import_source_refs() -> Result<()> {
-    tracking_scenarios(&[
-        "pending-before-source-delete",
-        "pending-before-source-rewind",
-        "pending-before-source-update",
-    ])
-}
+transport_scenarios!(base_tip_existing_guards_colocated_and_noncolocated, run_base_tip_scenario, {
+    api_race: ("api-race", false),
+    ref_race: ("ref-race", false),
+    pending_before_fallback_update: ("pending-before-fallback-update", false),
+    pending_first_fallback_update: ("pending-first-fallback-update", false),
+});
 
-#[test]
-fn pending_import_fallback_refs() -> Result<()> {
-    tracking_scenarios(&[
-        "pending-before-fallback-delete",
-        "pending-before-fallback-rewind",
-        "pending-before-fallback-update",
-    ])
-}
+transport_scenarios!(immutable_heads_colocated_and_noncolocated, run_scenario, {
+    immutable: ("immutable"),
+    immutable_late_edit: ("immutable-late-edit"),
+    ignore_removed_immutable: ("ignore-removed-immutable"),
+    ignore_kept_immutable: ("ignore-kept-immutable"),
+    ignore_late_file_immutable: ("ignore-late-file-immutable"),
+});
 
-#[test]
-fn pending_import_after_fetch() -> Result<()> {
-    tracking_scenarios(&[
-        "pending-first-source-delete",
-        "pending-first-source-rewind",
-        "pending-first-source-update",
-        "pending-first-fallback-delete",
-        "pending-first-fallback-rewind",
-        "pending-first-fallback-update",
-    ])
-}
+transport_scenarios!(ignored_files_colocated_and_noncolocated, run_scenario, {
+    ignore_removed: ("ignore-removed"),
+    ignore_kept: ("ignore-kept"),
+    ignore_negated: ("ignore-negated"),
+    ignore_node_modules: ("ignore-node-modules"),
+    ignore_node_modules_contents: ("ignore-node-modules-contents"),
+    ignore_nested_removed: ("ignore-nested-removed"),
+    ignore_nested_kept: ("ignore-nested-kept"),
+    ignore_excludes: ("ignore-excludes"),
+    ignore_relative_excludes: ("ignore-relative-excludes"),
+    ignore_core_changed: ("ignore-core-changed"),
+    ignore_late_file: ("ignore-late-file"),
+});
 
-#[test]
-fn pending_import_after_source_publication() -> Result<()> {
-    tracking_scenarios(&[
-        "pending-second-source-delete",
-        "pending-second-source-rewind",
-        "pending-second-source-update",
-    ])
-}
+transport_scenarios!(ignored_sibling_directories_use_bounded_batches, run_scenario, {
+    ignore_batched_directories: ("ignore-batched-directories"),
+});
 
-#[test]
-fn pending_import_local_refs() -> Result<()> {
-    tracking_scenarios(&[
-        "pending-before-local-delete",
-        "pending-before-local-rewind",
-        "pending-before-local-update",
-        "pending-before-tag-delete",
-        "pending-before-tag-rewind",
-        "pending-before-tag-update",
-    ])
-}
+transport_scenarios!(ignored_sibling_leaves_use_bounded_batches, run_scenario, {
+    ignore_batched_leaves: ("ignore-batched-leaves"),
+});
 
-#[test]
-fn pending_import_new_refs() -> Result<()> {
-    tracking_scenarios(&[
-        "pending-before-newlocal-update",
-        "pending-before-newremote-update",
-        "pending-before-newtag-update",
-    ])
-}
+transport_scenarios!(source_tracking_creation, run_scenario, {
+    track_same_repo: ("track-same-repo"),
+    track_fork_present: ("track-fork-present"),
+    track_fork_absent: ("track-fork-absent"),
+    track_wrong_host: ("track-wrong-host"),
+    track_local_equal: ("track-local-equal"),
+    track_literal_name: ("track-literal-name"),
+});
+
+transport_scenarios!(source_tracking_updates, run_scenario, {
+    track_up_to_date: ("track-up-to-date"),
+    track_at_head_dirty: ("track-at-head-dirty"),
+    track_fast_forward: ("track-fast-forward"),
+    track_local_divergent: ("track-local-divergent"),
+    track_tracked_divergent: ("track-tracked-divergent"),
+    track_deleted: ("track-deleted"),
+    track_remote_rewind: ("track-remote-rewind"),
+});
+
+transport_scenarios!(source_tracking_refusals, run_scenario, {
+    track_source_mismatch: ("track-source-mismatch"),
+    track_source_rewrite: ("track-source-rewrite"),
+    track_ambiguous: ("track-ambiguous"),
+    track_pending_git: ("track-pending-git"),
+    track_pending_remote: ("track-pending-remote"),
+    track_local_conflict: ("track-local-conflict"),
+});
+
+transport_scenarios!(source_tracking_guards, run_scenario, {
+    track_auto: ("track-auto"),
+    track_auto_conflict: ("track-auto-conflict"),
+    track_other_remote: ("track-other-remote"),
+    track_immutable: ("track-immutable"),
+    track_ignored: ("track-ignored"),
+});
+
+transport_scenarios!(source_tracking_pending_refs, run_scenario, {
+    track_pending_delete: ("track-pending-delete"),
+    track_multiple_urls: ("track-multiple-urls"),
+    track_symbolic_remote: ("track-symbolic-remote"),
+});
+
+transport_scenarios!(pending_import_source_refs, run_scenario, {
+    pending_before_source_delete: ("pending-before-source-delete"),
+    pending_before_source_rewind: ("pending-before-source-rewind"),
+    pending_before_source_update: ("pending-before-source-update"),
+});
+
+transport_scenarios!(pending_import_fallback_refs, run_scenario, {
+    pending_before_fallback_delete: ("pending-before-fallback-delete"),
+    pending_before_fallback_rewind: ("pending-before-fallback-rewind"),
+    pending_before_fallback_update: ("pending-before-fallback-update"),
+});
+
+transport_scenarios!(pending_import_after_fetch, run_scenario, {
+    pending_first_source_delete: ("pending-first-source-delete"),
+    pending_first_source_rewind: ("pending-first-source-rewind"),
+    pending_first_source_update: ("pending-first-source-update"),
+    pending_first_fallback_delete: ("pending-first-fallback-delete"),
+    pending_first_fallback_rewind: ("pending-first-fallback-rewind"),
+    pending_first_fallback_update: ("pending-first-fallback-update"),
+});
+
+transport_scenarios!(pending_import_after_source_publication, run_scenario, {
+    pending_second_source_delete: ("pending-second-source-delete"),
+    pending_second_source_rewind: ("pending-second-source-rewind"),
+    pending_second_source_update: ("pending-second-source-update"),
+});
+
+transport_scenarios!(pending_import_local_refs, run_scenario, {
+    pending_before_local_delete: ("pending-before-local-delete"),
+    pending_before_local_rewind: ("pending-before-local-rewind"),
+    pending_before_local_update: ("pending-before-local-update"),
+    pending_before_tag_delete: ("pending-before-tag-delete"),
+    pending_before_tag_rewind: ("pending-before-tag-rewind"),
+    pending_before_tag_update: ("pending-before-tag-update"),
+});
+
+transport_scenarios!(pending_import_new_refs, run_scenario, {
+    pending_before_newlocal_update: ("pending-before-newlocal-update"),
+    pending_before_newremote_update: ("pending-before-newremote-update"),
+    pending_before_newtag_update: ("pending-before-newtag-update"),
+});
 
 fn jj(root: &Path, args: &[&str]) -> Result<String> {
     output(
@@ -788,14 +1113,16 @@ fn ignored_checkout(
         // verification must not snapshot it, even with the default auto-track=all().
         let real_jj = PathBuf::from(std::env::var_os("ZPR_REAL_JJ").unwrap());
         let wrapper = fixture.join("bin/jj");
-        fs::write(
+        support::install(
             &wrapper,
-            format!(
-                "#!/usr/bin/env python3\nimport subprocess, sys\nr = subprocess.run([{}] + sys.argv[1:])\nif r.returncode == 0 and any(a in sys.argv[1:] for a in ['edit', 'new']):\n    open('.late-private', 'w').write('late private data\\n')\nsys.exit(r.returncode)\n",
-                serde_json::to_string(&real_jj)?
-            ),
+            &json!({
+                "tool": "transport-jj", "real_jj": real_jj,
+                "after_success": {
+                    "commands": ["edit", "new"],
+                    "path": ".late-private", "contents": "late private data\n",
+                },
+            }),
         )?;
-        fs::set_permissions(wrapper, fs::Permissions::from_mode(0o700))?;
         private_files.push((".late-private".into(), "late private data\n".into()));
     }
     let rejected = matches!(
@@ -1365,11 +1692,10 @@ fn tracking_checkout(client: &Client, fixture: &Path, scenario: &str) -> Result<
     let hooks = fixture.join("tracking-hooks");
     fs::create_dir(&hooks)?;
     let hook = hooks.join("reference-transaction");
-    fs::write(
+    support::install(
         &hook,
-        "#!/usr/bin/env python3\nimport os\nopen(os.environ['ZPR_FIXTURE'] + '/tracking-hook-ran', 'w').write('unsafe')\n",
+        &json!({"tool": "transport-hook", "marker": fixture.join("tracking-hook-ran")}),
     )?;
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))?;
     git(
         client,
         &["config", "core.hooksPath", hooks.to_str().unwrap()],
@@ -1584,6 +1910,21 @@ fn pending_import_checkout(client: &Client, fixture: &Path, scenario: &str) -> R
     let action = parts[3];
     let root = &client.root;
     client.fetch_pr(&client.read_pr(42)?)?;
+    if stage == "first" {
+        // This race is injected by the Git fetch shim. Clear retained transport
+        // refs so the seeded PR cannot skip that fetch through a cache hit.
+        let cached_refs = git(
+            client,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/zed-pr-review-prefetch/",
+            ],
+        )?;
+        for reference in cached_refs.lines() {
+            git(client, &["update-ref", "--no-deref", "-d", reference])?;
+        }
+    }
     let recorded = client.checkout_commit()?;
     let mut commits = Vec::new();
     for (parent, description) in [
@@ -2091,6 +2432,9 @@ fn checkout_child() -> Result<()> {
     assert_eq!(workspace_root(&directory)?, directory);
     assert_ne!(client.checkout_commit()?, pr.head_sha);
     assert_eq!(pr.head_repo, "contributor/fork");
+    if scenario.starts_with("prefetch-") {
+        return prefetch_checkout(&client, pr, &fixture, &scenario);
+    }
     if scenario.starts_with("base-tip-") {
         return base_tip_checkout(&client, pr, &fixture, &scenario);
     }
@@ -2146,11 +2490,10 @@ fn checkout_child() -> Result<()> {
     let hooks = fixture.join("hooks");
     fs::create_dir(&hooks)?;
     let hook = hooks.join("reference-transaction");
-    fs::write(
+    support::install(
         &hook,
-        "#!/usr/bin/env python3\nimport os\nopen(os.environ['ZPR_FIXTURE'] + '/hook-ran', 'w').write('unsafe')\n",
+        &json!({"tool": "transport-hook", "marker": fixture.join("hook-ran")}),
     )?;
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))?;
     git(
         &client,
         &["config", "core.hooksPath", hooks.to_str().unwrap()],
@@ -2345,12 +2688,15 @@ fn checkout_child() -> Result<()> {
     let target_before = git(&client, &["cat-file", "commit", &pr.head_sha])?;
     if scenario == "immutable-late-edit" {
         let real_jj = PathBuf::from(std::env::var_os("ZPR_REAL_JJ").unwrap());
-        fs::write(
-            fixture.join("bin/jj"),
-            format!(
-                "#!/usr/bin/env python3\nimport subprocess, sys\nr = subprocess.run([{}] + sys.argv[1:])\nif r.returncode == 0 and 'new' in sys.argv[1:]:\n    open('file.txt', 'w').write('late tracked edit\\n')\nsys.exit(r.returncode)\n",
-                serde_json::to_string(&real_jj)?
-            ),
+        support::install(
+            &fixture.join("bin/jj"),
+            &json!({
+                "tool": "transport-jj", "real_jj": real_jj,
+                "after_success": {
+                    "commands": ["new"],
+                    "path": "file.txt", "contents": "late tracked edit\n",
+                },
+            }),
         )?;
     }
     let bookmark_names = || -> Result<std::collections::BTreeSet<String>> {

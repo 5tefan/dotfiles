@@ -4,10 +4,36 @@
 
 use anyhow::{Context, Result, ensure};
 use std::fs::{self, File};
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+struct Driver(Child);
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        // The helper creates a session containing the viewer and all of its jj
+        // children. Clean up the group on success, assertion failure, or timeout.
+        // SAFETY: this PID came from our Child; the negative value targets only
+        // its process group, never the test runner's group.
+        unsafe { libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL) };
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                match self.0.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => thread::sleep(Duration::from_millis(10)),
+                    Err(error) => {
+                        eprintln!("Cannot reap PTY driver: {error}");
+                        return;
+                    }
+                }
+            }
+            eprintln!("PTY driver did not exit within five seconds of SIGKILL");
+        }
+    }
+}
 
 fn run_terminal_test(scenario: &str) -> Result<()> {
     let temp = tempfile::Builder::new()
@@ -16,24 +42,25 @@ fn run_terminal_test(scenario: &str) -> Result<()> {
     let root = temp.path().canonicalize()?;
     let transcript = root.join("test-output.txt");
     let output = File::create(&transcript)?;
-    let mut child = Command::new("python3")
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/log_terminal.py"))
-        .arg(env!("CARGO_BIN_EXE_zed-pr-review"))
-        .arg(&root)
-        .arg(scenario)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").context("Missing PATH")?)
-        .env("HOME", &root)
-        .env("PYTHONUTF8", "1")
-        .current_dir(&root)
-        .stdin(Stdio::null())
-        .stdout(output.try_clone()?)
-        .stderr(output)
-        .spawn()
-        .context("Python 3 is required for the PTY tests")?;
+    let mut child = Driver(
+        Command::new(env!("CARGO_BIN_EXE_zpr-test-helper"))
+            .arg("log-terminal")
+            .arg(env!("CARGO_BIN_EXE_zed-pr-review"))
+            .arg(&root)
+            .arg(scenario)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").context("Missing PATH")?)
+            .env("HOME", &root)
+            .current_dir(&root)
+            .stdin(Stdio::null())
+            .stdout(output.try_clone()?)
+            .stderr(output)
+            .spawn()
+            .context("Cannot start the native log PTY driver")?,
+    );
     let deadline = Instant::now() + Duration::from_secs(90);
     let status = loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = child.0.try_wait()? {
             break Some(status);
         }
         if Instant::now() >= deadline {
@@ -41,17 +68,7 @@ fn run_terminal_test(scenario: &str) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(25));
     };
-    // Python starts a session containing the viewer and its jj children. Also
-    // clean up that process group if Python times out or exits during a failure.
-    let _ = Command::new("kill")
-        .args(["-KILL", &format!("-{}", child.id())])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    if status.is_none() {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+    drop(child);
     let output = fs::read_to_string(&transcript)?;
     ensure!(
         status.is_some(),

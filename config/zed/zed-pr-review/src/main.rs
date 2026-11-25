@@ -8,12 +8,12 @@ use std::process::Command;
 use zed_pr_review::github::{Client, checkout_sha, workspace_git_dir, workspace_root};
 use zed_pr_review::message::{review_summary, review_template};
 use zed_pr_review::model::{Comment, PullRequest};
-use zed_pr_review::ready;
 use zed_pr_review::review_menu::{self, ReviewAction};
 use zed_pr_review::selection::{Selection, make_comment, validate_comment};
 use zed_pr_review::session::{self, Session};
 use zed_pr_review::stack::Stack;
 use zed_pr_review::store::{Attempt, Draft, Receipt, Store, default_directory, prepare_directory};
+use zed_pr_review::{prefetch, ready};
 
 #[derive(Parser)]
 #[command(
@@ -47,6 +47,8 @@ struct Cli {
 enum Action {
     /// Fetch and check out a PR, then open its full diff. Prompts if --pr is omitted.
     Open,
+    #[command(hide = true)]
+    Prefetch,
     /// Show the GitHub stack in a review diff; otherwise run jj l.
     Stack {
         /// Keep the PR stack or local jj log open and refresh it; non-terminal output is one-shot.
@@ -113,6 +115,21 @@ fn run(cli: Cli) -> Result<()> {
         None
     };
     let directory = context_directory(&cli);
+    if matches!(cli.command, Action::Prefetch) {
+        ensure!(
+            cli.draft_dir.is_none(),
+            "--draft-dir cannot be used with prefetch"
+        );
+        let spec = cli.pr.as_deref().context("prefetch requires --pr")?;
+        return zed_pr_review::github::with_background_deadlines(|| {
+            let (client, pr) = Client::resolve(&directory, spec, cli.repo.as_deref())?;
+            let state = chosen_state(&cli, &client.root)?;
+            prefetch::run(&client, &pr, &state)
+        });
+    }
+    if matches!(cli.command, Action::Comment) {
+        return comment_local(&cli, &directory, selection.context("Missing selection")?);
+    }
     if matches!(cli.command, Action::Finish | Action::Cancel { .. }) {
         return finish_review(&cli, &directory);
     }
@@ -155,7 +172,7 @@ fn run(cli: Cli) -> Result<()> {
         cli.command,
         Action::Comment | Action::SubmitComment | Action::Approve | Action::RequestChanges
     );
-    let mut review_session = None;
+
     let mut workspace_lock = None;
     let mut state_base = None;
     let (client, current, store, mut draft) = if let Some(path) = &cli.draft_dir {
@@ -203,7 +220,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         let state_dir = prepare_directory(&root, &git_dir, &requested_state, None)?;
         workspace_lock = Some(Store::at(&state_dir.join("workspace"))?);
-        review_session = if requires_session {
+        let review_session = if requires_session {
             Some(require_review_session(
                 &root,
                 &state_dir,
@@ -227,6 +244,8 @@ fn run(cli: Cli) -> Result<()> {
     );
     match cli.command {
         Action::Open
+        | Action::Prefetch
+        | Action::Comment
         | Action::Ready { .. }
         | Action::Stack { .. }
         | Action::Sb
@@ -237,57 +256,7 @@ fn run(cli: Cli) -> Result<()> {
                 "checkout, navigation, ready, and the finish menu return before opening a draft"
             )
         }
-        Action::Comment => {
-            draft.editable()?;
-            draft.check_revision(&current)?;
-            let selection = selection.context("Missing selection")?;
-            let session = review_session.as_ref().context("Missing review session")?;
-            let path = session.selection_path(&selection.file)?;
-            let comment_root = session.head_root();
-            let blob = client.blob(&draft.pr.head_sha, &path)?;
-            let files = client.files(current.number)?;
-            let validated = make_comment(&comment_root, &selection, &blob, &files, String::new())?;
-            println!(
-                "{}:{}–{} — RIGHT",
-                printable(&path),
-                validated.start_line,
-                validated.line
-            );
-            println!("Selected text:\n{}", printable(&validated.selected_text));
-            println!(
-                "{} comments saved. Write your comment; finish with Ctrl-D on an empty line. Ctrl-C cancels.",
-                draft.comments.len()
-            );
-            io::stdout().flush()?;
-            let body = read_stdin()?;
-            if body.trim().is_empty() {
-                println!("Blank comment: cancelled. Existing comments kept.");
-                return Ok(());
-            }
-            fresh(&client, &draft)?;
-            session.selection_path(&selection.file)?;
-            if let Some(state) = &state_base {
-                prepare_directory(
-                    &client.root,
-                    &client.git_dir,
-                    state,
-                    Some(&draft.pr.head_sha),
-                )?;
-            }
-            let comment = make_comment(
-                &comment_root,
-                &selection,
-                &blob,
-                &files,
-                body.trim().to_owned(),
-            )?;
-            draft.comments.push(comment);
-            store.save(&draft)?;
-            println!(
-                "Saved locally. {} comments pending; nothing published.",
-                draft.comments.len()
-            );
-        }
+
         Action::SubmitComment => submit(
             &client,
             &store,
@@ -366,12 +335,92 @@ fn run(cli: Cli) -> Result<()> {
             client.ensure_checkout(&current)?;
             session.activate(state)?;
             session.open()?;
+            session.remember(&store)?;
         }
     }
     if finish_review && draft.submitted.is_some() {
         cleanup_after_review(&client, &store, &draft, workspace_lock.is_some());
     }
     drop(workspace_lock);
+    Ok(())
+}
+
+fn comment_local(cli: &Cli, directory: &Path, selection: Selection) -> Result<()> {
+    ensure!(
+        cli.draft_dir.is_none(),
+        "--draft-dir cannot be used to comment; use a full PR diff"
+    );
+    let root = workspace_root(directory)?;
+    let state = chosen_state(cli, &root)?;
+    let session = require_review_session(&root, &state, true)?;
+    // The existing session establishes storage and PR identity. Saving a private
+    // draft does not need remote discovery or scans of the whole repository.
+    let _workspace = Store::at(&state.join("workspace"))?;
+    let client = Client {
+        root: root.clone(),
+        git_dir: workspace_git_dir(&root)?,
+        host: session.pr.host.clone(),
+        repo: session.pr.repo.clone(),
+        reviewer: session.pr.reviewer.clone(),
+    };
+    client.check_explicit_pr(&session.pr, cli.pr.as_deref(), cli.repo.as_deref())?;
+    client.ensure_checkout(&session.pr)?;
+    let store = Store::open(&state, &session.pr)?;
+    let mut draft = store
+        .load()?
+        .unwrap_or_else(|| Draft::new(session.pr.clone()));
+    draft.editable()?;
+    draft.check_revision(&session.pr)?;
+    let (path, blob, cached_files) = session.comment_data(&selection.file)?;
+    let legacy = cached_files.is_none();
+    let files = match cached_files {
+        Some(files) => files,
+        None => {
+            // Existing tabs from older binaries lack patches. Keep their old live
+            // validation until the user opens a new diff with cached metadata.
+            fresh(&client, &draft)?;
+            client.files(session.pr.number)?
+        }
+    };
+    let comment_root = session.head_root();
+    let validated = make_comment(&comment_root, &selection, &blob, &files, String::new())?;
+    println!("{} — {}", session.pr.url, printable(&session.pr.title));
+    println!("Draft: {}", store.directory.display());
+    println!(
+        "{}:{}–{} — RIGHT",
+        printable(&path),
+        validated.start_line,
+        validated.line
+    );
+    println!("Selected text:\n{}", printable(&validated.selected_text));
+    println!(
+        "{} comments saved. Write your comment; finish with Ctrl-D on an empty line. Ctrl-C cancels.",
+        draft.comments.len()
+    );
+    io::stdout().flush()?;
+    let body = read_stdin()?;
+    if body.trim().is_empty() {
+        println!("Blank comment: cancelled. Existing comments kept.");
+        return Ok(());
+    }
+    client.ensure_checkout(&draft.pr)?;
+    if legacy {
+        fresh(&client, &draft)?;
+    }
+    session.selection_path(&selection.file)?;
+    let comment = make_comment(
+        &comment_root,
+        &selection,
+        &blob,
+        &files,
+        body.trim().to_owned(),
+    )?;
+    draft.comments.push(comment);
+    store.save(&draft)?;
+    println!(
+        "Saved locally. {} comments pending; nothing published.",
+        draft.comments.len()
+    );
     Ok(())
 }
 
@@ -560,7 +609,7 @@ fn submit(
     }
     draft.check_revision(current)?;
     ensure!(
-        event == "COMMENT" || !draft.pr.author.eq_ignore_ascii_case(&draft.pr.reviewer),
+        event == "COMMENT" || !current.author.eq_ignore_ascii_case(&current.reviewer),
         "GitHub does not allow approving or requesting changes on your own PR"
     );
     ensure!(
@@ -954,7 +1003,9 @@ fn require_review_session(root: &Path, state: &Path, commenting: bool) -> Result
         session::load_for_navigation(root, state, Path::new(&file))?
     };
     let selected = selected.context("Not inside a review session. Use a file in the full PR diff, not an ordinary source file; open the PR with Ctrl-Shift-G")?;
-    selected.validate()?;
+    if !commenting {
+        selected.validate()?;
+    }
     Ok(selected)
 }
 
@@ -1054,34 +1105,52 @@ fn navigate(cli: &Cli, directory: &Path) -> Result<()> {
         let pr = cli.pr.clone();
         let repo = cli.repo.clone();
         let mut origin_validated = false;
-        return zed_pr_review::stack_view::run(move || {
-            // Validate the originating diff first. After that, the read-only
-            // viewer may follow a new active review, but never rebinds old diffs.
-            let active = if origin_validated && pr.is_none() {
-                session::load_active(&root, &state)?
-            } else {
-                None
-            };
-            let pinned = active.as_ref().unwrap_or(&selected);
-            let spec = pr.as_deref().unwrap_or(&pinned.pr.url);
-            let (client, current) = Client::discover(&root, Some(spec), repo.as_deref())?;
-            ensure!(
-                pinned.pr.same_revision(&current),
-                "This review session is stale. Open the PR again to refresh its pins"
-            );
-            client.ensure_checkout(&current)?;
-            // Navigation may change @ during discovery. Once the origin passed
-            // its checks, the next read can follow that newly active review.
-            origin_validated = true;
-            let stack = Stack::discover(&client, &current)?;
-            client.ensure_checkout(&current)?;
-            Ok(stack)
-        });
+        let status_state = state.clone();
+        return zed_pr_review::stack_view::run_with_status(
+            move || {
+                // Validate the originating diff first. After that, the read-only
+                // viewer may follow a new active review, but never rebinds old diffs.
+                let active = if origin_validated && pr.is_none() {
+                    session::load_active(&root, &state)?
+                } else {
+                    None
+                };
+                let pinned = active.as_ref().unwrap_or(&selected);
+                let spec = pr.as_deref().unwrap_or(&pinned.pr.url);
+                let (client, current) = Client::discover(&root, Some(spec), repo.as_deref())?;
+                ensure!(
+                    pinned.pr.same_revision(&current),
+                    "This review session is stale. Open the PR again to refresh its pins"
+                );
+                client.ensure_checkout(&current)?;
+                // Navigation may change @ during discovery. Once the origin passed
+                // its checks, the next read can follow that newly active review.
+                origin_validated = true;
+                let stack = Stack::discover(&client, &current)?;
+                client.ensure_checkout(&current)?;
+                let _ = stack.remember(&state);
+                prefetch::start(&client, &current, &state);
+                Ok(stack)
+            },
+            move || prefetch::status(&status_state),
+        );
     }
     let _workspace = Store::at(&state.join("workspace"))?;
     let (client, current) = discover_session(cli, &root, Some(&selected), None)?;
-    let stack = Stack::discover(&client, &current)?;
+    let cached = if matches!(cli.command, Action::Stack { .. }) {
+        None
+    } else {
+        Stack::cached(&state, &current)
+    };
+    let used_cache = cached.is_some();
+    let stack = match cached {
+        Some(stack) => stack,
+        None => Stack::discover(&client, &current)?,
+    };
     client.ensure_checkout(&current)?;
+    if !used_cache {
+        let _ = stack.remember(&state);
+    }
     println!("PR stack — {}/{}\n", current.host, current.repo);
     print!(
         "{}",
@@ -1095,6 +1164,7 @@ fn navigate(cli: &Cli, directory: &Path) -> Result<()> {
         println!(
             "Ctrl-Shift-J: parent PR. Ctrl-Shift-K: child PR. Ctrl-Shift-L: refresh this list."
         );
+        prefetch::start(&client, &current, &state);
         return Ok(());
     }
     let candidates = if matches!(cli.command, Action::Sb) {
@@ -1145,7 +1215,11 @@ fn navigate(cli: &Cli, directory: &Path) -> Result<()> {
     );
     client.ensure_checkout(&current)?;
     let target = client.read_pr(candidate.pr.number)?;
-    stack.verify_adjacent(&client, &target)?;
+    if used_cache {
+        stack.verify_cached_adjacent(&client, &target)?;
+    } else {
+        stack.verify_adjacent(&client, &target)?;
+    }
     checkout_review(&client, &target, &state, Some(&stack))
 }
 
@@ -1226,11 +1300,22 @@ fn checkout_review(
     println!("Fetching PR head {} and base history…", pr.head_sha);
     client.fetch_pr(pr)?;
     prepare_directory(&client.root, &client.git_dir, state, Some(&pr.head_sha))?;
-    let store = Store::open(state, pr)?;
-    let session = Session::prepare(client, &store, pr)?;
+    let store = prefetch::open_store(state, pr)?;
+    let prepared = if stack.is_some() {
+        Session::prepared(&store, pr)?
+    } else {
+        None
+    };
+    let session = match prepared {
+        Some(session) => {
+            println!("Using prepared diff for PR #{}.", pr.number);
+            session
+        }
+        None => Session::prepare(client, &store, pr)?,
+    };
     if let Some(stack) = stack {
         client.ensure_checkout(&stack.current().pr)?;
-        stack.verify_adjacent(client, pr)?;
+        stack.verify_cached_adjacent(client, pr)?;
     }
     let previous_commit = client.checkout_pr(pr)?;
     // Report recovery before any later validation or state write can fail.
@@ -1249,7 +1334,10 @@ fn checkout_review(
         "PR changed after checkout. Previous work is preserved; open the PR again"
     );
     session.activate(state)?;
-    session.open().context("Checkout succeeded, but the diff could not be opened. Run the PR: full diff task; do not repeat checkout just to reopen the view")
+    session.open().context("Checkout succeeded, but the diff could not be opened. Run the PR: full diff task; do not repeat checkout just to reopen the view")?;
+    session.remember(&store)?;
+    prefetch::start(client, pr, state);
+    Ok(())
 }
 
 #[cfg(test)]

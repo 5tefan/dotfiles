@@ -3,8 +3,11 @@
 //! Black-box tests: real jj/Git objects, a strict offline gh, and a non-GUI editor.
 //! All environment changes and repository operations are confined to child processes.
 
+mod support;
+
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -74,35 +77,19 @@ impl Fixture {
             "[user]\nname = 'CLI Tests'\nemail = 'cli@example.test'\n[ui]\npager = 'cat'\n",
         )?;
         let editor = bin.join("review editor");
-        for (source, destination) in [
-            ("fake_gh.py", bin.join("gh")),
-            ("fake_editor.py", editor.clone()),
-            ("fake_zed.py", bin.join("zed")),
+        for (tool, destination) in [
+            ("gh", bin.join("gh")),
+            ("editor", editor.clone()),
+            ("zed", bin.join("zed")),
         ] {
-            fs::copy(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests")
-                    .join(source),
-                &destination,
-            )?;
-            fs::set_permissions(destination, fs::Permissions::from_mode(0o700))?;
+            support::install(&destination, &json!({"tool": tool}))?;
         }
         // Even refusal-path tests must never reach a real GitHub transport if
         // the CLI regresses and fetches before validating its arguments.
-        let git_shim = format!(
-            r#"#!/usr/bin/env python3
-import os, sys
-real_git = {real_git}
-args = sys.argv[1:]
-assert not any(a in ('fetch', 'push', 'pull', 'clone', 'remote') for a in args), args
-assert 'ls-remote' not in args or '--get-url' in args, args
-os.environ['GIT_ALLOW_PROTOCOL'] = 'file'
-os.execv(real_git, [real_git] + args)
-"#,
-            real_git = serde_json::to_string(&git_executable()?)?,
-        );
-        fs::write(bin.join("git"), git_shim)?;
-        fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o700))?;
+        support::install(
+            &bin.join("git"),
+            &json!({"tool": "cli-git", "real": git_executable()?}),
+        )?;
         let mut paths = vec![bin];
         paths.extend(std::env::split_paths(
             &std::env::var_os("PATH").context("PATH is unset")?,
@@ -150,11 +137,14 @@ os.execv(real_git, [real_git] + args)
             ("XDG_CONFIG_HOME", self.root.join("home").into_os_string()),
             ("JJ_CONFIG", self.root.join("jj.toml").into_os_string()),
             ("JJ_PAGER", "cat".into()),
+            // Test-level parallelism is enough for these tiny jj repositories.
+            ("RAYON_NUM_THREADS", "1".into()),
             ("PAGER", "cat".into()),
             ("GIT_CONFIG_NOSYSTEM", "1".into()),
             ("GIT_CONFIG_GLOBAL", "/dev/null".into()),
             ("GIT_TERMINAL_PROMPT", "0".into()),
             ("GIT_EDITOR", "true".into()),
+            ("ZED_PR_REVIEW_PREFETCH", "0".into()),
             ("EDITOR", shell_quote(&self.editor.to_string_lossy()).into()),
             (
                 "ZPR_TEST_CONTROL",
@@ -733,48 +723,13 @@ fn install_local_pr_transport(fixture: &Fixture, prs: &[(u64, &str)]) -> Result<
         .iter()
         .map(|(number, base)| (number.to_string(), *base))
         .collect();
-    let shim = format!(
-        r#"#!/usr/bin/env python3
-import json, os, re, subprocess, sys
-from pathlib import Path
-real_git = {real_git}
-bases = {bases}
-root = Path(__file__).resolve().parent.parent
-args = sys.argv[1:]
-record = {{'args': args, 'cwd': os.getcwd()}}
-with (root / 'git.jsonl').open('a') as stream:
-    stream.write(json.dumps(record) + '\n')
-if 'fetch' in args:
-    expected = 'https://github.com/acme/widgets.git'
-    assert args.count(expected) == 1, args
-    separator = args.index('--', args.index('fetch'))
-    operands = args[separator + 1:]
-    assert len(operands) == 3 and operands[0] == expected, args
-    head = re.fullmatch(r'refs/pull/([1-9][0-9]*)/head:refs/heads/zed-pr-review/([^/:]+)/head', operands[1])
-    assert head and head[1] in bases, args
-    assert operands[2] == 'refs/heads/' + bases[head[1]] + ':refs/heads/zed-pr-review/' + head[2] + '/base', args
-    assert not any(a.startswith('+') or a.startswith('--depth') or a.startswith('--shallow') for a in args), args
-    assert set(['--atomic', '--no-tags', '--no-prune', '--no-prune-tags',
-                '--no-recurse-submodules', '--no-auto-maintenance', '--no-write-commit-graph',
-                '--no-write-fetch-head', '--refmap=', '--no-filter']).issubset(args), args
-    assert os.environ['GIT_ALLOW_PROTOCOL'] == 'https'
-    args[separator + 1] = str(root / 'remote.git')
-    os.environ['GIT_ALLOW_PROTOCOL'] = 'file'
-    sys.exit(subprocess.run([real_git] + args, timeout=15).returncode)
-# Bare `git remote` and ls-remote --get-url are local reads. No remote mutations.
-assert not any(a in ('push', 'pull', 'clone') for a in args), args
-assert 'remote' not in args or args[-1] == 'remote', args
-assert 'ls-remote' not in args or '--get-url' in args, args
-os.environ['GIT_ALLOW_PROTOCOL'] = 'file'
-os.execv(real_git, [real_git] + args)
-"#,
-        real_git = serde_json::to_string(&git_executable()?)?,
-        bases = serde_json::to_string(&bases)?,
-    );
-    let path = fixture.root.join("bin/git");
-    fs::write(&path, shim)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
+    support::install(
+        &fixture.root.join("bin/git"),
+        &json!({
+            "tool": "cli-git", "mode": "local-pr", "real": git_executable()?,
+            "root": fixture.root, "bases": bases,
+        }),
+    )
 }
 
 const PULLS_ENDPOINT: &str = "repos/acme/widgets/pulls?state=open&per_page=100";
@@ -817,35 +772,18 @@ sf = ["edit", "@+"]
         .find(|path| path.is_file())
         .context("jj is required")?
         .canonicalize()?;
-    let shim = format!(
-        r#"#!/usr/bin/env python3
-import json, os, sys
-from pathlib import Path
-root = Path(__file__).resolve().parent.parent
-program = Path(sys.argv[0]).name
-args = sys.argv[1:]
-with (root / 'navigation.jsonl').open('a') as stream:
-    stream.write(json.dumps({{'program': program, 'args': args, 'cwd': os.getcwd()}}) + '\n')
-if program == 'viddy':
-    print('Navigation must never invoke viddy', file=sys.stderr)
-    sys.exit(97)
-if 'fetch' in args:
-    print('Navigation fixture refused network transport', file=sys.stderr)
-    sys.exit(96)
-assert not any(a in ('push', 'pull', 'clone') for a in args), args
-assert 'remote' not in args or (program == 'git' and args[-1] == 'remote'), args
-assert 'ls-remote' not in args or '--get-url' in args, args
-os.environ['GIT_ALLOW_PROTOCOL'] = 'file'
-real = {{'jj': {real_jj}, 'git': {real_git}}}[program]
-os.execv(real, [real] + args)
-"#,
-        real_jj = serde_json::to_string(&real_jj)?,
-        real_git = serde_json::to_string(&git_executable()?)?,
-    );
-    for name in ["jj", "git", "viddy"] {
-        let path = fixture.root.join("bin").join(name);
-        fs::write(&path, &shim)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    for (name, tool, real) in [
+        ("jj", "cli-jj", real_jj.clone()),
+        ("git", "cli-git", git_executable()?),
+        ("viddy", "cli-jj", real_jj),
+    ] {
+        support::install(
+            &fixture.root.join("bin").join(name),
+            &json!({
+                "tool": tool, "mode": "navigation", "program": name,
+                "root": fixture.root, "real": real,
+            }),
+        )?;
     }
     Ok(fixture)
 }
@@ -1250,11 +1188,38 @@ impl NavigationTransport {
         Ok(session)
     }
 
+    fn prepared_directory(&self, number: u64) -> Result<Option<PathBuf>> {
+        for entry in fs::read_dir(&self.fixture.state)? {
+            let pointer = entry?.path().join("prepared.json");
+            if !pointer.is_file() {
+                continue;
+            }
+            let pointer = read_json(&pointer)?;
+            let directory = PathBuf::from(
+                pointer["directory"]
+                    .as_str()
+                    .context("Missing prepared directory")?,
+            );
+            let manifest = read_json(&directory.join("manifest.json"))?;
+            if manifest["pr"]["number"] == number
+                && !directory.join("cleanup.json").exists()
+                && !directory.join("cancelled.json").exists()
+            {
+                return Ok(Some(directory));
+            }
+        }
+        Ok(None)
+    }
+
     fn navigate(&self, action: &str, number: u64, side: &str, input: &str) -> Result<PathBuf> {
         let fixture = &self.fixture;
         let old = fixture.active_directory()?;
+        let prepared = self.prepared_directory(number)?;
+        let current_number = read_json(&old.join("manifest.json"))?["pr"]["number"]
+            .as_u64()
+            .context("Missing current PR number")?;
         let calls_before = fixture.calls()?.len();
-        let fetches_before = self.fetch_numbers()?.len();
+        let fetches_before = self.fetch_numbers()?;
         let launches_before = fixture.zed_calls()?.len();
         let bookmarks_before = fixture.previous_bookmarks()?;
         let previous_change = fixture.jj(&[
@@ -1281,7 +1246,15 @@ impl NavigationTransport {
         let session = self.assert_checkout(number)?;
         assert_ne!(session, old);
         assert_eq!(fixture.zed_calls()?.len(), launches_before + 1);
-        assert_eq!(&self.fetch_numbers()?[fetches_before..], &[number]);
+        let expected_fetches = if fetches_before.contains(&number) {
+            vec![]
+        } else {
+            vec![number]
+        };
+        assert_eq!(
+            &self.fetch_numbers()?[fetches_before.len()..],
+            expected_fetches
+        );
         assert_eq!(fixture.previous_bookmarks()?, bookmarks_before);
         let previous = fixture.checkout_previous(&session)?;
         assert_return_command(&output, &previous);
@@ -1300,21 +1273,45 @@ impl NavigationTransport {
         );
         let calls = fixture.calls()?;
         let calls = &calls[calls_before..];
-        let listings: Vec<_> = calls
-            .iter()
-            .enumerate()
-            .filter_map(|(index, call)| (call["endpoint"] == PULLS_ENDPOINT).then_some(index))
-            .collect();
-        let files = calls
-            .iter()
-            .position(|call| {
-                call["endpoint"] == format!("repos/acme/widgets/pulls/{number}/files?per_page=100")
-            })
-            .context("Navigation did not prepare a full PR session")?;
-        assert!(
-            listings.len() >= 3 && listings[1] < files && *listings.last().unwrap() > files,
-            "Check adjacency both before fetch and after preparing the session: {calls:?}"
-        );
+        let files = calls.iter().position(|call| {
+            call["endpoint"] == format!("repos/acme/widgets/pulls/{number}/files?per_page=100")
+        });
+        if let Some(prepared) = prepared {
+            assert_eq!(
+                session, prepared,
+                "Reuse the intact prepared snapshot directory"
+            );
+            assert!(
+                files.is_none(),
+                "Cached snapshots must not request files again"
+            );
+        } else {
+            assert!(
+                files.is_some(),
+                "A cache miss must prepare the full PR diff"
+            );
+        }
+        for endpoint in [
+            format!("repos/acme/widgets/pulls/{current_number}"),
+            format!("repos/acme/widgets/pulls/{number}"),
+            "user".to_owned(),
+        ] {
+            let reads: Vec<_> = calls
+                .iter()
+                .enumerate()
+                .filter_map(|(index, call)| (call["endpoint"] == endpoint).then_some(index))
+                .collect();
+            assert!(
+                reads.len() >= 2,
+                "Recheck current/target PRs and reviewer: {endpoint}"
+            );
+            if let Some(files) = files {
+                assert!(
+                    reads[0] < files && *reads.last().unwrap() > files,
+                    "Check {endpoint} both before and after preparing snapshots"
+                );
+            }
+        }
         Ok(session)
     }
 
@@ -1686,11 +1683,17 @@ fn navigation_missing_or_empty_context_uses_active_review_only_at_its_exact_head
             let start = fixture.calls()?.len();
             let output = fixture.execute(navigation_command(&fixture, args, file), "")?;
             success(&output);
+            let endpoint = if args[0] == "stack" {
+                PULLS_ENDPOINT
+            } else {
+                PR_ENDPOINT
+            };
             assert!(
                 fixture.calls()?[start..]
                     .iter()
-                    .any(|call| call["endpoint"] == PULLS_ENDPOINT)
+                    .any(|call| call["endpoint"] == endpoint)
             );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("@ #17"));
         }
     }
     before.assert_unchanged(&fixture)?;
@@ -1723,10 +1726,15 @@ fn navigation_empty_immutable_head_child_keeps_review_mode_in_zed_and_terminal()
                 let output =
                     fixture.execute(navigation_command(&fixture, args, file.as_deref()), "")?;
                 success(&output);
+                let endpoint = if args[0] == "stack" {
+                    PULLS_ENDPOINT
+                } else {
+                    PR_ENDPOINT
+                };
                 assert!(
                     fixture.calls()?[start..]
                         .iter()
-                        .any(|call| { call["endpoint"] == PULLS_ENDPOINT }),
+                        .any(|call| call["endpoint"] == endpoint),
                     "Expected review navigation for {args:?}, file {file:?}: {}",
                     describe(&output)
                 );
@@ -1934,15 +1942,13 @@ fn run_stack_terminal_test(scenario: &str) -> Result<()> {
     let transcript = fixture.root.join("stack-terminal-output.txt");
     let output = File::create(&transcript)?;
     // This environment is constructed by Fixture, not inherited from the test
-    // runner. The Python child and viewer must keep the offline gh/Git/jj shims.
-    let mut command = fixture.command("python3");
+    // runner. The Rust driver and viewer must keep the offline gh/Git/jj shims.
+    let mut command = fixture.command(env!("CARGO_BIN_EXE_zpr-test-helper"));
     command
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/stack_terminal.py"))
+        .arg("stack-terminal")
         .arg(env!("CARGO_BIN_EXE_zed-pr-review"))
         .arg(scenario)
         .env("TERM", "xterm-256color")
-        .env("PYTHONUTF8", "1")
-        .env("PYTHONDONTWRITEBYTECODE", "1")
         .stdin(Stdio::null())
         .stdout(output.try_clone()?)
         .stderr(output);
@@ -1959,7 +1965,7 @@ fn run_stack_terminal_test(scenario: &str) -> Result<()> {
     }
     let mut child = command
         .spawn()
-        .context("Python 3 is required for the PR stack PTY tests")?;
+        .context("Cannot start the Rust PR stack PTY driver")?;
     let deadline = Instant::now() + Duration::from_secs(60);
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -1970,7 +1976,7 @@ fn run_stack_terminal_test(scenario: &str) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(25));
     };
-    // Python creates a session containing the viewer and its transport children.
+    // The Rust driver creates a session for the viewer and its transport children.
     // Clean up the whole group even if an assertion or timeout interrupts a read.
     let _ = Command::new("kill")
         .args(["-KILL", &format!("-{}", child.id())])
@@ -1984,11 +1990,11 @@ fn run_stack_terminal_test(scenario: &str) -> Result<()> {
     let output = fs::read_to_string(transcript)?;
     ensure!(
         status.is_some(),
-        "PR stack PTY {scenario} exceeded 60 seconds:\n{output}"
+        "Rust PR stack PTY driver {scenario} exceeded 60 seconds:\n{output}"
     );
     ensure!(
         status.unwrap().success(),
-        "PR stack PTY {scenario} failed:\n{output}"
+        "Rust PR stack PTY driver {scenario} failed:\n{output}"
     );
     for call in fixture.calls()? {
         ensure!(
@@ -2053,6 +2059,52 @@ fn stack_terminal_escape_restores_the_terminal_in_active_review_context() -> Res
 #[test]
 fn stack_terminal_stdout_only_tty_with_piped_stdin_is_one_shot() -> Result<()> {
     run_stack_terminal_test("stdin-pipe")
+}
+
+#[test]
+fn navigation_cached_stack_discovers_new_children_only_after_full_refresh() -> Result<()> {
+    let (fixture, session) = navigation_session()?;
+    let before = NavigationCheckpoint::capture(&fixture)?;
+    let file = session.join("head").join(FILE);
+    success(&fixture.execute(navigation_command(&fixture, &["stack"], Some(&file)), "")?);
+    navigation_children(&fixture)?;
+    navigation_clear_calls(&fixture)?;
+    let output = fixture.execute(navigation_command(&fixture, &["sf"], Some(&file)), "")?;
+    success(&output);
+    assert!(describe(&output).contains("No open child PR"));
+    assert!(
+        fixture
+            .calls()?
+            .iter()
+            .any(|call| call["endpoint"] == PR_ENDPOINT)
+    );
+    assert!(
+        fixture
+            .calls()?
+            .iter()
+            .all(|call| call["endpoint"] != PULLS_ENDPOINT)
+    );
+    let output = fixture.execute(navigation_command(&fixture, &["stack"], Some(&file)), "")?;
+    success(&output);
+    assert!(describe(&output).contains("#18") && describe(&output).contains("#19"));
+    assert!(
+        fixture
+            .calls()?
+            .iter()
+            .any(|call| call["endpoint"] == PULLS_ENDPOINT)
+    );
+    navigation_clear_calls(&fixture)?;
+    let output = fixture.execute(navigation_command(&fixture, &["sf"], Some(&file)), "\n")?;
+    success(&output);
+    assert!(describe(&output).contains("PR number") && describe(&output).contains("Cancelled"));
+    assert!(
+        fixture
+            .calls()?
+            .iter()
+            .all(|call| call["endpoint"] != PULLS_ENDPOINT)
+    );
+    before.assert_unchanged(&fixture)?;
+    Ok(())
 }
 
 #[test]
@@ -2522,14 +2574,9 @@ fn navigation_transport_round_trip(colocate: bool) -> Result<()> {
         fixture.checkout_previous(&returned_parent)?,
         transport.revisions[&18].head
     );
-    assert_ne!(
-        returned_parent, parent,
-        "Returning must create a fresh frozen session"
-    );
     assert_eq!(
-        returned_parent.parent(),
-        parent.parent(),
-        "Reuse the PR's draft, not the old diff directory"
+        returned_parent, parent,
+        "Returning must reuse the intact prepared session and its PR draft"
     );
     assert_eq!(fs::read(&parent_draft)?, parent_bytes);
     assert_eq!(fs::read(&child_draft)?, child_bytes);
@@ -2547,8 +2594,7 @@ fn navigation_transport_round_trip(colocate: bool) -> Result<()> {
         fixture.checkout_previous(&returned_child)?,
         transport.revisions[&17].head
     );
-    assert_ne!(returned_child, child);
-    assert_eq!(returned_child.parent(), child.parent());
+    assert_eq!(returned_child, child);
     assert_eq!(fs::read(&parent_draft)?, parent_bytes);
     assert_eq!(fs::read(&child_draft)?, child_bytes);
     let listed = fixture.run_default(&["list"], "")?;
@@ -2568,7 +2614,7 @@ fn navigation_transport_round_trip(colocate: bool) -> Result<()> {
         transport.revisions[&18].head
     );
     assert_eq!(fixture.previous_bookmarks()?, legacy_bookmarks);
-    assert_eq!(transport.fetch_numbers()?, [17, 18, 17, 18]);
+    assert_eq!(transport.fetch_numbers()?, [17, 18]);
     assert_eq!(fixture.zed_calls()?.len(), 4);
     fixture.jj(&["status"])?;
     assert_eq!(
@@ -2654,15 +2700,14 @@ fn navigation_transport_immutable_round_trip(colocate: bool, terminal: bool) -> 
     )?;
     success(&output);
     let returned = transport.assert_checkout_kind(17, true)?;
-    assert_ne!(returned, parent);
-    assert_eq!(returned.parent(), parent.parent());
+    assert_eq!(returned, parent);
     let previous_child = fixture.checkout_previous(&returned)?;
     assert_eq!(previous_child, child_checkout);
     assert_return_command(&output, &previous_child);
     assert!(fixture.previous_bookmarks()?.is_empty());
     assert_eq!(fs::read(&parent_draft)?, parent_bytes);
     assert_eq!(fs::read(&child_draft)?, child_bytes);
-    assert_eq!(transport.fetch_numbers()?, [17, 18, 17]);
+    assert_eq!(transport.fetch_numbers()?, [17, 18]);
     assert_eq!(fixture.zed_calls()?.len(), 3);
     let checkout = fixture.sha("@")?;
     fixture.jj(&["status"])?;
@@ -2719,8 +2764,7 @@ fn navigation_transport_multiple_children_open_the_offered_pr_number_and_keep_se
     assert_eq!(fixture.drafts()?.len(), 3);
     transport.navigate("sb", 17, "head", "")?;
     let returned_second = transport.navigate("sf", 19, "base", " 19 \n")?;
-    assert_ne!(returned_second, second);
-    assert_eq!(returned_second.parent(), second.parent());
+    assert_eq!(returned_second, second);
     for (path, bytes) in [
         (&parent_draft, &parent_bytes),
         (&first_draft, &first_bytes),
@@ -2742,9 +2786,334 @@ fn navigation_transport_multiple_children_open_the_offered_pr_number_and_keep_se
         "{text}"
     );
     transport.assert_stale_tab(&first)?;
-    assert_eq!(transport.fetch_numbers()?, [17, 19, 17, 18, 17, 19]);
+    assert_eq!(transport.fetch_numbers()?, [17, 19, 18]);
     assert!(fixture.previous_bookmarks()?.is_empty());
     assert_eq!(fixture.zed_calls()?.len(), 6);
+    Ok(())
+}
+
+#[test]
+fn synchronous_prefetch_prepares_adjacent_prs_without_changing_active_review_or_checkout()
+-> Result<()> {
+    for args in [
+        vec!["--pr", PR_URL, "prefetch"],
+        vec!["prefetch", "--pr", "17", "--repo", "acme/widgets"],
+    ] {
+        let transport = NavigationTransport::new(false, true)?;
+        let fixture = &transport.fixture;
+        let parent = transport.open_parent()?;
+        let parent_draft = transport.comment(&parent, 17, "Keep the active review")?;
+        let draft_bytes = fs::read(&parent_draft)?;
+        let before = NavigationCheckpoint::capture(fixture)?;
+        let snapshots = CleanupSession::capture(&parent)?;
+        let bookmarks =
+            fixture.jj(&["--ignore-working-copy", "bookmark", "list", "--all-remotes"])?;
+        let refs = fixture.git(&[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+            "refs/remotes",
+        ])?;
+        let launches = fixture.zed_calls()?;
+        let receipt_path = parent.parent().unwrap().join("last-checkout.json");
+        let receipt = fs::read(&receipt_path)?;
+        fs::write(
+            fixture.repo.join(FILE),
+            "Unsnapshotted work while prefetching\n",
+        )?;
+        let fetches_before = transport.fetch_numbers()?.len();
+        let calls_before = fixture.calls()?.len();
+        // Fixture.command disables automatic workers, not this explicit synchronous one.
+        success(&fixture.execute(navigation_command(fixture, &args, None), "")?);
+        let after = NavigationCheckpoint::capture(fixture)?;
+        assert_eq!(after.head, before.head);
+        assert_eq!(after.active, before.active);
+        assert_eq!(after.drafts, before.drafts);
+        assert_eq!(
+            fixture.jj(&["--ignore-working-copy", "bookmark", "list", "--all-remotes"])?,
+            bookmarks
+        );
+        assert_eq!(
+            fixture.git(&[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads",
+                "refs/remotes"
+            ])?,
+            refs
+        );
+        assert_eq!(fixture.zed_calls()?, launches);
+        assert_eq!(fs::read(&receipt_path)?, receipt);
+        assert_eq!(
+            fs::read_to_string(fixture.repo.join(FILE))?,
+            "Unsnapshotted work while prefetching\n"
+        );
+        snapshots.assert_kept()?;
+        assert_eq!(&transport.fetch_numbers()?[fetches_before..], &[18, 19]);
+        assert!(
+            !fixture
+                .git(&[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/zed-pr-review-prefetch"
+                ])?
+                .is_empty()
+        );
+        let calls = fixture.calls()?;
+        let worker_calls = &calls[calls_before..];
+        assert!(
+            worker_calls
+                .iter()
+                .any(|call| call["endpoint"] == PULLS_ENDPOINT)
+        );
+        assert!(
+            worker_calls
+                .iter()
+                .all(|call| call["method"] != "POST" && call["args"][0] != "pr")
+        );
+        let mut prepared = BTreeMap::new();
+        for entry in fs::read_dir(&fixture.state)? {
+            let store = entry?.path();
+            let pointer = store.join("prepared.json");
+            if !pointer.is_file() {
+                continue;
+            }
+            let pointer = read_json(&pointer)?;
+            let directory = PathBuf::from(
+                pointer["directory"]
+                    .as_str()
+                    .context("Missing prepared session path")?,
+            );
+            let manifest = read_json(&directory.join("manifest.json"))?;
+            let number = manifest["pr"]["number"]
+                .as_u64()
+                .context("Missing prepared PR number")?;
+            if number == 17 {
+                continue;
+            }
+            assert!(matches!(number, 18 | 19), "Unexpected prepared PR {number}");
+            let revision = &transport.revisions[&number];
+            assert_eq!(manifest["pr"]["head_sha"], revision.head);
+            assert_eq!(manifest["pr"]["base_sha"], revision.base);
+            assert_eq!(manifest["merge_base"], revision.merge_base);
+            assert_eq!(manifest["patches_cached"], true);
+            assert_eq!(
+                snapshot_files(&directory.join("base"))?,
+                revision.base_files
+            );
+            assert_eq!(
+                snapshot_files(&directory.join("head"))?,
+                revision.head_files
+            );
+            assert!(!store.join("draft.json").exists());
+            assert!(!store.join("last-checkout.json").exists());
+            assert!(worker_calls.iter().any(|call| call["endpoint"]
+                == format!("repos/acme/widgets/pulls/{number}/files?per_page=100")));
+            prepared.insert(number, directory);
+        }
+        assert_eq!(prepared.keys().copied().collect::<Vec<_>>(), vec![18, 19]);
+        assert!(fixture.editors()?.is_empty());
+
+        // Foreground navigation must still validate the PR, but reuse its fetched
+        // history and prepared snapshots rather than fetching or preparing again.
+        fs::write(
+            fixture.repo.join(FILE),
+            &transport.revisions[&17].head_files[FILE],
+        )?;
+        let fetches = transport.fetch_numbers()?;
+        let calls_before = fixture.calls()?.len();
+        success(&fixture.execute(
+            navigation_command(fixture, &["sf"], Some(&parent.join("head").join(FILE))),
+            "19\n",
+        )?);
+        let child = transport.assert_checkout(19)?;
+        assert_eq!(child, prepared[&19]);
+        assert_eq!(transport.fetch_numbers()?, fetches);
+        let calls = fixture.calls()?;
+        let navigation = &calls[calls_before..];
+        assert!(
+            navigation
+                .iter()
+                .any(|call| call["endpoint"] == "repos/acme/widgets/pulls/19")
+        );
+        assert!(
+            navigation
+                .iter()
+                .all(|call| !call["endpoint"].as_str().unwrap_or("").contains("/files?"))
+        );
+        assert_eq!(fs::read(parent_draft)?, draft_bytes);
+        snapshots.assert_kept()?;
+        let calls = fixture.calls()?;
+        transport.comment(&child, 19, "Comment on the prefetched child")?;
+        assert_eq!(fixture.calls()?, calls);
+        assert_eq!(fixture.drafts()?.len(), 2);
+        assert!(fixture.posts()?.is_empty());
+    }
+    Ok(())
+}
+
+fn wait_for_prefetch(fixture: &Fixture) -> Result<Value> {
+    let started = Instant::now();
+    loop {
+        let status = fixture.state.join("prefetch/status.json");
+        if status.is_file() {
+            let status = read_json(&status)?;
+            if matches!(status["state"].as_str(), Some("complete" | "failed")) {
+                let lock = File::open(fixture.state.join("prefetch/lock"))?;
+                if lock.try_lock().is_ok() {
+                    return Ok(status);
+                }
+            }
+        }
+        ensure!(
+            started.elapsed() < Duration::from_secs(30),
+            "Prefetch did not finish within 30 seconds"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn automatic_prefetch_starts_after_stack_and_leaves_the_active_review_unchanged() -> Result<()> {
+    let transport = NavigationTransport::new(false, true)?;
+    let fixture = &transport.fixture;
+    let parent = transport.open_parent()?;
+    transport.comment(&parent, 17, "Keep the active review")?;
+    let before = NavigationCheckpoint::capture(fixture)?;
+    let snapshots = CleanupSession::capture(&parent)?;
+    let bookmarks = fixture.jj(&["--ignore-working-copy", "bookmark", "list", "--all-remotes"])?;
+    let refs = fixture.git(&[
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+        "refs/heads",
+        "refs/remotes",
+    ])?;
+    let launches = fixture.zed_calls()?;
+    fs::write(
+        fixture.repo.join(FILE),
+        "Unsnapshotted work during automatic preparation\n",
+    )?;
+    assert!(!fixture.state.join("prefetch/status.json").exists());
+    let mut command =
+        navigation_command(fixture, &["stack"], Some(&parent.join("head").join(FILE)));
+    command.env_remove("ZED_PR_REVIEW_PREFETCH");
+    success(&bounded_output(command, "", &fixture.root)?);
+    // Check completion only after the foreground task has returned. The worker
+    // must own neither its terminal streams nor the active review context.
+    let status = wait_for_prefetch(fixture)?;
+    assert_eq!(status["state"], "complete", "{status}");
+    assert_eq!(status["ready"], 2);
+    assert_eq!(status["total"], 2);
+    assert_eq!(status["errors"], json!([]));
+    let after = NavigationCheckpoint::capture(fixture)?;
+    assert_eq!(after.head, before.head);
+    assert_eq!(after.active, before.active);
+    assert_eq!(after.drafts, before.drafts);
+    snapshots.assert_kept()?;
+    assert_eq!(
+        fixture.jj(&["--ignore-working-copy", "bookmark", "list", "--all-remotes"])?,
+        bookmarks
+    );
+    assert_eq!(
+        fixture.git(&[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/heads",
+            "refs/remotes"
+        ])?,
+        refs
+    );
+    assert_eq!(fixture.zed_calls()?, launches);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join(FILE))?,
+        "Unsnapshotted work during automatic preparation\n"
+    );
+    assert_eq!(transport.fetch_numbers()?, vec![17, 18, 19]);
+    for number in [18, 19] {
+        let prepared = transport
+            .prepared_directory(number)?
+            .context("Automatic worker did not prepare adjacent PR")?;
+        assert_eq!(
+            snapshot_files(&prepared.join("head"))?,
+            transport.revisions[&number].head_files
+        );
+    }
+    assert!(
+        fixture
+            .calls()?
+            .iter()
+            .all(|call| call["method"] != "POST" && call.get("unexpected").is_none())
+    );
+    assert!(fixture.editors()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn prefetch_serializes_workers_without_blocking_comments_on_the_active_pr() -> Result<()> {
+    let transport = NavigationTransport::new(false, false)?;
+    let fixture = &transport.fixture;
+    let parent = transport.open_parent()?;
+    let before = NavigationCheckpoint::capture(fixture)?;
+    support::install(
+        &fixture.root.join("bin/gh"),
+        &json!({"tool": "gate", "root": fixture.root}),
+    )?;
+    let command = navigation_command(fixture, &["--pr", PR_URL, "prefetch"], None);
+    let root = fixture.root.clone();
+    let worker = thread::spawn(move || bounded_output(command, "", &root));
+    let contended = (|| -> Result<()> {
+        let started = Instant::now();
+        while !fixture.root.join("prefetch-entered").exists() {
+            ensure!(
+                started.elapsed() < Duration::from_secs(10),
+                "Worker never reached session preparation"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        let status = read_json(&fixture.state.join("prefetch/status.json"))?;
+        assert_eq!(status["state"], "fetching");
+        assert_eq!(status["pr"], 18);
+        // Slow network reads must not retain even the target PR's draft lock.
+        let target_store = fixture.state.join(status["draft_key"].as_str().unwrap());
+        drop(Store::at(&target_store)?);
+        let fetches = transport.fetch_numbers()?;
+        success(&fixture.execute(
+            navigation_command(fixture, &["--pr", PR_URL, "prefetch"], None),
+            "",
+        )?);
+        assert_eq!(
+            read_json(&fixture.state.join("prefetch/status.json"))?,
+            status
+        );
+        assert_eq!(transport.fetch_numbers()?, fetches);
+        let calls = fixture.calls()?;
+        transport.comment(
+            &parent,
+            17,
+            "Foreground comment while another PR is preparing",
+        )?;
+        assert_eq!(fixture.calls()?, calls);
+        assert_eq!(fixture.sha("@")?, before.head);
+        assert_eq!(fs::read(fixture.state.join("active.json"))?, before.active);
+        Ok(())
+    })();
+    // Release and reap even when a contention assertion returns an error.
+    fs::write(fixture.root.join("prefetch-release"), "")?;
+    let output = worker.join().expect("Prefetch test thread panicked")?;
+    contended?;
+    success(&output);
+    let status = wait_for_prefetch(fixture)?;
+    assert_eq!(status["state"], "complete");
+    assert_eq!(status["ready"], 1);
+    assert_eq!(status["errors"], json!([]));
+    assert_eq!(transport.fetch_numbers()?, vec![17, 18]);
+    let prepared = transport
+        .prepared_directory(18)?
+        .context("Missing child session")?;
+    assert!(!prepared.parent().unwrap().join("draft.json").exists());
+    assert_eq!(fixture.drafts()?.len(), 1);
+    assert_eq!(fixture.draft()?["comments"].as_array().unwrap().len(), 1);
+    assert!(fixture.posts()?.is_empty());
     Ok(())
 }
 
@@ -3164,7 +3533,7 @@ fn cleanup_navigate(
 ) -> Result<PathBuf> {
     let fixture = &transport.fixture;
     let before = NavigationCheckpoint::capture(fixture)?;
-    let fetches = transport.fetch_numbers()?.len();
+    let fetches = transport.fetch_numbers()?;
     let launches = fixture.zed_calls()?.len();
     let bookmarks = fixture.previous_bookmarks()?;
     let posts: Vec<_> = fixture
@@ -3178,7 +3547,15 @@ fn cleanup_navigate(
     let previous = fixture.checkout_previous(&session)?;
     assert_eq!(previous, before.head);
     assert_return_command(&output, &previous);
-    assert_eq!(&transport.fetch_numbers()?[fetches..], &[number]);
+    let expected_fetches = if fetches.contains(&number) {
+        vec![]
+    } else {
+        vec![number]
+    };
+    assert_eq!(
+        &transport.fetch_numbers()?[fetches.len()..],
+        expected_fetches
+    );
     assert_eq!(fixture.zed_calls()?.len(), launches + 1);
     assert_eq!(fixture.previous_bookmarks()?, bookmarks);
     assert_eq!(
@@ -3339,7 +3716,7 @@ fn cleanup_navigation_round_trip(action: &str, state: &str, colocate: bool) -> R
     assert_ne!(returned_child, child);
     assert_eq!(fs::read(&parent_draft)?, parent_bytes);
     assert_eq!(fs::read(&child_draft)?, child_bytes);
-    assert_eq!(transport.fetch_numbers()?, [17, 18, 17, 18, 17, 18]);
+    assert_eq!(transport.fetch_numbers()?, [17, 18]);
     assert_eq!(fixture.previous_bookmarks()?, bookmarks);
     assert_eq!(fixture.zed_calls()?.len(), 6);
     assert_eq!(
@@ -4315,20 +4692,32 @@ fn old_session_tabs_are_not_rebound_after_a_new_checkout_and_session() -> Result
 }
 
 #[test]
-fn registered_session_refuses_all_review_actions_after_checkout_or_remote_head_drift() -> Result<()>
-{
+fn registered_session_rejects_checkout_drift_and_checks_remote_drift_at_submission() -> Result<()> {
     for remote_drift in [false, true] {
         let mut fixture = Fixture::new()?;
         fixture.use_default_state();
         let session = fixture.prepare_session()?;
         success(&fixture.run_session(&session, &["comment"], "Keep this draft")?);
-        let before = fixture.draft()?;
         if remote_drift {
             fixture.configure("head", json!(fixture.base))?;
+            let calls = fixture.calls()?;
+            success(&fixture.run_session(
+                &session,
+                &["comment"],
+                "Still local after remote drift",
+            )?);
+            assert_eq!(fixture.calls()?, calls);
+            assert_eq!(fixture.draft()?["comments"].as_array().unwrap().len(), 2);
         } else {
             fixture.nonempty_child("Unrelated checkout")?;
         }
-        for action in ["comment", "approve", "request-changes"] {
+        let before = fixture.draft()?;
+        let actions: &[&str] = if remote_drift {
+            &["submit-comment", "approve", "request-changes"]
+        } else {
+            &["comment", "submit-comment", "approve", "request-changes"]
+        };
+        for action in actions {
             let calls_before = fixture.calls()?.len();
             let mut command = fixture.default_cli(&[action]);
             command.env("ZED_FILE", session.join("head").join(FILE));
@@ -4342,7 +4731,7 @@ fn registered_session_refuses_all_review_actions_after_checkout_or_remote_head_d
             if remote_drift {
                 assert!(
                     fixture.calls()?.len() > calls_before,
-                    "A valid local session must still check GitHub"
+                    "Submission must still check GitHub"
                 );
             }
             assert_eq!(fixture.draft()?, before);
@@ -4575,8 +4964,10 @@ fn diff_creates_frozen_sessions_without_changing_checkout_or_reusing_old_tabs() 
 fn comments_are_local_and_preserve_multiline_selection_and_literal_body() -> Result<()> {
     let fixture = Fixture::review()?;
     let body = "Literal $(touch injected-comment), `touch injected-backticks`; $HOME & |\nSecond paragraph: 'quoted' and \\\"double\\\".";
+    let calls = fixture.calls()?;
     fixture.comment(1, "one\ntwo\n", body)?;
     fixture.comment(3, "three\n", "Last line")?;
+    assert_eq!(fixture.calls()?, calls, "Local comments must not invoke gh");
     let draft = fixture.draft()?;
     assert_eq!(draft["version"], 1);
     assert_eq!(draft["pr"]["head_sha"], fixture.head);
@@ -4610,6 +5001,318 @@ fn comments_are_local_and_preserve_multiline_selection_and_literal_body() -> Res
 }
 
 #[test]
+fn cached_comments_work_offline_and_leave_remote_drift_checks_to_submission() -> Result<()> {
+    let fixture = Fixture::review()?;
+    let session = fixture.active_directory()?;
+    let manifest = read_json(&session.join("manifest.json"))?;
+    assert_eq!(manifest["patches_cached"], true);
+    let snapshots = CleanupSession::capture(&session)?;
+    let active = fs::read(fixture.state.join("active.json"))?;
+    let original = fixture.control()?;
+    for (index, (field, value)) in [
+        ("deny_discovery", json!(true)),
+        ("reviewer", json!("another-account")),
+        ("head", json!(fixture.base)),
+        ("base", json!(fixture.head)),
+        ("pr_state", json!("closed")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut control = original.clone();
+        control[field] = value;
+        fixture.set_control(control.clone())?;
+        let calls = fixture.calls()?;
+        let body = format!("Local comment with {field} changed");
+        fixture.comment(1, "one\ntwo\n", &body)?;
+        assert_eq!(fixture.calls()?, calls, "{field} must not trigger gh");
+        assert_eq!(fixture.control()?, control);
+        let draft = fixture.draft()?;
+        assert_eq!(draft["pr"], manifest["pr"]);
+        assert_eq!(draft["comments"].as_array().unwrap().len(), index + 1);
+        assert_eq!(draft["comments"][index]["body"], body);
+        let bytes = fs::read(fixture.draft_path()?)?;
+        for action in ["submit-comment", "approve", "request-changes"] {
+            failure(&fixture.run(&[action], "")?);
+            assert_eq!(fs::read(fixture.draft_path()?)?, bytes);
+            assert!(fixture.posts()?.is_empty());
+            assert!(fixture.editors()?.is_empty());
+        }
+        assert!(fixture.calls()?.len() > calls.len());
+        assert_eq!(fs::read(fixture.state.join("active.json"))?, active);
+        snapshots.assert_kept()?;
+        assert_eq!(fixture.sha("@")?, fixture.head);
+    }
+    assert_eq!(
+        fixture.drafts()?.len(),
+        1,
+        "Keep the pinned reviewer's draft"
+    );
+    Ok(())
+}
+
+#[test]
+fn cached_comments_read_frozen_bytes_without_git_blobs_or_state_scans() -> Result<()> {
+    let (fixture, session) = navigation_session()?;
+    let snapshots = CleanupSession::capture(&session)?;
+    let active = fs::read(fixture.state.join("active.json"))?;
+    // A recursive prepare_directory scan would reject this unrelated entry.
+    let unrelated = fixture.state.join("unrelated-private-state");
+    symlink(fixture.root.join("home"), &unrelated)?;
+    fs::write(fixture.repo.join(FILE), "Unsnapshotted local work\n")?;
+    fixture.configure("deny_discovery", json!(true))?;
+    fixture.configure("files", json!([]))?;
+    navigation_clear_calls(&fixture)?;
+    let mut command = fixture.default_cli(&["comment"]);
+    command
+        .env("ZED_FILE", session.join("head").join(FILE))
+        .env("ZED_ROW", "2")
+        .env("ZED_COLUMN", "2")
+        .env("ZED_SELECTED_TEXT", "wo\nTHREE\n");
+    success(&fixture.execute(command, "Only frozen bytes and cached patches")?);
+    assert_eq!(
+        fixture.draft()?["comments"][1],
+        json!({
+            "path": FILE, "start_line": 2, "line": 3, "column": 2,
+            "selected_text": "wo\nTHREE\n", "body": "Only frozen bytes and cached patches"
+        })
+    );
+    assert!(fixture.calls()?.is_empty());
+    for call in navigation_calls(&fixture)? {
+        let args = call["args"].as_array().unwrap();
+        if call["program"] == "git" {
+            for forbidden in [
+                "show",
+                "cat-file",
+                "ls-files",
+                "ls-tree",
+                "check-ignore",
+                "fetch",
+            ] {
+                assert!(
+                    !args.iter().any(|arg| arg == forbidden),
+                    "Unexpected Git read: {call}"
+                );
+            }
+        } else if call["program"] == "jj" {
+            assert!(
+                !args.iter().any(|arg| arg == "file"),
+                "Unexpected jj file scan: {call}"
+            );
+        }
+    }
+    assert_eq!(fixture.sha("@")?, fixture.head);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join(FILE))?,
+        "Unsnapshotted local work\n"
+    );
+    assert_eq!(fs::read(fixture.state.join("active.json"))?, active);
+    assert_eq!(fs::read_link(unrelated)?, fixture.root.join("home"));
+    snapshots.assert_kept()?;
+    Ok(())
+}
+
+#[test]
+fn cached_comments_require_a_cached_rhs_hunk_even_when_live_files_allow_the_selection() -> Result<()>
+{
+    let fixture = navigation_fixture()?;
+    let live_files = fixture.control()?["files"].clone();
+    fixture.configure(
+        "files",
+        json!([{
+            "filename": FILE, "status": "modified", "patch": "@@ -3 +3 @@\n-three\n+THREE"
+        }]),
+    )?;
+    let session = fixture.prepare_session()?;
+    fixture.configure("files", live_files)?;
+    fixture.configure("deny_discovery", json!(true))?;
+    let calls = fixture.calls()?;
+    let mut command = fixture.default_cli(&["comment"]);
+    command
+        .env("ZED_FILE", session.join("head").join(FILE))
+        .env("ZED_ROW", "3")
+        .env("ZED_SELECTED_TEXT", "THREE");
+    success(&fixture.execute(command, "Cached changed line")?);
+    let before = fs::read(fixture.draft_path()?)?;
+    let output = fixture.run_session(&session, &["comment"], "Outside the cached hunk")?;
+    failure(&output);
+    assert!(describe(&output).contains("hunk"), "{}", describe(&output));
+    assert_eq!(fs::read(fixture.draft_path()?)?, before);
+    assert_eq!(fixture.calls()?, calls);
+    Ok(())
+}
+
+#[test]
+fn cached_comments_do_not_fetch_missing_or_empty_patches() -> Result<()> {
+    for patch in [Value::Null, json!("")] {
+        let mut fixture = Fixture::new()?;
+        fixture.use_default_state();
+        fixture.configure(
+            "files",
+            json!([{
+                "filename": FILE, "status": "added", "patch": patch
+            }]),
+        )?;
+        let session = fixture.prepare_session()?;
+        assert_eq!(
+            read_json(&session.join("manifest.json"))?["patches_cached"],
+            true
+        );
+        fixture.configure("deny_discovery", json!(true))?;
+        let calls = fixture.calls()?;
+        let output = fixture.run_session(&session, &["comment"], "No cached patch")?;
+        failure(&output);
+        assert!(describe(&output).contains("patch"), "{}", describe(&output));
+        assert_eq!(fixture.calls()?, calls);
+        fixture.assert_no_comments()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn cached_comments_reject_explicit_context_mismatches_without_api_calls() -> Result<()> {
+    let fixture = Fixture::review()?;
+    fixture.comment(1, "one", "Keep the pinned draft")?;
+    fixture.configure("deny_discovery", json!(true))?;
+    let before = fs::read(fixture.draft_path()?)?;
+    let active = fs::read(fixture.state.join("active.json"))?;
+    let calls = fixture.calls()?;
+    for args in [
+        vec!["--pr", "18"],
+        vec!["--pr", "https://github.com/acme/widgets/pull/18"],
+        vec!["--pr", "https://github.com/acme/other/pull/17"],
+        vec!["--pr", "https://other.example/acme/widgets/pull/17"],
+        vec!["--repo", "acme/other"],
+        vec!["--repo", "other.example/acme/widgets"],
+        vec!["--pr", PR_URL, "--repo", "acme/other"],
+        vec!["--pr", "17", "--repo", "acme/other"],
+    ] {
+        let mut command = fixture.cli(&["comment"]);
+        command.args(&args);
+        navigation_failure(&fixture.execute(command, "Must not rebind the session")?);
+        assert_eq!(fixture.calls()?, calls, "{args:?}");
+        assert_eq!(fs::read(fixture.draft_path()?)?, before);
+        assert_eq!(fs::read(fixture.state.join("active.json"))?, active);
+    }
+    Ok(())
+}
+
+#[test]
+fn cached_comments_reject_stale_recorded_checkout_offline() -> Result<()> {
+    let fixture = Fixture::review()?;
+    fixture.comment(1, "one", "Keep the original draft")?;
+    let checkout = fixture.nonempty_child("Recorded work outside the pinned PR")?;
+    fixture.configure("deny_discovery", json!(true))?;
+    let before = fs::read(fixture.draft_path()?)?;
+    let calls = fixture.calls()?;
+    let output = fixture.run(&["comment"], "Must not use a stale session")?;
+    failure(&output);
+    assert!(describe(&output).contains("jj @"), "{}", describe(&output));
+    assert_eq!(fixture.calls()?, calls);
+    assert_eq!(fs::read(fixture.draft_path()?)?, before);
+    assert_eq!(fixture.sha("@")?, checkout);
+    Ok(())
+}
+
+#[test]
+fn cached_comments_require_editable_drafts_with_matching_local_pins() -> Result<()> {
+    let fixture = Fixture::review()?;
+    fixture.comment(1, "one", "Keep this comment")?;
+    fixture.configure("deny_discovery", json!(true))?;
+    let original = fixture.draft()?;
+    let path = fixture.draft_path()?;
+    let calls = fixture.calls()?;
+    let attempt = json!({"payload": {}, "previous_review_ids": []});
+    let mut invalid = Vec::new();
+    for (field, value) in [
+        ("head_sha", json!(fixture.base)),
+        ("base_sha", json!(fixture.head)),
+        ("reviewer", json!("another-account")),
+        ("repo", json!("acme/other")),
+        ("host", json!("other.example")),
+        ("number", json!(18)),
+        ("head_repo", json!("contributor/widgets")),
+        ("head_ref", json!("another-branch")),
+    ] {
+        let mut draft = original.clone();
+        draft["pr"][field] = value;
+        invalid.push(draft);
+    }
+    for (field, value) in [
+        ("attempt", attempt),
+        (
+            "submitted",
+            json!({"id": 501, "url": format!("{PR_URL}#pullrequestreview-501"), "state": "APPROVED"}),
+        ),
+    ] {
+        let mut draft = original.clone();
+        draft[field] = value;
+        invalid.push(draft);
+    }
+    for draft in invalid {
+        let bytes = serde_json::to_vec(&draft)?;
+        fs::write(&path, &bytes)?;
+        failure(&fixture.run(&["comment"], "Must not change a pinned or finalized draft")?);
+        assert_eq!(fs::read(&path)?, bytes);
+        assert_eq!(fixture.calls()?, calls);
+    }
+    assert!(fixture.posts()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn legacy_comments_fetch_files_and_still_require_a_live_matching_pr() -> Result<()> {
+    let fixture = Fixture::review()?;
+    let session = fixture.active_directory()?;
+    let path = session.join("manifest.json");
+    let mut manifest = read_json(&path)?;
+    manifest.as_object_mut().unwrap().remove("patches_cached");
+    for file in manifest["files"].as_array_mut().unwrap() {
+        file.as_object_mut().unwrap().remove("patch");
+    }
+    let bytes = serde_json::to_vec(&manifest)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    fs::write(&path, &bytes)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
+    let active_path = fixture.state.join("active.json");
+    let mut active = read_json(&active_path)?;
+    active["manifest_sha256"] = json!(format!("{:x}", Sha256::digest(&bytes)));
+    fs::write(&active_path, serde_json::to_vec(&active)?)?;
+    let calls_before = fixture.calls()?.len();
+    fixture.comment(1, "one", "Legacy session comment")?;
+    let calls = fixture.calls()?;
+    assert!(
+        calls[calls_before..]
+            .iter()
+            .any(|call| call["endpoint"] == PR_ENDPOINT)
+    );
+    assert!(
+        calls[calls_before..]
+            .iter()
+            .any(|call| call["endpoint"] == format!("{PR_ENDPOINT}/files?per_page=100"))
+    );
+    let before = fs::read(fixture.draft_path()?)?;
+    let original = fixture.control()?;
+    for (field, value) in [
+        ("files", json!([])),
+        ("head", json!(fixture.base)),
+        ("reviewer", json!("another-account")),
+        ("deny_discovery", json!(true)),
+    ] {
+        let mut control = original.clone();
+        control[field] = value;
+        fixture.set_control(control)?;
+        let calls_before = fixture.calls()?.len();
+        failure(&fixture.run(&["comment"], "Legacy sessions need live validation")?);
+        assert!(fixture.calls()?.len() > calls_before);
+        assert_eq!(fs::read(fixture.draft_path()?)?, before);
+    }
+    assert!(fixture.posts()?.is_empty());
+    assert!(fixture.editors()?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn saved_drafts_without_retry_history_load_with_an_empty_history() -> Result<()> {
     let fixture = Fixture::review()?;
     fixture.comment(1, "one", "Legacy comment")?;
@@ -4636,10 +5339,15 @@ fn explicit_pr_url_and_number_work_without_bookmark_discovery() -> Result<()> {
     for args in [
         vec!["--pr", PR_URL, "comment"],
         vec!["--pr", "17", "--repo", "acme/widgets", "comment"],
+        vec!["--pr", "17", "--repo", "github.com/acme/widgets", "comment"],
+        vec!["--repo", "acme/widgets", "comment"],
     ] {
         let fixture = Fixture::review()?;
         fixture.jj(&["bookmark", "delete", "topic"])?;
+        fixture.configure("deny_discovery", json!(true))?;
+        let calls = fixture.calls()?;
         success(&fixture.run(&args, "Explicit PR")?);
+        assert_eq!(fixture.calls()?, calls);
         assert_eq!(fixture.draft()?["comments"][0]["body"], "Explicit PR");
         assert!(fixture.calls()?.iter().all(|call| call["args"][0] == "api"));
         assert!(fixture.posts()?.is_empty());
@@ -4651,10 +5359,19 @@ fn explicit_pr_url_and_number_work_without_bookmark_discovery() -> Result<()> {
 fn blank_stdin_cancels_without_changing_an_existing_comment() -> Result<()> {
     let fixture = Fixture::review()?;
     fixture.comment(1, "one", "Keep me")?;
-    let before = fixture.draft()?;
+    let before = fs::read(fixture.draft_path()?)?;
+    fixture.configure("deny_discovery", json!(true))?;
+    let calls = fixture.calls()?;
     for input in ["", " \t\n\n"] {
-        fixture.run(&["comment"], input)?;
-        assert_eq!(fixture.draft()?, before);
+        let output = fixture.run(&["comment"], input)?;
+        success(&output);
+        assert!(
+            describe(&output).contains("cancelled"),
+            "{}",
+            describe(&output)
+        );
+        assert_eq!(fs::read(fixture.draft_path()?)?, before);
+        assert_eq!(fixture.calls()?, calls);
     }
     assert!(fixture.posts()?.is_empty());
     assert!(fixture.editors()?.is_empty());
@@ -4689,11 +5406,15 @@ fn a_changed_local_file_is_rejected_without_snapshotting() -> Result<()> {
 }
 
 #[test]
-fn a_pr_head_that_differs_from_jj_at_is_rejected() -> Result<()> {
+fn a_remote_pr_head_that_differs_from_jj_at_does_not_block_local_comments() -> Result<()> {
     let fixture = Fixture::review()?;
     fixture.configure("head", json!(fixture.base))?;
-    failure(&fixture.run(&["--pr", PR_URL, "comment"], "Wrong revision")?);
-    fixture.assert_no_comments()?;
+    let calls = fixture.calls()?;
+    success(&fixture.run(&["--pr", PR_URL, "comment"], "Pinned revision")?);
+    assert_eq!(fixture.calls()?, calls);
+    assert_eq!(fixture.draft()?["pr"]["head_sha"], fixture.head);
+    assert_eq!(fixture.draft()?["comments"][0]["body"], "Pinned revision");
+    assert!(fixture.posts()?.is_empty());
     assert_eq!(fixture.sha("@")?, fixture.head);
     Ok(())
 }
@@ -5530,6 +6251,9 @@ fn a_new_pr_revision_can_start_a_fresh_draft_after_offline_discard() -> Result<(
     assert_ne!(new_head, fixture.head);
     fixture.configure("head", json!(new_head))?;
     fixture.jj(&["bookmark", "set", "topic", "-r", "@"])?;
+    // An empty child is still a valid checkout of H1. Select the new H2 session
+    // to verify that its pins cannot authorize changes to the existing H1 draft.
+    fixture.review_file = Some(fixture.prepare_session()?.join("head").join(FILE));
     failure(&fixture.run(&["comment"], "Must not reuse stale comments")?);
     assert_eq!(fixture.draft()?, before);
     fixture.configure("deny_discovery", json!(true))?;
@@ -7211,21 +7935,19 @@ fn run_review_flow_terminal(scenario: &str) -> Result<()> {
     navigation_clear_calls(&fixture)?;
     let transcript = fixture.root.join("review-terminal-output.txt");
     let output = File::create(&transcript)?;
-    let mut command = fixture.command("python3");
+    let mut command = fixture.command(env!("CARGO_BIN_EXE_zpr-test-helper"));
     command
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/review_terminal.py"))
+        .arg("review-terminal")
         .arg(env!("CARGO_BIN_EXE_zed-pr-review"))
         .arg(scenario)
         .env("TERM", "xterm-256color")
-        .env("PYTHONUTF8", "1")
-        .env("PYTHONDONTWRITEBYTECODE", "1")
         .env("ZED_FILE", directory.join("head").join(FILE))
         .stdin(Stdio::null())
         .stdout(output.try_clone()?)
         .stderr(output);
     let mut child = command
         .spawn()
-        .context("Python 3 is required for review PTY tests")?;
+        .context("Cannot start the Rust review PTY driver")?;
     let deadline = Instant::now() + Duration::from_secs(45);
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -7236,6 +7958,7 @@ fn run_review_flow_terminal(scenario: &str) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(25));
     };
+    // Reap the Rust driver's session, including any CLI or editor left on timeout.
     let _ = Command::new("kill")
         .args(["-KILL", &format!("-{}", child.id())])
         .stdout(Stdio::null())
@@ -7248,11 +7971,11 @@ fn run_review_flow_terminal(scenario: &str) -> Result<()> {
     let output = fs::read_to_string(transcript)?;
     ensure!(
         status.is_some(),
-        "Review PTY {scenario} exceeded 45 seconds:\n{output}"
+        "Rust review PTY driver {scenario} exceeded 45 seconds:\n{output}"
     );
     ensure!(
         status.unwrap().success(),
-        "Review PTY {scenario} failed:\n{output}"
+        "Rust review PTY driver {scenario} failed:\n{output}"
     );
     for call in fixture.calls()? {
         ensure!(

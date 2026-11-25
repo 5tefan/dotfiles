@@ -59,4 +59,4 @@
 
 - shell:
     - description: Build zed-pr-review
-      command: cargo build --locked --release --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml
+      command: cargo build --locked --release --bin zed-pr-review --manifest-path ~/.config/zed/zed-pr-review/Cargo.toml

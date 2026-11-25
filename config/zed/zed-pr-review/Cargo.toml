@@ -4,7 +4,16 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 publish = false
+default-run = "zed-pr-review"
 description = "Review GitHub pull requests from Zed and jj"
+
+[[bin]]
+name = "zpr-test-helper"
+path = "tests/support/runner.rs"
+bench = false
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dependencies]
 anyhow = "1"
