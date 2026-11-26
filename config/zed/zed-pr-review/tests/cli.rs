@@ -772,3 +772,56 @@ fn agent_cli_review_inspection_flag_commenting_and_github_quoting() -> Result<()
 
     Ok(())
 }
+
+#[test]
+fn comment_works_when_workspace_root_is_reached_through_a_symlink() -> Result<()> {
+    let fx = StackFixture::new()?;
+    let open = fx.run_cli(&["--pr", "101", "open"], "", &[])?;
+    assert!(
+        open.status.success(),
+        "open failed: {}",
+        String::from_utf8_lossy(&open.stderr)
+    );
+
+    let alias_root = fx._temp.path().join("repo-alias");
+    std::os::unix::fs::symlink(&fx.root, &alias_root)?;
+    let aliased_file = alias_root.join("one.txt");
+
+    let ok = fx.run_cli(
+        &["comment"],
+        "comment via symlinked root\n",
+        &[
+            ("ZED_WORKTREE_ROOT", alias_root.to_str().unwrap()),
+            ("ZED_FILE", aliased_file.to_str().unwrap()),
+            ("ZED_ROW", "1"),
+            ("ZED_COLUMN", "1"),
+            ("ZED_SELECTED_TEXT", "alpha"),
+        ],
+    )?;
+    assert!(
+        ok.status.success(),
+        "comment through symlinked root failed: {}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+
+    let rejected = fx.run_cli(
+        &["--directory", fx.root.to_str().unwrap(), "comment"],
+        "comment via unrelated alias\n",
+        &[
+            ("ZED_FILE", aliased_file.to_str().unwrap()),
+            ("ZED_ROW", "1"),
+            ("ZED_COLUMN", "1"),
+            ("ZED_SELECTED_TEXT", "alpha"),
+        ],
+    )?;
+    assert!(
+        !rejected.status.success(),
+        "explicit --directory should still reject an unrelated symlink alias"
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("selected file uses an alias outside the configured repository root")
+    );
+
+    Ok(())
+}

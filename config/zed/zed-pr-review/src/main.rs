@@ -927,9 +927,16 @@ fn comment_local(cli: &Cli, directory: &Path, selection: Selection, agent: bool)
     draft.editable()?;
     draft.check_revision(&entry.pr)?;
 
-    let relative_path = repo_path(&root, &selection.file)?;
+    let selection_root = configured_root(directory, &root);
+    let relative_path = repo_path(&selection_root, &selection.file)?;
     let blob = client.blob(&entry.pr.head_sha, &relative_path)?;
-    let validated = make_comment(&root, &selection, &blob, &entry.files, String::new())?;
+    let validated = make_comment(
+        &selection_root,
+        &selection,
+        &blob,
+        &entry.files,
+        String::new(),
+    )?;
     println!("{} — {}", entry.pr.url, printable(&entry.pr.title));
     println!("Draft: {}", store.directory.display());
     println!(
@@ -957,7 +964,7 @@ fn comment_local(cli: &Cli, directory: &Path, selection: Selection, agent: bool)
         "jj @ changed while writing the comment; nothing saved"
     );
     let mut comment = make_comment(
-        &root,
+        &selection_root,
         &selection,
         &blob,
         &entry.files,
@@ -1911,13 +1918,25 @@ fn context_directory(cli: &Cli) -> PathBuf {
         && let Some(existing) = parent
             .ancestors()
             .find(|path| fs::symlink_metadata(path).is_ok())
-        && let Ok(root) = workspace_root(existing)
+        && workspace_root(existing).is_ok()
     {
-        return root;
+        return existing.to_path_buf();
     }
     std::env::var_os("ZED_WORKTREE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn configured_root(directory: &Path, canonical_root: &Path) -> PathBuf {
+    std::path::absolute(directory)
+        .ok()
+        .and_then(|absolute| {
+            absolute
+                .ancestors()
+                .find(|ancestor| fs::canonicalize(ancestor).ok().as_deref() == Some(canonical_root))
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or_else(|| canonical_root.to_path_buf())
 }
 
 fn chosen_state(cli: &Cli, root: &Path) -> Result<PathBuf> {
